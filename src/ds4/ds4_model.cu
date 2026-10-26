@@ -7375,11 +7375,27 @@ struct Model::Impl {
                 gg::iq_cpu_gate_up(fm, mx_part_ptr(l, en.e, 0, X), mx_part_ptr(l, en.e, 1, X), ap, en.n, hp,
                                    r0 - X * FFh, r1 - X * FFh, lim);
             };
-        run_nodes(ne * GB, f);
+        // DS4_CPU_STATS: this path's phases 0 (gate / up), 1 (h's quant) and 2 (down) - cpu_experts' phase() is not
+        // reached here - and the matrices' bytes, for the lane's GB/s
+        static const bool stats = std::getenv("DS4_CPU_STATS") != nullptr;
+        double tph = stats ? now_ms() : 0.0;
+        auto phase = [&](int i) {
+            if (!stats) return;
+            const double t = now_ms();
+            cpu_ph_ms[i] += t - tph;
+            tph = t;
+        };
+        if (stats) {
+            cpu_bytes[0] += (double) ne * (double) (mx_part_bytes(l, 0) + mx_part_bytes(l, 1));
+            cpu_bytes[2] += (double) ne * (double) mx_part_bytes(l, 2);
+        }
+        run_nodes(ne * GB, f, 0);
+        phase(0);
         for (const Ent& en : ents)
             for (int i = 0; i < en.n; ++i)
                 gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF,
                                  aq + (size_t) (kWin + en.slot0 + i) * E * 4);
+        phase(1);
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
                 const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
@@ -7392,11 +7408,12 @@ struct Model::Impl {
                 }
                 gg::iq_cpu_down(fm, mx_part_ptr(l, en.e, 2, X), hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
             };
-        run_nodes(ne * DB, f);
+        run_nodes(ne * DB, f, 2);
+        phase(2);
     }
 
     // DS4_CPU_STATS: the CPU lane's calls, entries, rows and each phase's time, printed with the profile's save
-    double cpu_ph_ms[4] = {};
+    double cpu_ph_ms[4] = {}, cpu_bytes[4] = {};   // (bytes: the low-bit path's matrices a phase read)
     long cpu_calls = 0, cpu_ents = 0, cpu_rows = 0;
     std::atomic<uint64_t> cpu_job_ns[4] = {}, cpu_job_n[4] = {};
     void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx = 0,
@@ -13698,9 +13715,10 @@ struct Model::Impl {
             const int thr = pools.empty() ? 1 : (int) (pools[0]->size() + (pools.size() > 1 ? pools[1]->size() : 0));
             for (int i = 0; i < 4; ++i)
                 std::fprintf(stderr, "  phase %d: %.1f jobs a call, %.1f us a job; the jobs' time %.0f%% of %d threads x the "
-                                     "phase's wall\n", i, (double) cpu_job_n[i] / cpu_calls,
+                                     "phase's wall; %.1f GB/s\n", i, (double) cpu_job_n[i] / cpu_calls,
                              cpu_job_n[i] ? cpu_job_ns[i] / 1e3 / cpu_job_n[i] : 0.0,
-                             100.0 * cpu_job_ns[i] / 1e6 / (cpu_ph_ms[i] * thr), thr);
+                             cpu_ph_ms[i] > 0 ? 100.0 * cpu_job_ns[i] / 1e6 / (cpu_ph_ms[i] * thr) : 0.0, thr,
+                             cpu_ph_ms[i] > 0 ? cpu_bytes[i] / cpu_ph_ms[i] / 1e6 : 0.0);
         }
         if (o.profile.empty()) return;
         const std::string tmp = o.profile + ".tmp";
