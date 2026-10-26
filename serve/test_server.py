@@ -441,6 +441,33 @@ class StableToolOrder(unittest.TestCase):
         self.assertEqual(msgs[2]["reasoning_content"], "real thinking")
 
 
+class NoDelayStreaming(unittest.TestCase):
+    """rw-13: streamed replies are flush-per-token small frames; without TCP_NODELAY, Nagle + delayed ACK
+    can hold a frame ~40 ms on the LAN to LiteLLM.  _sse (every streaming path goes through it) sets it."""
+
+    def test_sse_sets_tcp_nodelay(self):
+        import socket
+
+        from serve.server import make_handler
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        client = socket.create_connection(listener.getsockname())
+        conn, _ = listener.accept()
+        try:
+            handler_cls = make_handler(None)
+            handler = handler_cls.__new__(handler_cls)
+            handler.connection = conn
+            handler.send_response = lambda *a, **k: None
+            handler.send_header = lambda *a, **k: None
+            handler.end_headers = lambda *a, **k: None
+            self.assertEqual(conn.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY), 0)
+            handler._sse()
+            self.assertEqual(conn.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY), 1)
+        finally:
+            conn.close(), client.close(), listener.close()
+
+
 class ClientShapes(unittest.TestCase):
     """What real clients send: Claude Code posts /v1/messages?beta=true (issue #55) and puts hook context into the
     conversation as a mid-conversation system message (issue #56); some OpenAI clients send a late developer message."""
