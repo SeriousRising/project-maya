@@ -1266,6 +1266,9 @@ struct Model::Impl {
     // a window of one through moe_gate_up / moe_down (DS4_MOE_TOKEN=0: win_experts, whose down rows run
     // before the wait for the CPU lane - the same bits, no faster)
     bool moe_token_path = std::getenv("DS4_MOE_TOKEN") == nullptr || std::atoi(std::getenv("DS4_MOE_TOKEN")) != 0;
+    // DS4_RW_DOWN_WAIT=1: a window of one waits for the CPU lane after its down rows, before the combine (as
+    // win_experts does) - the down rows run while the CPU lane computes (the same bits)
+    bool rw_down_wait = std::getenv("DS4_RW_DOWN_WAIT") != nullptr && std::atoi(std::getenv("DS4_RW_DOWN_WAIT")) != 0;
     int async_max_t = std::getenv("DS4_ASYNC_T") ? std::atoi(std::getenv("DS4_ASYNC_T")) : 8;   // windows up to this
     // a layer on one GPU with every expert in its VRAM leaves the host out of its decode: no CPU lane part to wait
     // for, so no mailbox seq and no wait - each wait is a round trip through the host (on Windows HIP, ~1 ms a
@@ -13369,7 +13372,10 @@ struct Model::Impl {
                     m2.plan_ptr = LD.plan2;
                     gg::moe_gate_up(m2, d.x, d.xg, s);
                 }
-                if (lead) wait_seq(&resps[slot].seq, sq, s);
+                if (lead && mx && rw_down_wait) {   // (gg::moe_down's combine waits)
+                    ma.wait_ptr = &resps[slot].seq;
+                    ma.wait_val = sq;
+                } else if (lead) wait_seq(&resps[slot].seq, sq, s);
                 prof_mark(d, 4);
                 if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
                 else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);

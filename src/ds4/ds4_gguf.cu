@@ -1541,6 +1541,7 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
     } else {
         launch_groups<DownK>(m, a.n_embd, a.k, 1, s);
     }
+    if (a.wait_ptr != nullptr) mx_wait_kernel<<<1, 32, 0, s>>>(a.wait_ptr, a.wait_val);
     CombArgs c{};
     c.plan_ptr = a.plan_ptr;
     c.plan_w = a.plan_w;

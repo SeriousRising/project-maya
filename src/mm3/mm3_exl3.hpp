@@ -133,6 +133,10 @@ struct MoeArgs {
     MixedLayouts mix;     // (n > 0: the experts' layouts by class - lay is not used)
     int k = 8, n_embd = 4096, n_ff = 2048;
     float limit = 0.0f;   // 0: no clamp
+    // (given; ds4's GGUF moe_down only) its combine first waits on the device until *wait_ptr == wait_val, as
+    // WinArgs' does - the down rows run while the CPU lane computes
+    const unsigned* wait_ptr = nullptr;
+    unsigned wait_val = 0;
 };
 void moe_gate_up(const MoeArgs& a, const float* x, float* h, cudaStream_t s);
 void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s);
