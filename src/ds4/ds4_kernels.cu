@@ -4,6 +4,7 @@
 #include "ds4_numerics.cuh"
 #include "ds4_q6k.cuh"
 #include "ds4_pool.hpp"
+#include "ds4_attn_split.cuh"
 
 #include <cuda_fp16.h>
 #if !defined(STRATA_USE_HIP)
@@ -23,6 +24,10 @@
 #include <memory>
 #include <thread>
 #include <mutex>
+#include <map>
+#include <tuple>
+#include <cmath>
+#include <utility>
 #include <deque>
 #include <condition_variable>
 #if !defined(_WIN32)   // (the host all-reduce's rows on a NUMA node)
@@ -3354,9 +3359,49 @@ static bool attn_mma_now() {
 #endif
 }
 
-void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
-                 const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
-                 int ckv_fmt, int heads_per_block, const AttnScratch* scr) {
+namespace {
+
+// ---- the split-KV attention's scratch: a device allocation a (device, stream, heads), made on first use and
+// kept (Strata 0.2.6 keys it a (device, stream); the heads in the key keep a later wider call off a narrower
+// first allocation).  kSplitCap * kSplitR = 960 rows covers this model's window 128 + index_topk 512; anything
+// wider stays on the stock path.
+constexpr int kSplitG = 4, kSplitR = 40, kSplitCap = 24, kSplitMaxT = 5;
+bool split_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("DS4_ATTN_SPLIT");
+        return e != nullptr && std::atoi(e) != 0;   // opt-in: the merge sums in another order (the bits differ)
+    }();
+    return on;
+}
+attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
+    static std::mutex mu;
+    static std::map<std::tuple<int, cudaStream_t, int>, attnsplit::AttnSplitScratch> m;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        cudaGetLastError();
+        return {};
+    }
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = m.find({dev, s, heads});
+    if (it != m.end()) return it->second;
+    attnsplit::AttnSplitScratch sc;
+    sc.nsplit = kSplitCap;
+    sc.max_t = kSplitMaxT;
+    const size_t np = (size_t) kSplitMaxT * heads * kSplitCap;
+    if (cudaMalloc((void**) &sc.part, np * 512 * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void**) &sc.ml, np * 2 * sizeof(float)) != cudaSuccess) {
+        cudaGetLastError();
+        if (sc.part != nullptr) cudaFree(sc.part);
+        sc = attnsplit::AttnSplitScratch{};
+    }
+    m[{dev, s, heads}] = sc;
+    return sc;
+}
+}  // namespace
+
+static void sparse_attn_stock(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
+                              const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
+                              int ckv_fmt, int heads_per_block, const AttnScratch* scr) {
     if (d != 512 || (ckv_fmt != kKvFp4 && ckv_fmt != kKvBf16)) {
         std::fprintf(stderr, "ds4 sparse_attn: head dim %d (rows %d) not covered\n", d, ckv_fmt);
         return;
@@ -3426,6 +3471,79 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     else if (G == 4) sparse_attn_packed_kernel<4><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
     else if (G == 2) sparse_attn_packed_kernel<2><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
     else sparse_attn_packed_kernel<1><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+}
+
+namespace {
+// DS4_ATTN_SPLIT_CHECK=N: the first N split calls also run the stock dispatch on the same live inputs into a
+// side buffer and print the largest difference (a synchronising debug path; never set it for timing)
+void attn_split_check(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
+                      const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
+                      int ckv_fmt, int heads_per_block, const AttnScratch* scr, int total_max) {
+    static const int budget = [] {
+        const char* e = std::getenv("DS4_ATTN_SPLIT_CHECK");
+        return e != nullptr ? std::atoi(e) : 0;
+    }();
+    if (budget <= 0) return;
+    static std::atomic<int> done{0};
+    if (done.fetch_add(1, std::memory_order_relaxed) >= budget) return;
+    auto ck = [](cudaError_t e, const char* what) {
+        if (e == cudaSuccess) return true;
+        std::fprintf(stderr, "attn split check: %s: %s\n", what, cudaGetErrorString(e));
+        cudaGetLastError();
+        return false;
+    };
+    const size_t n = (size_t) T * heads * d;
+    float* ref = nullptr;
+    if (!ck(cudaMalloc((void**) &ref, n * sizeof(float)), "cudaMalloc")) return;
+    sparse_attn_stock(q, win, ckv, sel, sel_stride, a, sink, heads, d, T, scale, ref, s, ckv_fmt, heads_per_block, scr);
+    std::vector<float> got(n), stock(n);
+    const bool good = ck(cudaMemcpyAsync(got.data(), out, n * sizeof(float), cudaMemcpyDeviceToHost, s), "copy split out") &&
+                      ck(cudaMemcpyAsync(stock.data(), ref, n * sizeof(float), cudaMemcpyDeviceToHost, s), "copy stock out") &&
+                      ck(cudaStreamSynchronize(s), "sync");
+    cudaFree(ref);
+    if (!good) return;
+    double max_abs = 0.0, max_rel = 0.0, omax = 0.0;
+    size_t bad = 0, nonfinite = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (!std::isfinite(got[i]) || !std::isfinite(stock[i])) ++nonfinite;
+        const double err = std::abs((double) got[i] - stock[i]);
+        max_abs = std::max(max_abs, err);
+        omax = std::max(omax, std::abs((double) stock[i]));
+        max_rel = std::max(max_rel, err / std::max(std::abs((double) stock[i]), 1e-12));
+        bad += err > 1e-4 + 1e-4 * std::abs((double) stock[i]);
+    }
+    int dev = 0;
+    cudaGetDevice(&dev);
+    cudaGetLastError();
+    std::fprintf(stderr,
+                 "attn split check: dev=%d T=%d heads=%d rows<=%d nsel0=%d values=%zu max_abs=%.9g max_abs_over_max=%.9g max_rel=%.9g bad=%zu nonfinite=%zu\n",
+                 dev, T, heads, total_max, a.nsel[0], n, max_abs, omax > 0 ? max_abs / omax : 0.0, max_rel, bad, nonfinite);
+}
+}  // namespace
+
+void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
+                 const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
+                 int ckv_fmt, int heads_per_block, const AttnScratch* scr) {
+    // a decode step / short verify window of packed rows: the split-KV kernel (Strata's CUDA lab, ds4_attn_split.cuh; 2.9x at
+    // one query on an A4000).  The same inputs; the merge sums the chunks in another order, so the bits differ in the last
+    // place (4e-7 against a double reference).  DS4_ATTN_SPLIT=1 turns it on (off by default).  It never pre-empts a prompt
+    // chunk's tensor-core request (kAttnWmma), and the chunked-prefill caller (a.gen) stays on the stock dispatch.
+    if (split_enabled() && d == 512 && ckv_fmt == kKvFp4 && a.gen == 0 && heads_per_block != kAttnWmma &&
+        T >= 1 && T <= kSplitMaxT && heads > 0 && heads % kSplitG == 0) {
+        int total_max = 0;
+        for (int t = 0; t < T; ++t) total_max = std::max(total_max, a.nwin[t] + a.nsel[t]);
+        if (total_max > 0 && total_max <= kSplitCap * kSplitR) {
+            const attnsplit::AttnSplitScratch sc = split_scratch(s, heads);
+            if (sc.part != nullptr) {
+                attnsplit::sparse_attn_split<kSplitG, kSplitR>(q, win, (const uint8_t*) ckv, kv_row_bytes(kKvFp4, d), sel,
+                                                               sel_stride, a, sink, heads, T, scale, out, sc, total_max, s);
+                attn_split_check(q, win, ckv, sel, sel_stride, a, sink, heads, d, T, scale, out, s, ckv_fmt,
+                                 heads_per_block, scr, total_max);
+                return;
+            }
+        }
+    }
+    sparse_attn_stock(q, win, ckv, sel, sel_stride, a, sink, heads, d, T, scale, out, s, ckv_fmt, heads_per_block, scr);
 }
 
 void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, cudaStream_t s) {
