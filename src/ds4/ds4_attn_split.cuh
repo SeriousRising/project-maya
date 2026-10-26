@@ -2,7 +2,7 @@
 // (the surrounding types, AttnRows and the packed-row formats, are theirs; see the Project Maya LICENSE).
 // Ported from Strata 0.2.6 src/dsv41/ds4_attn_split.cuh into Maya v1.1.28 (Phase 5 item 4, 2026-10-25); kernel code unchanged.
 // src/ds4/ds4_attn_split.cuh - split-KV ("flash-decoding") version of DeepSeek's sparse attention for a few queries
-// (decode T = 1, DSpark verify T = 2..5): 64 heads x d 512, MQA (K = V), window rows (BF16) + selected compressed rows (kKvFp4:
+// (decode T = 1, DSpark verify T = 2..kWin; a 5-draft block verifies at T <= 6): 64 heads x d 512, MQA (K = V), window rows (BF16) + selected compressed rows (kKvFp4:
 // E2M1 codes + E4M3 scales per 16) + a learned sink logit per head.  Same inputs and outputs as strata::ds4::sparse_attn
 // (AttnRows gen 0, ckv kKvFp4); the shipped kernel runs one 256-thread block per (head, query) = 64 blocks on 48 SMs and takes
 // ~125 us per query; this one splits the keys over R-row chunks and groups G heads per block, which share the decoded rows.
@@ -14,7 +14,11 @@
 #pragma once
 #include "ds4_kernels.cuh"
 #include "ds4_numerics.cuh"
+#if !defined(STRATA_USE_HIP)
 #include <cuda_fp16.h>
+#else
+#include <hip/hip_fp16.h>   // (__half2float / __ushort_as_half; Maya's HIP build has no cuda_fp16.h - ds4_numerics.cuh)
+#endif
 
 namespace strata::ds4 {
 namespace attnsplit {

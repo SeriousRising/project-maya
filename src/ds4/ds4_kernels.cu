@@ -3361,17 +3361,48 @@ static bool attn_mma_now() {
 
 namespace {
 
-// ---- the split-KV attention's scratch: a device allocation a (device, stream, heads), made on first use and
-// kept (Strata 0.2.6 keys it a (device, stream); the heads in the key keep a later wider call off a narrower
-// first allocation).  kSplitCap * kSplitR = 960 rows covers this model's window 128 + index_topk 512; anything
-// wider stays on the stock path.
-constexpr int kSplitG = 4, kSplitR = 40, kSplitCap = 24, kSplitMaxT = 5;
+// ---- the split-KV attention's scratch: a device allocation a (device, stream, heads), allocated at load time
+// by attn_split_prewarm (ds4_model.cu, next to AttnScratch) and kept (Strata 0.2.6 keys it a (device, stream);
+// the heads in the key keep a later wider call off a narrower first allocation).  A first-use allocation is
+// still the fallback for a (stream, heads) the prewarm did not cover, but never inside a stream capture: an
+// uncached key under capture runs stock for that call only (the null is not cached).  kSplitCap * kSplitR =
+// 960 rows covers this model's window 128 + index_topk 512; anything wider stays on the stock path.
+// kSplitMaxT = kWin covers every window the engine can build (verify() caps T at kWin; DSpark's block of 5
+// drafts verifies at T <= 6): scratch 16 * 64 * 24 * 512 floats = 48 MiB a device, inside the 600 MiB reserve.
+constexpr int kSplitG = 4, kSplitR = 40, kSplitCap = 24, kSplitMaxT = kWin;
 bool split_enabled() {
     static const bool on = [] {
         const char* e = std::getenv("DS4_ATTN_SPLIT");
         return e != nullptr && std::atoi(e) != 0;   // opt-in: the merge sums in another order (the bits differ)
     }();
     return on;
+}
+// DS4_ATTN_FUSE (p5-fuse) moves finish(q)'s RoPE and finish(o)'s inverse RoPE inside the stock kernel; the
+// split kernels know nothing of it, so with both switches on the split path is refused (stock runs, fused).
+bool split_usable() {
+    static const bool ok = [] {
+        if (!split_enabled()) return false;
+        const char* e = std::getenv("DS4_ATTN_FUSE");
+        if (e != nullptr && std::atoi(e) != 0) {
+            std::fprintf(stderr, "ds4: DS4_ATTN_SPLIT refused while DS4_ATTN_FUSE is on (the split kernels skip the fused RoPE)\n");
+            return false;
+        }
+        return true;
+    }();
+    return ok;
+}
+bool stream_capturing(cudaStream_t s) {
+#if defined(STRATA_USE_HIP)
+    (void) s;   // (no capture path in the HIP build; the load-time prewarm still applies)
+    return false;
+#else
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(s, &st) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return st != cudaStreamCaptureStatusNone;
+#endif
 }
 attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
     static std::mutex mu;
@@ -3384,20 +3415,33 @@ attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
     std::lock_guard<std::mutex> lk(mu);
     auto it = m.find({dev, s, heads});
     if (it != m.end()) return it->second;
+    if (stream_capturing(s)) return {};   // (not cached: a later uncaptured call allocates)
     attnsplit::AttnSplitScratch sc;
     sc.nsplit = kSplitCap;
     sc.max_t = kSplitMaxT;
     const size_t np = (size_t) kSplitMaxT * heads * kSplitCap;
-    if (cudaMalloc((void**) &sc.part, np * 512 * sizeof(float)) != cudaSuccess ||
-        cudaMalloc((void**) &sc.ml, np * 2 * sizeof(float)) != cudaSuccess) {
+    const size_t part_b = np * 512 * sizeof(float), ml_b = np * 2 * sizeof(float);
+    cudaError_t e1 = cudaMalloc((void**) &sc.part, part_b);
+    cudaError_t e2 = e1 == cudaSuccess ? cudaMalloc((void**) &sc.ml, ml_b) : e1;
+    if (e1 != cudaSuccess || e2 != cudaSuccess) {
+        std::fprintf(stderr, "ds4: attn split scratch allocation failed on CUDA%d (heads=%d, %.0f MiB): %s - stock attention runs\n",
+                     dev, heads, (double) (part_b + ml_b) / 1048576.0, cudaGetErrorString(e1 != cudaSuccess ? e1 : e2));
         cudaGetLastError();
         if (sc.part != nullptr) cudaFree(sc.part);
         sc = attnsplit::AttnSplitScratch{};
+    } else {
+        std::fprintf(stderr, "ds4: attn split on CUDA%d (heads=%d, T<=%d, scratch %.0f MiB)\n", dev, heads, kSplitMaxT,
+                     (double) (part_b + ml_b) / 1048576.0);
     }
     m[{dev, s, heads}] = sc;
     return sc;
 }
 }  // namespace
+
+void attn_split_prewarm(cudaStream_t s, int heads) {
+    if (!split_usable() || heads <= 0 || heads % kSplitG != 0) return;
+    (void) split_scratch(s, heads);   // (the caller's device must be current, as after its dalloc)
+}
 
 static void sparse_attn_stock(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                               const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
@@ -3484,6 +3528,12 @@ void attn_split_check(const float* q, const uint16_t* win, const void* ckv, cons
         return e != nullptr ? std::atoi(e) : 0;
     }();
     if (budget <= 0) return;
+    if (stream_capturing(s)) {   // (the check mallocs and synchronises: it cannot run inside a capture)
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "attn split check: refused under stream capture\n");
+        return;
+    }
     static std::atomic<int> done{0};
     if (done.fetch_add(1, std::memory_order_relaxed) >= budget) return;
     auto ck = [](cudaError_t e, const char* what) {
@@ -3528,7 +3578,7 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     // one query on an A4000).  The same inputs; the merge sums the chunks in another order, so the bits differ in the last
     // place (4e-7 against a double reference).  DS4_ATTN_SPLIT=1 turns it on (off by default).  It never pre-empts a prompt
     // chunk's tensor-core request (kAttnWmma), and the chunked-prefill caller (a.gen) stays on the stock dispatch.
-    if (split_enabled() && d == 512 && ckv_fmt == kKvFp4 && a.gen == 0 && heads_per_block != kAttnWmma &&
+    if (split_usable() && d == 512 && ckv_fmt == kKvFp4 && a.gen == 0 && heads_per_block != kAttnWmma &&
         T >= 1 && T <= kSplitMaxT && heads > 0 && heads % kSplitG == 0) {
         int total_max = 0;
         for (int t = 0; t < T; ++t) total_max = std::max(total_max, a.nwin[t] + a.nsel[t]);

@@ -1,5 +1,5 @@
 // tests/ds4_attn_split_test.cu - the split-KV decode attention (DS4_ATTN_SPLIT=1, ds4_attn_split.cuh) against a
-// double-precision host reference on decode-shaped inputs (AttnRows gen 0, T = 1..5, packed kKvFp4 rows), next to
+// double-precision host reference on decode-shaped inputs (AttnRows gen 0, T = 1..16, packed kKvFp4 rows), next to
 // the stock dispatch on the same inputs.  The env switch is read once a process, so run it twice:
 //   DS4_ATTN_SPLIT=0 ./ds4_attn_split_test --dump stock.bin
 //   DS4_ATTN_SPLIT=1 ./ds4_attn_split_test --dump split.bin --cmp stock.bin
@@ -52,7 +52,7 @@ __global__ void decode_rows_kernel(const uint8_t* ckv, int n, float* out) {
 struct Cfg {
     const char* name;
     int T;
-    int nwin[5], nsel[5], win0[5];
+    int nwin[16], nsel[16], win0[16];
 };
 
 int main(int argc, char** argv) {
@@ -106,8 +106,20 @@ int main(int argc, char** argv) {
         {"T=2 verify (128+512, 129 window rows)", 2, {128, 128}, {512, 511}, {0, 1}},
         {"T=5 verify mixed", 5, {128, 64, 3, 128, 17}, {512, 300, 0, 40, 129}, {0, 5, 9, 2, 40}},
         {"T=5 all-window", 5, {128, 128, 128, 128, 128}, {0, 0, 0, 0, 0}, {0, 1, 2, 3, 4}},
+        {"T=6 verify deep (5 drafts)", 6, {128, 128, 128, 128, 128, 128}, {512, 512, 512, 512, 512, 512}, {0, 1, 2, 3, 4, 5}},
+        {"T=7 verify mixed", 7, {128, 64, 3, 128, 17, 90, 128}, {512, 300, 0, 40, 129, 7, 511}, {0, 5, 9, 2, 40, 3, 1}},
+        {"T=16 max window deep", 16,
+         {128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128},
+         {512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512},
+         {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}},
     };
-    if (time_only) cfgs = {{"T=1 deep (timing)", 1, {128}, {512}, {0}}, {"T=5 deep (timing)", 5, {128, 128, 128, 128, 128}, {512, 512, 512, 512, 512}, {0, 1, 2, 3, 4}}};
+    if (time_only) cfgs = {{"T=1 deep (timing)", 1, {128}, {512}, {0}},
+                           {"T=5 deep (timing)", 5, {128, 128, 128, 128, 128}, {512, 512, 512, 512, 512}, {0, 1, 2, 3, 4}},
+                           {"T=6 deep (timing)", 6, {128, 128, 128, 128, 128, 128}, {512, 512, 512, 512, 512, 512}, {0, 1, 2, 3, 4, 5}},
+                           {"T=16 deep (timing)", 16,
+                            {128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128},
+                            {512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512},
+                            {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}}};
 
     std::vector<float> all_out;
     bool ok = true;
@@ -213,7 +225,7 @@ int main(int argc, char** argv) {
             emax = std::max(emax, std::fabs(h_out[i] - ref[i]));
         }
         const double rel = emax / omax;
-        const bool pass = !nan && rel <= 2e-3;
+        const bool pass = !nan && rel <= 1e-4;   // (observed ~3e-6; 1e-4 still catches a 10x regression)
         ok = ok && pass;
         std::printf("%-38s |ref|max %.3g  max_abs %.3g  rel %.2e  %s%s\n", c.name, omax, emax, rel, pass ? "ok" : "FAIL", nan ? " (NaN)" : "");
         CK(cudaFree(d_win));
