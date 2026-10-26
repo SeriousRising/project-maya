@@ -460,6 +460,12 @@ def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], l
         for message in messages:
             if message.get("role") == "developer":
                 message["role"] = "system"
+            rc = message.get("reasoning_content")
+            if isinstance(rc, str) and not rc.strip():
+                # rw-13: a whitespace-only value is a client's must-echo pad (Hermes sends " " for a history
+                # turn with no reasoning text), not reasoning the model produced.  Rendered literally it puts
+                # a space where the engine holds an empty think block, breaking prompt-prefix reuse there.
+                message.pop("reasoning_content", None)
             if _has_media(message.get("content")):
                 message["content"] = _parts_of(message["content"])
             for call in message.get("tool_calls") or []:
@@ -481,7 +487,10 @@ def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], l
         # Unlike the legacy adapter, preserve tool IDs, namespaces, content_blocks,
         # mid-system roles, latest_reminder and task fields for the reference encoder.
         declared = copy.deepcopy(req.get("tools") or [])
-        tools = tools_from_openai_format(declared) if declared else None
+        # rw-13: same stabilization as the legacy branch - the encoder renders tools at the prompt's head,
+        # so a client's registration-order swap would otherwise break the engine's prompt-prefix reuse.
+        # tools_from_openai_format already returns flat dicts keyed by the namespace-qualified name.
+        tools = stable_tool_order(tools_from_openai_format(declared)) if declared else None
         if req.get("tool_choice") == "none":
             tools = None
             for message in messages:
@@ -591,8 +600,7 @@ def anthropic_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict]
             messages.append(out)
     tools = [{"name": t["name"], "description": t.get("description", ""),
               "parameters": t.get("input_schema", {})} for t in req.get("tools") or []] or None
-    if not deepseek:
-        tools = stable_tool_order(tools)
+    tools = stable_tool_order(tools)   # rw-13: DeepSeek renders tools at the prompt's head too
     if isinstance(req.get("tool_choice"), dict) and req["tool_choice"].get("type") == "none":
         tools = None
     kwargs = {}
