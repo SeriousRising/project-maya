@@ -212,6 +212,19 @@ std::string per_position(const strata::ds4::Stats& s0, const strata::ds4::Stats&
     return pp;
 }
 
+// The drafter's and the verify windows' time between two counters, and their share of `ms` (a decode's time): what a
+// drafter pass costs, and how many passes had every draft cut (no window followed)
+std::string dspark_time(const strata::ds4::Stats& s0, const strata::ds4::Stats& s1, double ms) {
+    const long long np = s1.drafts_rounds - s0.drafts_rounds, nv = s1.verify_rounds - s0.verify_rounds;
+    const double dm = s1.draft_ms - s0.draft_ms, vm = s1.verify_ms - s0.verify_ms;
+    char b[256];
+    std::snprintf(b, sizeof b, "drafter %.2f ms a pass over %lld passes (%lld with every draft cut), verify %.2f ms a "
+                  "window over %lld windows; %.1f%% / %.1f%% of the decode's %.0f ms", np > 0 ? dm / (double) np : 0.0,
+                  np, np - nv, nv > 0 ? vm / (double) nv : 0.0, nv, ms > 0 ? 100.0 * dm / ms : 0.0,
+                  ms > 0 ? 100.0 * vm / ms : 0.0, ms);
+    return b;
+}
+
 // The drafts' cut on the product of their confidences (DeepInfer's cumulative rule, GLM's spec_cum): a draft is
 // verified while the chance that it and every draft before it are kept stays at least this - a long window whose later
 // drafts are likely lost is not verified whole.  MAYA_DS4_DSPARK_CUM=F (STRATA_DS4_DSPARK_CUM), a request's dspark_cum
@@ -1098,6 +1111,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                                             : 0.0);
         if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
                                     per_position(s_dec, s).c_str());
+        if (s.drafts_rounds > s_dec.drafts_rounds)
+            std::fprintf(stderr, "maya ds4 serve: %s\n", dspark_time(s_dec, s, t2 - t1).c_str());
         prof_line(s_dec, s);   // DS4_PROF: this request's decode (the CLI's line, a request at a time)
         m.save_profile();
     }
@@ -1414,6 +1429,9 @@ int serve_pipe(strata::ds4::Model& m, const std::string& eos_list, bool spec, fl
         if (g.d_off > 0)
             std::fprintf(stderr, "maya ds4 serve (pipe): request %lld drafts %lld of %lld kept\n", g.r.rid, g.d_acc,
                          g.d_off);
+        if (s.drafts_rounds > g.s_dec.drafts_rounds)   // (its lone rounds: no other request drafts meanwhile)
+            std::fprintf(stderr, "maya ds4 serve (pipe): request %lld %s\n", g.r.rid,
+                         dspark_time(g.s_dec, s, t2 - g.t1).c_str());
         if (g.piped && g.n_pipe > 0)   // where a pipelined step's time went, and the model's (shared) counters
             std::fprintf(stderr,
                          "maya ds4 serve (pipe): request %lld pipe timing over %lld steps: issue %.2f ms/step, "
@@ -1950,7 +1968,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "dspark: %lld rounds, %lld drafts offered, %lld accepted (%.2f tokens a round); drafting "
                              "%.2f ms a round, verifying %.1f ms in all (%lld windows)\n",
                      rounds, d_off, d_acc, (double) out.size() / (double) rounds, (s1.draft_ms - s0.draft_ms) / nv,
-                     s1.verify_ms - s0.verify_ms, (long long) (s1.drafts_offered > 0 ? 0 : 0));
+                     s1.verify_ms - s0.verify_ms, (long long) (s1.verify_rounds - s0.verify_rounds));
         std::fprintf(stderr, "dspark %s\n", per_position(s0, s1).c_str());
     }
     const double t2 = now_ms();

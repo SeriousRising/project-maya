@@ -10806,6 +10806,7 @@ struct Model::Impl {
         const double tv = now_ms();
         const bool ok = forward(tk, T, T, err, 0);   // (a window streams nothing - the lane is a decoded token's)
         st.verify_ms += now_ms() - tv;
+        ++st.verify_rounds;
         spec_win = false;
         if (!ok) return false;
         Dev& hd = devs[(size_t) head_dev];
