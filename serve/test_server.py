@@ -506,6 +506,28 @@ class BurstEngine(MockEngine):
             yield t
 
 
+class PatternBurstEngine(MockEngine):
+    """Only a few tokens are ever 'already queued': BURST at a time, then the queue empties, so
+    Service.run must flush each small burst instead of holding its text for the next one."""
+
+    BURST = 3
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self._pending = 0
+        self.yielded = 0
+
+    def burst_pending(self):
+        return self._pending
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        total = len(self.script[:max_new])
+        for i, t in enumerate(super().generate(ids, max_new, sampling, cancel, embeddings)):
+            self.yielded += 1
+            self._pending = max(0, min(total - self.yielded, self.BURST - 1 - (i % self.BURST)))
+            yield t
+
+
 class SseBursts(unittest.TestCase):
     """rw-13: tokens that arrive in an engine burst go out as one SSE chunk per burst instead of one
     json.dumps + flush per token.  The concatenated deltas (and every non-text chunk) are unchanged."""
@@ -542,6 +564,135 @@ class SseBursts(unittest.TestCase):
         plain = self.chunks(MockEngine)
         self.assertEqual(len(off), len(plain))
         self.assertEqual(self.texts(off, "content"), self.texts(plain, "content"))
+
+    TOOLS = [{"name": "get_weather", "parameters": {"type": "object", "properties": {
+        "city": {"type": "string"}, "days": {"type": "integer"}}}}]
+    TOOL_SCRIPT = ("thinking about the weather</think>\n\nChecking the weather.\n\n"
+                   "<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\n"
+                   "<arg_key>days</arg_key>\n<arg_value>3</arg_value>\n</tool_call>"
+                   "\n\nThat is the forecast STOPHERE and trailing junk")
+
+    def run_events(self, engine_cls, script, **run_kw):
+        tok = ByteTokenizer()
+        svc = Service(engine_cls(tok, script, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        evs, done = [], None
+        for kind, v in svc.run([1, 2, 3], run_kw.pop("thinking", True), run_kw.pop("tools", None), 500,
+                               run_kw.pop("sampling", {}), threading.Event()):
+            if kind == "event":
+                evs.append(v)
+            elif kind == "done":
+                done = v
+        return evs, done
+
+    @staticmethod
+    def describe(evs):
+        """Events as comparable tuples: a call's id (a uuid) becomes its order of first appearance,
+        and empty text events, which the chunk builders skip, are dropped."""
+        seen, out = {}, []
+        for ev in evs:
+            cid = seen.setdefault(ev.call.id, len(seen)) if ev.call is not None else None
+            if ev.kind == "tool_call":
+                out.append((ev.kind, cid, ev.call.name,
+                            json.dumps(ev.call.arguments, sort_keys=True), ev.complete))
+            elif ev.kind == "tool_start":
+                out.append((ev.kind, cid, ev.call.name))
+            elif ev.kind in ("reasoning", "content", "tool_args"):
+                if ev.text:
+                    out.append((ev.kind, cid, ev.text))
+            else:
+                out.append((ev.kind, cid, ev.text))
+        return out
+
+    @staticmethod
+    def merged(rows):
+        out = []
+        for row in rows:
+            if out and row[0] in ("reasoning", "content", "tool_args") \
+                    and out[-1][0] == row[0] and out[-1][1] == row[1]:
+                out[-1] = (row[0], row[1], out[-1][2] + row[2])
+            else:
+                out.append(row)
+        return out
+
+    def test_burst_events_are_the_unbatched_events_merged(self):
+        # Review S1: the exact neutrality claim, on a script with reasoning, content, a streamed tool
+        # call and a client stop string - merging (or a flush in the wrong place) must not reorder a
+        # content event past a tool_start, and the stop must cut both runs at the same place.
+        kw = {"sampling": {"stop": ["STOPHERE"]}, "tools": self.TOOLS}
+        plain, pdone = self.run_events(MockEngine, self.TOOL_SCRIPT, **kw)
+        burst, bdone = self.run_events(BurstEngine, self.TOOL_SCRIPT, **kw)
+        self.assertEqual(self.merged(self.describe(plain)), self.describe(burst))
+        self.assertLess(len(burst), len(plain))
+        for done in (pdone, bdone):
+            self.assertEqual((done["finish"], done["stop_sequence"]), ("stop", "STOPHERE"))
+        kinds = [e.kind for e in burst]
+        self.assertLess(kinds.index("content"), kinds.index("tool_start"))
+        self.assertLess(kinds.index("tool_start"), kinds.index("tool_args"))
+        self.assertLess(len(kinds) - 1 - kinds[::-1].index("tool_args"), kinds.index("tool_call"))
+        self.assertLess(kinds.index("tool_call"), len(kinds) - 1 - kinds[::-1].index("content"))
+        self.assertEqual(json.loads("".join(e.text for e in burst if e.kind == "tool_args")),
+                         {"city": "Paris", "days": 3})
+        call = [e.call for e in burst if e.kind == "tool_call"][0]
+        self.assertEqual((call.name, call.arguments), ("get_weather", {"city": "Paris", "days": 3}))
+        content = "".join(e.text for e in burst if e.kind == "content")
+        self.assertIn("That is the forecast", content)
+        self.assertNotIn("STOPHERE", content)
+        self.assertNotIn("trailing junk", content)
+
+    def test_small_bursts_flush_at_each_boundary(self):
+        # Review S1: with only a few tokens waiting at a time, a burst's text is yielded as soon as
+        # its burst ends (pending reaches 0), mid-stream - holding never waits for the next burst.
+        tok = ByteTokenizer()
+        engine = PatternBurstEngine(tok, "abcdefghijklmnopqrst", max_context=CTX)
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        got = []                       # (text, engine tokens handed over when it reached us)
+        for kind, v in svc.run([1, 2, 3], False, None, 500, {}, threading.Event()):
+            if kind == "event" and v.text:
+                got.append((v.text, engine.yielded))
+        self.assertEqual([t for t, _ in got], ["abc", "def", "ghi", "jkl", "mno", "pqr", "st"])
+        self.assertEqual([n for _, n in got], [3, 6, 9, 12, 15, 18, 21])
+
+    def test_burst_through_the_real_engine_queue(self):
+        # Review S1: through StrataEngine + serve/fake_multi_engine.py - the real
+        # _tls.pending = q.qsize() path, not BurstEngine's say-so.  The fake answers a prompt with
+        # its own ids (+1000), and FAKE_MULTI_BURST writes its token lines in bursts.
+        class FakeTok(ByteTokenizer):
+            def decode(self, ids, errors="replace"):
+                raw = bytearray()
+                for t in ids:
+                    raw += bytes([t - 1000]) if t >= 1000 else \
+                        (self.SPECIALS[t - 256].encode() if t >= 256 else bytes([t]))
+                return raw.decode("utf-8", errors=errors)
+
+        script = "burst through the real engine queue. " * 6
+        ids = list(script.encode())
+        engine = StrataEngine(str(ROOT / "serve/fake_multi_engine.py"), ["1"],
+                              env={**os.environ, "FAKE_MULTI_BURST": "16"})
+        try:
+            pending_seen, real_pending = [], engine.burst_pending
+
+            def recording_pending():
+                v = real_pending()
+                pending_seen.append(v)
+                return v
+
+            engine.burst_pending = recording_pending
+            tok = FakeTok()
+            svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+            evs, done = [], None
+            for kind, v in svc.run(ids, False, None, len(ids), {}, threading.Event()):
+                if kind == "event":
+                    evs.append(v)
+                elif kind == "done":
+                    done = v
+            self.assertEqual("".join(e.text for e in evs if e.kind == "content"), script)
+            self.assertGreater(max(pending_seen), 0)          # the queue really had a burst waiting
+            self.assertLess(len([e for e in evs if e.kind == "content"]), len(ids) // 2)
+            self.assertEqual(done["completion_tokens"], len(ids))
+            self.assertEqual(engine.burst_pending(), 0)       # nothing left after the request
+        finally:
+            engine.close()
 
 
 class ClientShapes(unittest.TestCase):

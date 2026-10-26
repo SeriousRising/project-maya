@@ -5,6 +5,8 @@ interleaved token by token as the pipelined decode interleaves them; STOP <id> e
 FAKE_MULTI_INTERLEAVE=<n> (STRATA_GLM_PREFILL_INTERLEAVE's line pattern): a prompt is read n ids a piece, one PP line
 each, while the requests already running decode a token each between two pieces; one prompt is read at a time (later
 ones queue), and a STOP for the one being read ends it with no token.
+FAKE_MULTI_BURST=<n>: token lines go out n at a time in one flush, with no pause between them (an engine
+burst - serve/test_server.py's SSE merging, exercised through StrataEngine's per-request queue).
 
     serve/fake_multi_engine.py --serve <n>        (StrataEngine starts it as it starts `strata`)
 """
@@ -17,6 +19,7 @@ import time
 
 n = int(sys.argv[-1]) if len(sys.argv) > 1 and sys.argv[-1].isdigit() else 2
 piece = int(os.environ.get("FAKE_MULTI_INTERLEAVE", "0") or 0)
+burst = int(os.environ.get("FAKE_MULTI_BURST", "0") or 0)
 lock = threading.Lock()
 active: dict[int, dict] = {}
 reading: list[int] = []                               # FAKE_MULTI_INTERLEAVE: prompts to read, the first being read
@@ -88,7 +91,7 @@ while not quit_.is_set():
     if not rids:
         time.sleep(0.002)
         continue
-    for rid in rids:                                  # one token of each, in turn
+    for rid in rids:                                  # one token of each, in turn (a burst of them with FAKE_MULTI_BURST)
         with lock:
             r = active.get(rid)
             if r is None or rid in reading:
@@ -99,7 +102,10 @@ while not quit_.is_set():
                 out(f"DONE {rid} {r['n']} {r['total']} 0.0 1.0 {'cancel' if stopped else 'length'} 0 0 0")   # (prompt: its own)
                 del active[rid]
                 continue
-            t = r["left"].pop(0)
-            r["n"] += 1
-        out(f"T {rid} {t}")
-        time.sleep(0.003)
+            take = r["left"][:burst or 1]
+            del r["left"][:len(take)]
+            r["n"] += len(take)
+        sys.stdout.write("".join(f"T {rid} {t}\n" for t in take))
+        sys.stdout.flush()
+        if not burst:
+            time.sleep(0.003)
