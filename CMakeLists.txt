@@ -76,16 +76,16 @@ if(STRATA_ENABLE_CUDA)
   endif()
   foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
     string(REGEX REPLACE "-.*$" "" _base "${_a}")     # 120-real / 120-virtual are still 120
-    # Turing port: developed and measured on sm_120 (RTX 50); the tf32 mma in the QSA scorer has a
-    # portable fp32-FMA fallback, so RTX 20 (75), 30 (86), RTX 40 (89) and RTX 50 (120) build too.
-    # Pre-sm_75 is refused.
+    # Developed on sm_120 (RTX 50) and Volta (sm_70: GLM, maya-ds4 and maya-mm3 run on V100s); GLM also builds for
+    # Pascal (sm_6x, experimental - maya.py's MIN_CC).  Below sm_60 is refused.  maya-mm3 is built for sm_70 and
+    # newer only (its kernels take more than Pascal's 4 KB of parameters: _mm3_archs below).
     if(_base STREQUAL "native" OR _base STREQUAL "all" OR _base STREQUAL "all-major")
       continue()
     endif()
-    if(_base LESS 75)
+    if(_base LESS 60)
       message(FATAL_ERROR
-        "Maya needs an NVIDIA GPU of compute capability 7.5 or newer (RTX 20 / 30 / 40 / 50 series), but "
-        "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}'.")
+        "Maya needs an NVIDIA GPU of compute capability 6.0 or newer (Pascal experimental, Volta / V100 and the "
+        "RTX 20 / 30 / 40 / 50 series), but CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}'.")
     endif()
   endforeach()
   message(STATUS "Maya: CUDA enabled, arch ${CMAKE_CUDA_ARCHITECTURES}")
@@ -502,6 +502,82 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                                        src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_host_ar.cpp)
     target_include_directories(ds4_attn_split_test PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
     target_link_libraries(ds4_attn_split_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
+  endif()
+
+  # MiniMax-M3.1-Flash (EXL3, tools/mm3/pack.py): its own engine (src/mm3), with its own copy of the EXL3 device kernels
+  # (swigluoai) - none of the other engines' code but maya-ds4's OS helpers (src/ds4/ds4_os.hpp).  CUDA, on Linux and
+  # Windows.  For sm_70 and newer only: its EXL3 kernels take more than the 4 KB of parameters before Volta allows
+  # (a "native" build on a PC with an older display card beside its GPUs - a Quadro P400 - leaves that card out).
+  set(_mm3_archs)
+  set(_mm3_filter OFF)
+  if(STRATA_ENABLE_CUDA AND _strata_archs)
+    set(_mm3_filter ON)
+    foreach(_a IN LISTS _strata_archs)
+      string(REGEX REPLACE "-.*$" "" _base "${_a}")
+      if(NOT _base MATCHES "^[0-9]+$")
+        set(_mm3_filter OFF)   # ("all" / "all-major": as CMake gives them)
+      elseif(NOT _base LESS 70)
+        list(APPEND _mm3_archs "${_a}")
+      endif()
+    endforeach()
+    if(_mm3_filter AND NOT _mm3_archs)
+      message(STATUS "Maya: maya-mm3 not built - it needs sm_70 or newer, arch ${_strata_archs}")
+    endif()
+  endif()
+  if(STRATA_ENABLE_CUDA AND (_mm3_archs OR NOT _mm3_filter))
+    add_executable(maya-mm3 src/mm3/mm3_main.cpp src/mm3/mm3_model.cu src/mm3/mm3_kernels.cu src/mm3/mm3_exl3.cu
+                            src/mm3/mm3_cpu.cpp src/mm3/mm3_host.cpp src/mm3/mm3_dspark.cu
+                            src/mm3/mm3_vision.cu src/mm3/mm3_tp.cu)
+    target_include_directories(maya-mm3 PRIVATE ${_strata_gpu_include_directories} include src/mm3)
+    # (the CPU lane: the shared CPU EXL3 kernels, used as they are)
+    target_link_libraries(maya-mm3 PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+    if(STRATA_BUILD_TESTS)
+      # maya-mm3's EXL3 kernels against the scalar CPU reference (random matrices, no model): exl3_test's cases with
+      # swigluoai, the Volta / Turing tensor-core tiles and the FP16 GEMM path before sm_80
+      add_executable(mm3_exl3_test tests/mm3_exl3_test.cu src/mm3/mm3_exl3.cu)
+      target_include_directories(mm3_exl3_test PRIVATE ${_strata_gpu_include_directories} include src/mm3)
+      target_link_libraries(mm3_exl3_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target}
+                            ${_strata_gpu_blas_target})
+      add_test(NAME mm3_exl3_test COMMAND mm3_exl3_test)
+      set_tests_properties(mm3_exl3_test PROPERTIES TIMEOUT 300)
+      # the K / V caches in every format (BF16, INT8, FP8, FP4, mixed; rows rotated or not) and the sparse attention
+      # over them: exact over the decoded rows, KV streaming the same bits, each format's error (no model)
+      add_executable(mm3_kv_test tests/mm3_kv_test.cu src/mm3/mm3_kernels.cu)
+      target_include_directories(mm3_kv_test PRIVATE ${_strata_gpu_include_directories} include src/mm3)
+      target_link_libraries(mm3_kv_test PRIVATE ${_strata_gpu_runtime_target})
+      add_test(NAME mm3_kv_test COMMAND mm3_kv_test)
+      set_tests_properties(mm3_kv_test PROPERTIES TIMEOUT 600)
+      if(NOT WIN32)
+        # maya-mm3's kernels against F64 host references: the candidates' top-k, the INT8 / rotated K / V attention and
+        # its split, the sampled draft step, the pipeline's waits (no model)
+        add_executable(mm3_kernels_test tests/mm3_kernels_test.cu src/mm3/mm3_kernels.cu)
+        target_include_directories(mm3_kernels_test PRIVATE ${_strata_gpu_include_directories} include src/mm3)
+        target_link_libraries(mm3_kernels_test PRIVATE ${_strata_gpu_runtime_target})
+        add_test(NAME mm3_kernels_test COMMAND mm3_kernels_test)
+        set_tests_properties(mm3_kernels_test PROPERTIES TIMEOUT 600)
+        # the CPU lane's one-dispatch schedule against its four phases on random EXL3 sub-experts: the same bits
+        # (its own stubs of expert_layout.cpp / pool.cpp: the shared CPU EXL3 kernels' source alone, not the library)
+        add_executable(mm3_lane_test tests/mm3_lane_test.cpp src/mm3/mm3_cpu.cpp src/kernels/cpu/exl3_cpu.cpp)
+        target_include_directories(mm3_lane_test PRIVATE include src/mm3)
+        target_compile_options(mm3_lane_test PRIVATE -mavx2 -mfma -mf16c)
+        target_link_libraries(mm3_lane_test PRIVATE Threads::Threads)
+        add_test(NAME mm3_lane_test COMMAND mm3_lane_test)
+        set_tests_properties(mm3_lane_test PROPERTIES TIMEOUT 600)
+        # the sampler (mm3_sample.hpp): candidates' distributions, penalties, speculative sampling's exactness
+        add_executable(mm3_sampler_test tests/mm3_sampler_test.cpp)
+        target_include_directories(mm3_sampler_test PRIVATE include src/mm3)
+        add_test(NAME mm3_sampler_test COMMAND mm3_sampler_test)
+        set_tests_properties(mm3_sampler_test PROPERTIES TIMEOUT 300)
+      endif()
+    endif()
+    if(_mm3_filter)
+      foreach(_t maya-mm3 mm3_exl3_test mm3_kv_test mm3_kernels_test)
+        if(TARGET ${_t})
+          set_target_properties(${_t} PROPERTIES CUDA_ARCHITECTURES "${_mm3_archs}")
+        endif()
+      endforeach()
+      message(STATUS "Maya: maya-mm3 for ${_mm3_archs}")
+    endif()
   endif()
 
   if(STRATA_ENABLE_HIP)

@@ -4,6 +4,39 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.29 - 2026-10-26
+
+MiniMax-M3.1-Flash joins GLM and DeepSeek as Maya's third model, on an engine of its own, with MiniMax's own
+settings and fitted to each PC from the first release.
+
+- **MiniMax-M3.1-Flash on its own engine** (#477, @needmorevram): `./setup.sh --model MiniMax-M3.1-Flash` downloads
+  Mia-AiLab's EXL3 3.5 bpw quant (197 GB, every file checked) and runs it on `maya-mm3`, the engine @needmorevram
+  built for this model: tensor parallel over groups of GPUs, the DSpark drafter (about 1.5x decode in his runs),
+  pictures, a streamed K/V cache, and the experts VRAM cannot hold computed on the CPU from RAM. On an RTX 3090 with
+  eight RTX 5060 Ti he measured 38.2 tokens/s writing code.
+- **Prompts about 4.5x faster, decode up to 13% faster** (#490, @needmorevram, his figures): with tensor parallel the
+  GPU groups now read a long prompt together, with the same perplexity. Also from him: a rotation that cuts the INT8
+  K/V cache's quality loss by about three quarters (now on by default), and MiniMax tool calls keep a value that may
+  be a string as a string.
+- **Windows and V100-class GPUs:** MiniMax runs wherever DeepSeek's EXL3 does: NVIDIA from V100 up, on Linux and
+  Windows (Windows is new: tell us how it goes), with the V100, T4 and RTX 20 tensor cores in use.
+- **A compact K/V cache by default:** INT8 takes half of BF16's memory, so a longer context or more experts fit;
+  `fp8`, `fp4` and mixes are options (`--kv-cache`).
+- **Pictures on, never parked in VRAM:** the vision tower stays in RAM or on the SSD and comes to the GPU only while
+  a picture is read, so the VRAM goes to the model.
+- **Fitted to each PC:** the setup recommends the context (up to the model's 1M) by the PC's memory, the engine plans
+  VRAM and RAM at start and steps down with a note instead of failing, the DSpark drafter stays only where it measures
+  faster, and the CPU lane uses the PC's own cores.
+- **MiniMax's own settings:** the model card's sampling (temperature 1.0, top-p 0.95), MiniMax's official prompt
+  format, and its thinking levels in the chat: Auto (the default, the model decides whether to think), Low to Max,
+  and Off.
+- **Fix: an empty answer after an engine error** (DeepSeek and MiniMax): the request after a failed one (an
+  unreadable picture, for example) now gets its own answer.
+- **New setting:** `"reasoning_effort": "auto"` (any model) asks for the model's own default level.
+
+**MiniMax runs on** NVIDIA V100 / RTX 20 and newer, Linux and Windows, with about 250 GB of VRAM and RAM together. Its license,
+the MiniMax Community License (`LICENSE.minimax-m31`), allows non-commercial use freely; commercial use has conditions.
+
 ## v1.1.28 - 2026-10-25
 
 DeepSeek decodes faster on a single NVIDIA GPU and reaches its full 1M context, the chat stays steady while it writes

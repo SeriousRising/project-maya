@@ -79,6 +79,26 @@ results. See [the prompt format notes](docs/deepseek-prompt-format.md) for API d
   setup asks for a page file big enough to keep every expert on the GPU and says the size
   ([docs/AMD_MAYA.md](docs/AMD_MAYA.md)).
 
+### MiniMax-M3.1-Flash (new, experimental)
+
+The setup also offers **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)** (MiniMax; 428 B
+parameters, 23 B active per token; the [MiniMax Community License](LICENSE.minimax-m31): free for non-commercial use,
+commercial use has conditions) on an engine of its own (`maya-mm3`, contributed by
+[@needmorevram](https://github.com/needmorevram), #477): `./setup.sh --model MiniMax-M3.1-Flash`.
+
+| Files | Size | Runs on |
+| --- | ---: | --- |
+| Mia-AiLab's [EXL3 3.5 bpw](https://huggingface.co/Mia-AiLab/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.5-bpw), with MiniMax's DSpark drafter and vision tower | 197 GB | NVIDIA V100 / RTX 20 and newer, Linux and Windows |
+
+- **Set up for your PC:** the experts that do not fit in VRAM are computed on the CPU from RAM; the context (up to the
+  model's 1M) is recommended by your memory; tensor parallel where the GPUs form groups; and the DSpark drafter only
+  where it measures faster on your PC.
+- **MiniMax's own settings:** the model card's sampling (temperature 1.0, top-p 0.95) and its thinking levels - Auto
+  (the default: it decides whether to think), the five efforts Low to Max, and Off - with MiniMax's own prompt format.
+- **Pictures:** on from the start, the model's vision tower running in the engine; `--no-vision` leaves it out.
+- **Tool calls, the OpenAI- and Anthropic-compatible API and the dashboard** work as for the other models, with its
+  own numbers in the monitor.
+
 <details>
 <summary>Community quants that also run on Maya</summary>
 
@@ -156,6 +176,12 @@ slowest while the caches fill with what you use. Share yours: `--bench`, then `-
 | **2x RX 7900 XTX 24 GB** (tensor parallel 2, PCIe 4.0 x4 each) + **Radeon 8060S** helper (Ryzen AI Max+ 395, 128 GB), the model on a USB4 NVMe | Maya-S, a 130K-token prompt | 37.1 tokens/s (42.8 with the prompt cached) | 155 tokens/s (130K) | @pepuscz (v1.1.21 + its own changes, #410) |
 | **2x RTX 4090 24 GB** (PCIe 3.0 + 4.0 x16), 2x Xeon Silver 4309Y, 188 GB RAM | Maya-XS, 64K context | 21.5 tokens/s | 573 tokens/s | @fuad00 (v1.1.22, #393) |
 
+**MiniMax-M3.1-Flash** (`maya-mm3`):
+
+| Machine | Model | Decode (writing the answer) | Prefill (reading your prompt) | By |
+| --- | --- | ---: | ---: | --- |
+| **RTX 3090 24 GB + 8x RTX 5060 Ti 16 GB** (PCIe 3.0 x8 each), 183 GB RAM | EXL3 3.5 bpw, tensor parallel 4 + DSpark, 8K context | **38.2 tokens/s** (code), 32.4 (prose) | - | @needmorevram (#477) |
+
 **Several requests at once** (`--parallel`) add up: on one GPU a token of each goes through the model together, so
 the dense weights are read once for all of them. In tokens per second for all of them together, against the same
 questions one after another: x1.41 for two and x1.35 for four on a V100 that streams most of Maya-S's experts from
@@ -169,7 +195,7 @@ VRAM holds, the more it gains ([how](docs/SETTINGS.md#several-requests-at-once))
 | --- | --- |
 | **GPU** | NVIDIA, compute capability 7.0 or newer (V100, RTX 20 and newer): one, or up to 16 that share the model. More VRAM is faster. Pascal (Tesla P40 / P100, GTX 10) is experimental, not validated yet. **AMD (experimental):** RX 7900 XT / XTX, Radeon AI PRO R9700 / RX 9070, Strix Halo and Gorgon Halo (Radeon 8060S / 8065S); RX 6800 / 6900 and Radeon PRO V620 / W6800 not validated yet; GLM-5.3-Flash reads text only there, DeepSeek-V4.1-Flash-1017 pictures too - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
 | **RAM** | 32 GB runs it. More RAM keeps more experts close and is faster |
-| **Disk** | **A fast NVMe SSD** with room for the model (~100 GB for Maya-S, ~160 GB for Maya-L, ~350 GB for DeepSeek-V4.1-Flash-1017's Maya-S, ~520 GB for unsloth's GGUF) and its picture encoder (1.1 GB). Not a hard disk |
+| **Disk** | **A fast NVMe SSD** with room for the model (~100 GB for Maya-S, ~160 GB for Maya-L, ~350 GB for DeepSeek-V4.1-Flash-1017's Maya-S, ~520 GB for unsloth's GGUF, ~200 GB for MiniMax-M3.1-Flash) and its picture encoder (1.1 GB). Not a hard disk |
 | **System** | Linux (x86-64; a CPU with AVX2 is best), the NVIDIA driver, CUDA 12.x (CUDA 13 works for RTX 20 and newer, not for the V100 or Pascal), g++, Python 3.10+. Windows 10/11 (experimental): [docs/WINDOWS.md](docs/WINDOWS.md). Not WSL2. AMD: ROCm 7 |
 
 The setup checks all of this, prints the exact command for anything missing, and installs nothing system-wide.

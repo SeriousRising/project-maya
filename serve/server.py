@@ -11,7 +11,8 @@ Images (optional, when the config has a "vision" entry): OpenAI image_url parts 
 data, http(s) URLs or local file paths) go through `maya-vision` (the model's mmproj file) and reach the engine as
 embeddings (`GENI`).  JPEG/PNG/BMP/GIF go straight in; WebP, TIFF, AVIF, ... (agents like omp send WebP) are
 converted to PNG first with Pillow.  DeepSeek-V4.1 (maya-ds4, `INFO vision=ds4`) runs its vision tower in the engine:
-the server only resizes the pictures (serve/ds4_vision.py) and sends their pixels with `GENI`.
+the server only resizes the pictures (serve/ds4_vision.py) and sends their pixels with `GENI`; so does
+MiniMax-M3.1-Flash (maya-mm3 with --vision on, `INFO vision=mm3`, serve/mm3_vision.py).
 Requests whose prompt plus max tokens exceed the engine's context are REJECTED with 400, never truncated.
 An unset (or 0, or -1) max tokens means "unlimited": whatever the prompt leaves of the context.
 
@@ -50,10 +51,13 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve import ds4_vision, gpu_map  # noqa: E402
-from serve.frontend import (CALL_START, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            deepseek_effort_kwargs, deepseek_images, effort_kwargs, effort_level, literal_tags,
-                            mark_literals, media_of, openai_to_messages, unmark_literals)
+from serve import ds4_vision, gpu_map, mm3_vision  # noqa: E402
+
+ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
+from serve.frontend import (CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
+                            EFFORT_WORDS, anthropic_to_messages, deepseek_effort_kwargs, deepseek_images, effort_kwargs,
+                            effort_level, effort_name, literal_tags, mark_literals, media_of, openai_to_messages,
+                            unmark_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.responses import (ResponseStore, input_items, input_page, normalize_request,  # noqa: E402
                              new_response, response_collect, response_events)
@@ -109,8 +113,9 @@ def nvml_pids(pid: int | None, listed: set) -> set:
 CONTEXT_MIN = 4096          # the dashboard's Context size: the smallest it offers ...
 CONTEXT_FALLBACK_MAX = 262144   # ... and the largest when the model file does not say what it was trained for
 # the largest context the dashboard offers without an "untested" warning, by engine: maya-ds4 its model's own 1M; the
-# GLM engine's 256K
-CONTEXT_TESTED = {"ds4": 1048576}
+# GLM engine's 256K, and maya-mm3's 256K (MiniMax-M3.1 is offered up to its 1M; past 256K it has not been run end to
+# end yet)
+CONTEXT_TESTED = {"ds4": 1048576, "mm3": 262144}
 CONTEXT_TESTED_DEFAULT = 262144
 # the engine log's lines a report carries (maya.py's --report reads the same ones)
 REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm stat|glm slots|glm prefill: \d|ERR|error|"
@@ -958,6 +963,7 @@ class StrataEngine:
                     return
                 elif line.startswith("ERR"):
                     done = True
+                    self._done_after_err()        # (maya-ds4 / maya-mm3 end the request with a DONE after it)
                     raise ValueError(line[4:].strip())
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
@@ -977,11 +983,41 @@ class StrataEngine:
                         print(f"[maya] stopped, and the engine did not say the request had ended within {DRAIN_S:.0f} s "
                               "(STRATA_DRAIN_S) - going on; the engine may still be writing it", flush=True)
                         break
-                    if line is None or line.startswith("ERR"):
+                    if line is None:
+                        self.lines.put(None)                # (the engine is gone: the next reader hears it too)
+                        break
+                    if line.startswith("ERR"):
+                        self._done_after_err()
                         break
                     if line.startswith("DONE"):
                         self._parse_done(line)
                         break
+
+    # How long, after an ERR, the reader waits for the DONE that may follow it: maya-ds4 and maya-mm3 print one right
+    # after (in the same flush), the GLM engine none for most errors - so a short wait, not DRAIN_S.
+    ERR_DONE_S = 0.5
+
+    def _done_after_err(self):
+        """After an ERR (single stream): take the DONE the engine may print after it, so the next request does not read
+        that stale DONE as its own end (it returned an empty answer).  STAT / NOTE lines meanwhile are handled; the
+        wait ends at another line, at the engine's end or after ERR_DONE_S."""
+        end = time.monotonic() + self.ERR_DONE_S
+        while True:
+            try:
+                line = self.lines.get(timeout=max(0.01, end - time.monotonic()))
+            except queue.Empty:
+                return
+            if line is None:
+                self.lines.put(None)
+                return
+            if line.startswith("DONE"):
+                return
+            if line.startswith("STAT "):
+                self._parse_stat(line)
+            elif line.startswith("NOTE "):
+                print("[maya] " + line[5:].strip(), flush=True)
+            else:
+                return                                  # (not this request's end: dropped, as before)
 
     def command(self, line: str, expect: str, timeout: float = 60.0) -> str:
         """One control line between requests (the GLM engine's VLEND / VRECLAIM) -> its answer line; ValueError on
@@ -1471,18 +1507,19 @@ def trained_context(model_dir) -> int | None:
 
 
 def trained_context_ds4(pack) -> int | None:
-    """DeepSeek's: the context its pack says the model was trained for (ds4.txt's max_position_embeddings, from the
-    model's config.json or a GGUF's context_length; V4.1-Flash: 1,048,576, its native reach), the top of the dashboard's
-    Context size.  None when the pack does not say."""
-    try:
-        with open(Path(pack) / "ds4.txt", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                k, _, v = line.strip().partition(" ")
-                if k == "max_position_embeddings":
-                    n = int(v.split()[0])
-                    return n if n > 0 else None
-    except (OSError, ValueError, IndexError):
-        pass
+    """DeepSeek's and MiniMax's: the context its pack says the model was trained for (ds4.txt's / mm3.txt's
+    max_position_embeddings, from the model's config.json or a GGUF's context_length; V4.1-Flash and M3.1-Flash:
+    1,048,576, their native reach), the top of the dashboard's Context size.  None when the pack does not say."""
+    for name in ("ds4.txt", "mm3.txt"):
+        try:
+            with open(Path(pack) / name, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    k, _, v = line.strip().partition(" ")
+                    if k == "max_position_embeddings":
+                        n = int(v.split()[0])
+                        return n if n > 0 else None
+        except (OSError, ValueError, IndexError):
+            continue
     return None
 
 
@@ -1627,15 +1664,19 @@ class Service:
         self.stop_ids = set(_special_ids(IM_END) + _special_ids("<|endoftext|>") + _special_ids("<|user|>") +
                             _special_ids("<|observation|>") +
                             # DeepSeek-V4.1 ends a turn with its EOS (and would start the next with <｜User｜>)
-                            _special_ids("<｜end▁of▁sentence｜>") + _special_ids("<｜User｜>"))
+                            _special_ids("<｜end▁of▁sentence｜>") + _special_ids("<｜User｜>") +
+                            # MiniMax-M3.1 with [e~[ (and would start the next turn with ]~b])
+                            _special_ids("[e~[") + _special_ids("]~b]"))
         # ... and a model that spells a role marker out of ordinary pieces ('<|', 'user', '|>') has ended its turn just
         # the same: the text stops there.  Only markers that are special tokens in this vocabulary count.
-        self.stop_texts = [s for s in ("<|user|>", "<|observation|>", "<|endoftext|>", "<｜end▁of▁sentence｜>", "<｜User｜>")
+        self.stop_texts = [s for s in ("<|user|>", "<|observation|>", "<|endoftext|>", "<｜end▁of▁sentence｜>", "<｜User｜>",
+                                       "[e~[", "]~b]")
                            if _special_ids(s)]
         # the thinking budget (run config `thinking_budget`, tokens; 0 = none): a reasoning block that reaches it is
         # closed with the template's </think> and the answer follows - GLM at High can plan for 14k+ tokens
         self.think_budget = 0
-        end = _special_ids("</think>")
+        # (MiniMax-M3.1 closes its reasoning with </mm:think>; its vocabulary may hold a plain "</think>" too)
+        end = _special_ids("</mm:think>") if getattr(template, "minimax", False) else _special_ids("</think>")
         self.think_end_id = end[0] if end else None
         # the special literals that stay text inside a message (frontend.mark_literals): every one the vocabulary has
         self.literals = literal_tags(getattr(tokenizer, "special_tokens", None))
@@ -1790,11 +1831,23 @@ class Service:
         top = self.trained_context or CONTEXT_FALLBACK_MAX
         with self.status_lock:
             reload = dict(self.reload) if self.reload else None
+        # a streamed cache's RAM (KV streaming: maya-mm3's VRAM lines' kv_ram - every position's K / V in pinned RAM,
+        # the engine's own count at this context) and the RAM free now: the dashboard scales the one against the other
+        kv_ram = sum(int(p.get("kv_ram") or 0) for p in getattr(self.engine, "vram", None) or [])
+        ram = {}
+        if kv_ram:
+            try:
+                import psutil
+                vm = psutil.virtual_memory()
+                ram = {"ram_gb": round(vm.total / 2**30, 1), "ram_free_gb": round(vm.available / 2**30, 1)}
+            except Exception:  # noqa: BLE001 - psutil is optional: no RAM figures, no RAM warning
+                pass
         return {"context": self.engine.max_context, "min": CONTEXT_MIN, "max": max(top, self.engine.max_context),
                 "trained": self.trained_context,
                 "tested": CONTEXT_TESTED.get(str(info.get("engine_kind") or ""), CONTEXT_TESTED_DEFAULT),
                 "kv_gb": info.get("kv_gb"), "kv_ctx": info.get("kv_ctx"),
                 "kv_resident": info.get("kv_resident") or 0,
+                "kv_ram_gb": round(kv_ram / 2**30, 3) if kv_ram else None, **ram,
                 "vram_gb": info.get("vram_gb"), "vram_slots": info.get("vram_slots"), "reload": reload}
 
     def set_context(self, n: int) -> dict:
@@ -2237,6 +2290,8 @@ class Service:
             glm_calls = "<arg_key>" in self.template.source
             if getattr(self.template, "deepseek", False):
                 prefill = "\n\n<｜DSML｜ calls>\n" + (f'<｜DSML｜ invoke name="{force}">\n' if force else "")
+            elif getattr(self.template, "minimax", False):
+                prefill = MINIMAX_NS + "<tool_call>\n" + (MINIMAX_NS + f'<invoke name="{force}">' if force else "")
             else:
                 prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
         given["_prefill"] = prefill
@@ -2245,7 +2300,9 @@ class Service:
         media = media_of(messages)
         images = (deepseek_images(messages) if getattr(self.template, "deepseek", False)
                   else [src for kind, src in media if kind == "image"])
-        if images and isinstance(self.vision, ds4_vision.Vision):
+        if isinstance(self.vision, mm3_vision.Vision) and any(kind == "video" for kind, _ in media):
+            raise ValueError("MiniMax-M3.1 reads pictures, not videos")
+        if images and isinstance(self.vision, ENGINE_VISION):
             # DeepSeek: the engine encodes the pictures itself; each placeholder the template wrote (user text's are
             # plain text, see render_ids) becomes its picture's span, the resized pixels go in the GENI file
             pics = []
@@ -2357,10 +2414,12 @@ class Service:
         if self.default_effort and "reasoning_effort" not in kw and "enable_thinking" not in kw:
             kw = {**kw, **(deepseek_effort_kwargs(self.default_effort) if getattr(self.template, "deepseek", False)
                                   else effort_kwargs(self.default_effort))}
-        if getattr(self.template, "deepseek", False):
-            sources = deepseek_images(messages)
+        if getattr(self.template, "deepseek", False) or isinstance(self.vision, mm3_vision.Vision):
+            # (DeepSeek, MiniMax: the engine's own vision tower - a picture's span is its resize's)
+            sources = (deepseek_images(messages) if getattr(self.template, "deepseek", False)
+                       else [src for kind, src in media_of(messages) if kind == "image"])
             n, approximate = len(self.render_ids(messages, tools, kw)), bool(sources)
-            if sources and isinstance(self.vision, ds4_vision.Vision):   # (DeepSeek: a picture's span is its resize's)
+            if sources and isinstance(self.vision, ENGINE_VISION):
                 try:
                     n += sum(self.vision.picture(src).tokens - 1 for src in sources)
                     approximate = False
@@ -2538,6 +2597,7 @@ class Service:
         single_tool = responses and (sampling or {}).get("parallel_tool_calls") is False
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True,
                               dsml=getattr(self.template, "deepseek", False),
+                              minimax=getattr(self.template, "minimax", False),
                               strict_tools=responses, single_tool=single_tool)
         prefill = (sampling or {}).get("_prefill") or ""   # the call's opening, already in the prompt (prepare)
         pre_events = parser.feed(prefill) if prefill else []
@@ -3555,8 +3615,9 @@ def make_handler(svc: Service):
             elif path == "/health":
                 # the run config's recommended settings: the web app's Chat defaults until its user picks their own
                 rec = {k: v for k, v in svc.sampling_defaults.items() if k in ("temperature", "top_p", "top_k")}
-                if svc.default_effort:
-                    rec["reasoning_effort"] = effort_level(svc.default_effort) or svc.default_effort
+                if svc.default_effort:   # (MiniMax's by its own five names)
+                    rec["reasoning_effort"] = (effort_name if getattr(svc.template, "minimax", False) else effort_level)(
+                        svc.default_effort) or svc.default_effort
                 self._json(200, {"status": "updating" if svc.updater.busy() else
                                            "reloading" if svc.reloading() else "ok",
                                  "max_context": svc.engine.max_context, "model": svc.model,
@@ -4123,10 +4184,10 @@ def clean_shared_defaults(d) -> dict:
         if value is None or value == "":
             continue
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
-        if key == "reasoning_effort":
+        if key == "reasoning_effort":   # (kept by its own name: medium / xhigh are MiniMax's, GLM's High / Max else)
             if effort_level(value) is None:
-                raise ValueError("reasoning_effort: none, low, high or max")
-            value = effort_level(value)
+                raise ValueError(f"reasoning_effort: {EFFORT_WORDS}")
+            value = effort_name(value)
         elif key == "temperature":
             if not number or not 0 <= value <= 2:
                 raise ValueError("temperature: 0..2")
@@ -4439,6 +4500,12 @@ def main() -> int:
                                        Path(tempfile.mkdtemp(prefix="maya-ds4-pictures-")), Vision.load)
             print(f"[maya] images: the model's vision tower runs in the engine (GPU {engine.info.get('vision_gpu')}, "
                   f"{engine.info.get('vision_mib')} MiB), up to {vision.g.max_tokens} tokens a picture", flush=True)
+        elif vision is None and not vcfg and engine.info.get("vision") == "mm3":
+            # MiniMax-M3.1-Flash: the engine's own vision tower; the server resizes the pictures
+            vision = mm3_vision.Vision(mm3_vision.Geometry.from_info(engine.info),
+                                       Path(tempfile.mkdtemp(prefix="maya-mm3-pictures-")), Vision.load)
+            print(f"[maya] images: the model's vision tower runs in the engine, up to {vision.g.max_pixels} pixels "
+                  f"({vision.g.max_tokens} tokens) a picture", flush=True)
         elif vision is None and not vcfg and engine.info.get("vision") == "off":
             # (DeepSeek-V4.1: its tower did not load - the engine's NOTE line above says why; no pictures offered)
             print("[maya] images: OFF - pictures are refused until the vision tower loads (see the line above)",
@@ -4484,7 +4551,8 @@ def main() -> int:
             raise SystemExit(f"[maya] config reasoning_effort: {e}")
         svc.default_effort = cfg["reasoning_effort"]
         # (#363: DeepSeek's 1..100 budget is a level of its own - it was shown as "none")
-        level = effort_level(svc.default_effort) or (f"{svc.default_effort} of 100" if type(svc.default_effort) is int
+        level = (effort_name if svc.template.minimax else effort_level)(svc.default_effort) or \
+            (f"{svc.default_effort} of 100" if type(svc.default_effort) is int
                                                      else "none")
         print(f"[maya] thinking level when a request names none: {level}"
               f"{'' if level in (svc.default_effort, f'{svc.default_effort} of 100') else f' (the config says {svc.default_effort})'}",
@@ -4510,7 +4578,7 @@ def main() -> int:
         svc.model_dir = Path(args[args.index("--glm-pack") + 1]).resolve().parent
         threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(svc.model_dir)),
                          daemon=True).start()
-    elif "--pack" in args[:-1]:                         # DeepSeek's pack: its ds4.txt
+    elif "--pack" in args[:-1]:                         # DeepSeek's pack (its ds4.txt), MiniMax's (mm3.txt)
         svc.trained_context = trained_context_ds4(args[args.index("--pack") + 1])
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"

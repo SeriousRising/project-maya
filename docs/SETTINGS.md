@@ -649,3 +649,65 @@ The engine's log says what happened (`ds4 slots: saved/took back/wrote ...`; the
 `[maya] sessions: ...`). A slot's identity is the engine's version, the model's geometry and files and whether the
 DSpark blocks are loaded, so a slot from another model, another pack or an engine that changed the state's layout is
 refused rather than read.
+
+## MiniMax-M3.1-Flash
+
+`./maya.sh --setup --model MiniMax-M3.1-Flash` writes `maya-mm3.json` with what fits this PC: the context (below), the
+model's pictures on, the tensor-parallel groups from the GPU count, and the DSpark drafter only where this PC's speed
+calibration (or your answer at the setup) says drafting is faster. A setup again keeps every engine option listed
+here that the config already has.
+
+**Defaults from MiniMax's model card**: temperature 1.0, top-p 0.95 (no top-k, no min-p). The thinking level a
+request gets when it names none is `auto`: the card names no default effort, so none is set and the model decides
+whether to think, as MiniMax's template does by default. The levels:
+
+| `reasoning_effort` | The prompt |
+|---|---|
+| `auto` (default) | MiniMax's template as it is: adaptive thinking, no effort named |
+| `low`, `medium`, `high`, `xhigh`, `max` | the same, with that effort (the card's five); the model still decides whether to think |
+| `none` | thinking off: the turn opens with `</mm:think>`, the system prompt says thinking is disabled (MiniMax-M3's words) |
+
+The prompt is Maya's own copy of MiniMax's template (`tools/mm3/chat_template.jinja`, used by every MiniMax pack):
+byte for byte MiniMax's for every level but `none`. Change the default with `"reasoning_effort"` in the config.
+
+**The context.** The setup offers 32K to 1M (the model's own reach) and recommends the largest, up to 256K, whose KV
+cache fits beside the model in this PC's VRAM + RAM. With KV streaming (on by default) every position's K / V sits in
+pinned RAM - about 120 KB a token in BF16, 62 KB in INT8 - and the newest 32K positions in VRAM as well. Past 256K the
+engine has not been run end to end yet; the setup and the dashboard say so. The dashboard's Context size shows the
+cache's RAM at each size and warns when it takes more than is free.
+
+Engine options, in the config's `"args"`:
+
+| Option | Default | What it does |
+|---|---|---|
+| `--max-context` | the setup's choice | the context, in tokens (the dashboard's Context size changes it) |
+| `--kv-streaming` | `on` (the setup) | `on`: every position's K / V in pinned RAM, a ring of the newest in VRAM; `off`: all of it in VRAM |
+| `--kv-resident` | 32768 | with KV streaming: the positions of each layer kept in VRAM |
+| `--kv-cache` | `int8` | the K / V cache's format: `int8` or `fp8` (half of BF16's memory), `fp4` (a quarter), `bf16` (exact), or K and V apart (`int8,fp4`); the index keys stay BF16 |
+| `--kv-rot` | `on` | the cache's rows rotated before they are rounded (outliers spread over the row); `--kv-rotate` is the same option |
+| `--vision` | `on` (the setup) | the model's vision tower in the engine (~1.9 GB on its GPU); `off` frees it for experts (`--no-vision` at the setup) |
+| `--vision-gpu` | 0 | which of the config's GPUs holds the vision tower |
+| `--dspark` | `off` until measured | `on`: the DSpark drafter proposes tokens, the model checks them (the same tokens); `./maya.sh --speed-calibration` measures which is faster here |
+| `--dspark-conf` | 0.7 | a draft is verified only while its confidence is at least this |
+| `--tp` | from the GPU count | tensor parallel: the GPUs in groups of 4 or 2 (the first alone when the others make whole groups); `0`: layers split across the GPUs |
+| `--cache-gb` | 1.5 | with `--tp`: each GPU's expert cache, out of its experts in VRAM - at least this; where the GPU memory is tight the engine makes it larger by itself (a NOTE), and when `--tp` does not fit at all it runs the layer split instead (a NOTE) |
+| `--tp-chunk` | 1024 | with `--tp`: the prompt's tokens a pipeline chunk takes |
+| `--tp-ffn-rows` | 0 | with `--tp`: a chunk's FFN in slices of this many tokens (0: the whole chunk; 256 keeps more experts in VRAM) |
+| `--dspark-cost` | 0 | (> 0) drafts are verified only while their confidences' product stays above this |
+| `--cpu-threads` | one a physical core | the CPU lane's workers (the experts VRAM does not hold are computed on the CPU from pinned RAM); `-1`: no CPU lane |
+| `--reserve-gb` | 1.0 (0.3 with `--tp`) | VRAM each GPU keeps free beyond the plan |
+| `--resident-cap` | as many as fit | routed experts kept in VRAM, a layer at most |
+| `--chunk` | 1024 | prompt tokens a forward takes at most |
+| `--staging` | 48 | expert staging slots a GPU |
+| `--profile` | `data/expert-profile-mm3.bin` | the routing profile: the most-routed experts are placed in VRAM |
+
+Setup and debugging variables:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `MAYA_MM3_MIN_CC` | - | testing only: `70` lets the setup take GPUs before RTX 30 / A100 (a V100), with a warning |
+| `MM3_TIMING`, `MM3_CONF`, `MM3_LANE_PROF`, `MM3_MISS_STATS`, `MM3_TP_PROF`, `MM3_TP_TRACE`, `MM3_NSYS` | off | debugging: the engine prints timings, the drafts' confidences, the CPU lane's and tensor parallel's profiles |
+| `MM3_PROMOTE` | - | debugging: the expert cache's promotion rule with `--tp` (`threshold,pending,decay`) |
+| `MM3_STRESS`, `MM3_STRESS_T` | off | debugging: a drafting stress run |
+| `MM3_DUMP_KEPT`, `MM3_DUMP_HS` | off | debugging: write the sparse attention's kept blocks / hidden states to files |
+| `MM3_TOPK` | the model's | debugging only: routes each token to this many experts - the answers are no longer the model's |

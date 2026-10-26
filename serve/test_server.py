@@ -1869,5 +1869,58 @@ class FailedRestartKeepsContext(unittest.TestCase):
             self.assertFalse(eng.alive())               # (so the next request's ensure_engine tries again)
 
 
+@unittest.skipUnless(os.name == "posix", "the fake engine is a script with a #! line")
+class StaleDoneAfterErr(unittest.TestCase):
+    """maya-ds4 and maya-mm3 end a failed request with ERR and then DONE (a picture that cannot be read, a forward that
+    failed).  The single-stream reader raised at the ERR and left the DONE queued: the next request read it as its own
+    end and answered nothing.  Now the DONE after an ERR is taken."""
+
+    ENGINE = r'''
+import sys
+n = 0
+print("READY 4096 stop", flush=True)
+for line in sys.stdin:
+    if not line.startswith("GEN"):
+        continue
+    n += 1
+    if "seed=1" in line:      # a failed request, as maya-mm3 ends it
+        print("ERR the picture file could not be read", flush=True)
+        print("DONE 0 3 0.0 0.0 cancel 0 0 0 0 0", flush=True)
+    elif "seed=2" in line:    # an ERR alone, as the GLM engine ends most errors
+        print("ERR the prompt and max_new are more than the context", flush=True)
+    else:
+        print("T 66", "T 67", "DONE 2 3 1.0 1.0 stop 0 0 0 0 0", sep="\n", flush=True)
+'''
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        exe = Path(self.tmp.name) / "engine"
+        exe.write_text(f"#!{sys.executable}\n" + self.ENGINE)
+        exe.chmod(0o755)
+        self.eng = StrataEngine(str(exe), [])
+
+    def tearDown(self):
+        self.eng.proc.kill()
+        self.eng.proc.wait()
+        self.tmp.cleanup()
+
+    def run_gen(self, seed):
+        return [t for t in self.eng.generate([1, 2, 3], 16, {"seed": seed}, threading.Event()) if t is not None]
+
+    def test_done_after_err_is_taken(self):
+        with self.assertRaises(ValueError):
+            self.run_gen(1)
+        self.assertEqual(self.run_gen(3), [66, 67])         # (it used to be [] - the ERR's DONE read as this end)
+        self.assertEqual(self.eng.last.get("finish"), "stop")
+
+    def test_err_alone(self):
+        t0 = time.monotonic()
+        with self.assertRaises(ValueError):
+            self.run_gen(2)
+        self.assertLess(time.monotonic() - t0, 5.0)         # (a short wait for a DONE that does not come)
+        self.assertEqual(self.run_gen(3), [66, 67])
+
+
 if __name__ == "__main__":
     unittest.main()

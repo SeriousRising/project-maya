@@ -210,12 +210,16 @@ async function loadHealth() {
     // the server's recommended settings for this model (its run config) replace the built-in Chat defaults, and
     // are what the Chat uses until its user applies settings of their own
     const d = health.defaults || {};
-    if (THINKING.includes(d.reasoning_effort)) DEFAULTS.thinking = d.reasoning_effort;   // the server sends GLM's names
+    // each model keeps its own Chat settings (DeepSeek's are not GLM's), and its own thinking levels and their
+    // meaning - MiniMax's: Off, Auto (its template's default, the default here) and the five efforts of its card
+    thinkFamily = /deepseek/i.test(health.model || "") ? "deepseek" : /minimax/i.test(health.model || "") ? "minimax" : "glm";
+    THINKING = THINK_LEVELS[thinkFamily];
+    DEFAULTS.thinking = THINK_DEFAULT[thinkFamily];
+    if (THINKING.includes(d.reasoning_effort)) DEFAULTS.thinking = d.reasoning_effort;   // (the run config's level)
     if (d.temperature !== undefined) DEFAULTS.temperature = d.temperature;
     if (d.top_p !== undefined) DEFAULTS.top_p = d.top_p;
     if (d.temperature !== undefined || d.top_k !== undefined) DEFAULTS.top_k = d.top_k !== undefined ? d.top_k : 0;
-    // each model keeps its own Chat settings (DeepSeek's are not GLM's), and its own thinking levels' meaning
-    samplingKey = /deepseek/i.test(health.model || "") ? "sampling_deepseek" : "sampling";
+    samplingKey = {deepseek: "sampling_deepseek", minimax: "sampling_minimax"}[thinkFamily] || "sampling";
     settings = {...DEFAULTS, ...store.get(samplingKey, {})};
     if (!THINKING.includes(settings.thinking)) settings.thinking = DEFAULTS.thinking;
     thinkingTitles();
@@ -300,6 +304,12 @@ const TIER_SETS = {
     {key: "promo", label: "Promoted", icon: "bolt", unit: "/tok", digits: 2, sub: "experts moved into VRAM"},
     {key: "engram_ms", label: "N-gram memory", icon: "layers", unit: " ms/tok", digits: 2, sub: "n-gram lookups"},
   ],
+  mm3: [   // (MiniMax, maya-mm3: the CPU lane computes the experts not in VRAM from the pinned pool)
+    {key: "ram_fetch", label: "From RAM", icon: "link", unit: "/tok", digits: 2, tone: "info",
+     sub: "experts the CPU computed from pinned RAM"},
+    {key: "disk", label: "From SSD", icon: "disk", unit: "/tok", digits: 2, tone: "warn", sub: "experts read from the SSD"},
+    {key: "promo", label: "Promoted", icon: "bolt", unit: "/tok", digits: 2, sub: "experts copied into the VRAM cache"},
+  ],
 };
 let tiersShown = null;   // the set the cards are built for
 function tierCards(kind) {
@@ -326,7 +336,8 @@ function renderTiers(t, eng) {
   const age = n.time ? Math.max(0, Date.now() / 1000 - n.time) : null;
   const stale = age != null && age > 30;               // a reading from the last answer, not live
   card.classList.toggle("is-stale", stale);
-  for (const m of tierCards(ds4 ? "ds4" : "glm")) {
+  const mm3 = !!(eng && eng.engine_kind === "mm3");
+  for (const m of tierCards(ds4 ? "ds4" : mm3 ? "mm3" : "glm")) {
     const v = n[m.key];
     const shown = v == null ? null : fmt(v, m.digits);
     $(`tv-${m.key}`).innerHTML = shown == null ? "–" : `${esc(shown)}<small>${esc(m.unit)}</small>`;
@@ -360,6 +371,8 @@ function renderTiers(t, eng) {
     }
   } else if (!stale && n.disk != null && n.disk >= 3) {
     tip = "Many experts are read from the SSD for every token: more RAM, a smaller model or a shorter context makes answers faster.";
+  } else if (mm3) {   // (MiniMax: the CPU computes the experts VRAM does not hold - nothing crosses PCIe for them)
+    if (!stale && n.vram_hit != null && n.vram_hit < 0.5) tip = "Most experts run on the CPU: more VRAM (or a second GPU) keeps more of them on the card.";
   } else if (!stale && n.vram_hit != null && n.vram_hit < 0.85 && (n.ram_fetch || 0) >= 4) {
     tip = "Most misses come from RAM over PCIe: more VRAM (or a second GPU) keeps more experts on the card.";
   }
@@ -871,21 +884,29 @@ function renderAbout(eng, hw, st, storage) {
       ? `${k} attention cache, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM`
       : `${k} attention cache, in VRAM${kvPerTok ? ` (about ${fmt(kvPerTok / 1024)} KB a token, ${fmt(eng.kv_gb, 1)} GB at this size)` : ""}`;
   } else {
-    const k = {int8: "8-bit", q4_0: "4-bit (Hadamard-rotated)", fp16: "16-bit", bf16: "16-bit", f32: "32-bit",
-               fp4: "4-bit FP4 as DeepSeek stores it (the recent-token window FP8)"}[eng.kv] || eng.kv;
+    const k = (eng.engine_kind === "mm3"   // (MiniMax's: maya-mm3's KV formats)
+      ? {bf16: "16-bit (BF16)", int8: "8-bit (INT8)", fp8: "8-bit (FP8)", fp4: "4-bit (FP4)", nvfp4: "4-bit (NVFP4)",
+         mxfp4: "4-bit (MXFP4)", q4: "4-bit"}
+      : {int8: "8-bit", q4_0: "4-bit (Hadamard-rotated)", fp16: "16-bit", bf16: "16-bit", f32: "32-bit",
+         fp4: "4-bit FP4 as DeepSeek stores it (the recent-token window FP8)"})[eng.kv] || eng.kv;
     kv = k ? `${k}${eng.kv_resident ? `, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null;
   }
   facts($("facts-engine"), [
     ["Version", ver ? `Project Maya v${ver}${eng.version ? ` · engine ${eng.version}` : ""}` : null],
     ["Model", eng.model],
-    ["Engine", eng.engine_kind ? ({"glm-fast": "GLM fast path", ds4: "DeepSeek-V4.1 (maya-ds4)"}[eng.engine_kind] || eng.engine_kind) : null],
+    ["Engine", eng.engine_kind ? ({"glm-fast": "GLM fast path", ds4: "DeepSeek-V4.1 (maya-ds4)",
+                                   mm3: "MiniMax-M3.1 (maya-mm3)"}[eng.engine_kind] || eng.engine_kind) : null],
     ["Context", eng.max_context ? `${fmt(eng.max_context)} tokens (Settings changes it)` : null],
     ["Trained for", eng.trained_context ? `up to ${fmt(eng.trained_context)} tokens` : null],
     ["KV cache", kv],
     ["Experts", eng.experts ? `${fmt(eng.experts)} routed; room for ${fmt(eng.expert_slots || 0)} in VRAM` +
-                 `${eng.ram_slots ? ` and ${fmt(eng.ram_slots)} in RAM` : ""}, the rest read from the SSD` : null],
-    ["Speculation", eng.mtp == null ? null : +eng.mtp ? "MTP: the model's draft block proposes the next token, the full model checks it"
-                  : "off (one GPU, or no draft block in this model file)"],
+                 `${eng.ram_slots ? ` and ${fmt(eng.ram_slots)} in RAM` : ""}` +
+                 `${+eng.expert_slots + (+eng.ram_slots || 0) >= +eng.experts ? "" : ", the rest read from the SSD"}` : null],
+    ["Speculation", eng.mtp != null ? (+eng.mtp ? "MTP: the model's draft block proposes the next token, the full model checks it"
+                                       : "off (one GPU, or no draft block in this model file)")
+                  : eng.engine_kind === "mm3" && eng.dspark != null
+                    ? (+eng.dspark ? "DSpark: MiniMax's drafter proposes the next tokens, the full model checks them (the same tokens)"
+                                   : "off (no DSpark drafter loaded)") : null],
     ["Images", eng.images ? "on" : "off"],
   ]);
   const gpus = hw.gpus || [];
@@ -1308,9 +1329,15 @@ function previewHtml(code) {
 // "Medium" was GLM's High and its "High" GLM's Max: they are translated once (thinking_v 2)
 const DEFAULTS = {thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0, max: "", seed: "", show: true,
                   mcp: true, system: "", sys_default: false, thinking_v: 2};
-const THINKING = ["none", "low", "high", "max"];
+// (MiniMax-M3.1: Off, Auto - no effort named, its template's default - and its card's five efforts, each in its
+//  template's adaptive mode: the model decides whether to think)
+const THINK_LEVELS = {glm: ["none", "low", "high", "max"], deepseek: ["none", "low", "high", "max"],
+                      minimax: ["none", "auto", "low", "medium", "high", "xhigh", "max"]};
+const THINK_DEFAULT = {glm: "high", deepseek: "high", minimax: "auto"};   // (the run config's level wins: loadHealth)
+let thinkFamily = "glm";
+let THINKING = THINK_LEVELS.glm;
 const glmLevel = (v, v2) => (v2 ? v : {medium: "high", high: "max", xhigh: "max"}[v] || v);
-let samplingKey = "sampling";        // the running model's saved settings (loadHealth: DeepSeek's own key)
+let samplingKey = "sampling";        // the running model's saved settings (loadHealth: DeepSeek's, MiniMax's own key)
 let settings = {...DEFAULTS, ...store.get(samplingKey, {})};
 // the thinking buttons say what each level is for the running model
 const THINK_TITLES = {
@@ -1318,10 +1345,24 @@ const THINK_TITLES = {
         max: "GLM's Max: the most thorough, and the longest"},
   deepseek: {none: "No thinking: it answers right away", low: "DeepSeek's Low: reasoning effort 50",
              high: "DeepSeek's High: reasoning effort 75", max: "DeepSeek's Max: reasoning effort 100, the most thorough"},
+  minimax: {none: "No thinking: it answers right away", auto: "MiniMax's default: it decides whether to think, no effort set",
+            low: "Effort low: it decides whether to think, and keeps it short", medium: "Effort medium: it decides whether to think",
+            high: "Effort high: it decides whether to think, and thinks it through",
+            xhigh: "Effort extra-high: it decides whether to think, and thinks hard",
+            max: "Effort max: it decides whether to think - the most thorough, and the longest"},
 };
+const THINK_SAYS = {none: "answers right away", auto: "it decides", low: "a short think", medium: "a moderate think",
+                    high: "thinks it through", xhigh: "thinks hard", max: "the most thorough, the longest"};
+// MiniMax: every effort is "it decides whether to think, at that effort" (its template's adaptive mode)
+const THINK_SAYS_MINIMAX = {auto: "it decides", low: "effort low", medium: "effort medium", high: "effort high",
+                            xhigh: "effort extra-high", max: "effort max"};
 function thinkingTitles() {
-  const t = THINK_TITLES[samplingKey === "sampling_deepseek" ? "deepseek" : "glm"];
-  for (const b of $("s-thinking").children) if (t[b.dataset.v]) b.title = t[b.dataset.v];
+  const t = THINK_TITLES[thinkFamily];
+  for (const b of $("s-thinking").children) {
+    if (t[b.dataset.v]) b.title = t[b.dataset.v];
+    b.hidden = !THINKING.includes(b.dataset.v);
+  }
+  $("s-thinking").classList.toggle("seg--many", THINKING.length > 4);
 }
 if (settings.thinking_v !== 2) { settings.thinking = glmLevel(settings.thinking, false); settings.thinking_v = 2; }
 if (!THINKING.includes(settings.thinking)) settings.thinking = "high";
@@ -2163,7 +2204,12 @@ async function loadCtxInfo() {
 }
 // what a context size costs here: the engine's own measurement of the current size, scaled
 function ctxEstimate(n) {
-  // (a streamed cache - KV streaming - keeps a fixed window in VRAM: scaling it by the context would mislead)
+  // a streamed cache - KV streaming - keeps a fixed window in VRAM and every position in pinned RAM: its RAM scales
+  // (the engine's own count at this size, kv_ram_gb), against the RAM free now
+  if (ctxInfo && ctxInfo.kv_resident && ctxInfo.kv_ram_gb && ctxInfo.context) {
+    const est = (ctxInfo.kv_ram_gb / ctxInfo.context) * n;
+    return {ram: true, gb: est, delta: est - ctxInfo.kv_ram_gb, free: ctxInfo.ram_free_gb != null ? +ctxInfo.ram_free_gb : null};
+  }
   if (!ctxInfo || !ctxInfo.kv_gb || !ctxInfo.kv_ctx || ctxInfo.kv_resident) return null;
   const perTok = ctxInfo.kv_gb / ctxInfo.kv_ctx;
   const est = perTok * n, now = perTok * ctxInfo.context;
@@ -2188,7 +2234,10 @@ function outputsCtx() {
   const e = ctxEstimate(v);
   let text = "How much text the model holds at once: the chat, files, tool output.";
   if (reloadWatch) text = `Reloading with a ${ctxfmt(reloadWatch.to)} context…`;
-  else if (e) {
+  else if (e && e.ram) {
+    text = `≈ ${fmt(e.gb, 1)} GB of RAM for the context (kept pinned; its newest ${ctxfmt(ctxInfo.kv_resident)} positions also in VRAM)` +
+      (v === now ? "." : ` · ${fmt(Math.abs(e.delta), 1)} GB ${e.delta > 0 ? "more" : "less"} than now.`);
+  } else if (e) {
     text = `≈ ${fmt(e.gb, 1)} GB of GPU memory for the context` + (v === now ? "." :
       e.experts ? ` · about ${fmt(Math.abs(e.experts))} ${e.experts > 0 ? "fewer" : "more"} experts held in VRAM than now` +
                   `${e.experts > 0 ? " (answers a little slower)" : ""}.` : ".");
@@ -2198,6 +2247,8 @@ function outputsCtx() {
   const tested = ctxInfo.tested || 262144;   // (the largest context run end to end on this engine)
   if (v > tested) warns.push(`Beyond ${ctxfmt(tested)} is untested on this engine.`);
   if (e && e.vram && e.gb > e.vram * 0.6) warns.push("That leaves little GPU memory for experts: answers get much slower, and it may not start (the current size then comes back).");
+  // (8 GB kept for the system: the pinned cache comes out of the RAM the experts not in VRAM use)
+  if (e && e.ram && e.free != null && e.delta > e.free - 8) warns.push("That takes more RAM than is free now: fewer experts stay in RAM (answers slower), and it may not start (the current size then comes back).");
   if (v !== now) warns.push("Saving reloads the model (1-3 minutes).");
   $("ctx-warn").hidden = !warns.length;
   $("ctx-warn").textContent = warns.join(" ");
@@ -2212,7 +2263,8 @@ async function confirmContext(n) {
                  "<li>Requests from other apps get a “try again” until the model is back.</li>" +
                  "<li>If the new size does not fit, the current one comes back by itself.</li>" +
                  (busy ? "<li>The answer being written finishes first.</li>" : "") + "</ul>"];
-  if (e) parts.push(`<p class="muted">Its cost here: about ${esc(fmt(e.gb, 1))} GB of GPU memory` +
+  if (e && e.ram) parts.push(`<p class="muted">Its cost here: about ${esc(fmt(e.gb, 1))} GB of RAM, kept pinned for the context.</p>`);
+  else if (e) parts.push(`<p class="muted">Its cost here: about ${esc(fmt(e.gb, 1))} GB of GPU memory` +
                     (e.experts ? `, ${esc(fmt(Math.abs(e.experts)))} ${e.experts > 0 ? "fewer" : "more"} experts in VRAM than now.` : ".") + "</p>");
   if (tokens > n) parts.push(`<p class="ctx-warn">This chat holds about ${esc(fmt(tokens))} tokens: more than the new size, so it will not fit. Start a new chat after the reload, or keep a larger context.</p>`);
   const ok = await confirmDialog(`Reload the model with a ${ctxfmt(n)} context?`, parts.join(""), `Reload with ${ctxfmt(n)}`);
@@ -2425,11 +2477,14 @@ function outputs() {
   $("o-temp").textContent = t === 0 ? "0 · greedy" : t.toFixed(2);
   $("o-topp").textContent = (+$("s-topp").value).toFixed(2);
   const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
-  $("o-thinking").textContent = sel ? {none: "answers right away", low: "a short think", high: "thinks it through",
-                                       max: "the most thorough, the longest"}[sel.dataset.v] +
+  $("o-thinking").textContent = sel ? ((thinkFamily === "minimax" && THINK_SAYS_MINIMAX[sel.dataset.v]) ||
+                                       THINK_SAYS[sel.dataset.v]) +
     (sel.dataset.v === DEFAULTS.thinking ? " (default)" : "") : "";
   $("o-topk").textContent = +$("s-topk").value > 0 ? $("s-topk").value : "off";
   $("o-minp").textContent = +$("s-minp").value > 0 ? (+$("s-minp").value).toFixed(2) : "off";
+  // the running model's recommended values (its run config: the model card's) say so
+  const rec = (id, key) => { if (Math.abs(+$(id).value - (+DEFAULTS[key] || 0)) < 1e-9) $(`o-${id.slice(2)}`).textContent += " (default)"; };
+  if (t > 0) { rec("s-temp", "temperature"); rec("s-topp", "top_p"); rec("s-topk", "top_k"); rec("s-minp", "min_p"); }
   for (const id of ["s-topp", "s-topk", "s-minp"]) $(id).disabled = t === 0;
   // the preset these values match, if any
   const f = {temperature: t, top_p: +$("s-topp").value, top_k: +$("s-topk").value, min_p: +$("s-minp").value};
@@ -2455,7 +2510,7 @@ for (const b of $("s-thinking").children) b.onclick = () => selectThinking(b);
 $("s-thinking").addEventListener("keydown", (e) => {
   if (!["ArrowRight", "ArrowLeft", "ArrowUp", "ArrowDown"].includes(e.key)) return;
   e.preventDefault();
-  const items = [...$("s-thinking").children];
+  const items = [...$("s-thinking").children].filter((x) => !x.hidden);
   const i = items.findIndex((x) => x.getAttribute("aria-checked") === "true");
   const next = items[(i + (e.key === "ArrowRight" || e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length];
   selectThinking(next);
