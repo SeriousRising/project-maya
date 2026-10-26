@@ -1150,6 +1150,52 @@ struct Model::Impl {
                                       // continued the last in place (a chat template that drops earlier turns'
                                       // reasoning at a new user message re-renders the history from about there)
     bool slot_held = false;           // slot_save took this state and nothing has changed it since
+    // two requests in flight (MAYA_DS4_PIPE=1, pipe_alloc / seq_bind / pipe_issue below; Model's note): a second
+    // sequence's state, bound by swapping the pointers and values the windows read.  The bound sequence's own
+    // live in the Impl's members, its PipeCtx holding placeholders the swaps shuttle back; its tok_h / ev_done /
+    // inflight are always its own (pipe_take reads them with the other sequence bound).
+    struct PipeCtx {
+        std::vector<uint8_t*> win;              // every layer member's window ring (the layers, then mates order)
+        std::vector<float*> c_kv, c_score;      // ... its compressor's partial group (null: none)
+        std::vector<std::vector<uint8_t*>> ckv, ik;   // every source's rows, a vector over the devices
+        int64_t pos = 0;
+        std::vector<int32_t> toks, ctoks;
+        Check ck[3];
+        bool slot_held = false;
+        int n_logits = 0;
+        int cur_topk_n[kWin] = {}, cur_cand_n[kWin] = {};   // plan_window's carried counts (below)
+        int pen_n = 0;
+        float pen_repeat = 1.0f, pen_freq = 0.0f, pen_present = 0.0f;
+        uint16_t* h_emb = nullptr;              // the window's embedding rows (a copy still reading them at a bind)
+        uint8_t* h_eg = nullptr;                // ... its Engram rows, eg_cap tokens a layer (the readers write them)
+        size_t eg_cap = 0;
+        std::vector<std::unique_ptr<EgBatch>> eg_win;
+        int32_t* h_pen = nullptr;               // the penalty rows (a copy still reading them at a bind)
+        std::vector<uint8_t*> bounce;           // every device's hand-off buffer and its event (the other card
+        std::vector<cudaEvent_t> ev_out;        // may not have read this sequence's when the next one is written)
+        std::vector<uint8_t*> hand;             // ... the threads path's mapped hand-off, a sequence's own too
+                                                // (DS4_PIPE_PAR: forward_par's xfer_put of the next window of
+                                                // this sequence is ordered after its take, so one a sequence is
+                                                // enough; the shared Dev::hand would be overwritten by the other
+                                                // sequence's put before this one's get has run)
+        int* tok_h = nullptr;                   // pinned: the issued token's pick, and the event after its copy
+        cudaEvent_t ev_done = nullptr;
+        bool inflight = false;                  // a pipe_issue of this sequence not yet taken
+    };
+    PipeCtx pipe_ctx[2];
+    int pipe_n = 1;           // sequence states (2: pipe_alloc made the second)
+    int pipe_cur = 0;         // the bound one
+    bool pipe_issuing = false;   // forward() enqueues only: no head wait, no cache tick, no drafter seeding
+    bool pipe_par = false;    // DS4_PIPE_PAR: a pipelined window is enqueued by the per-device workers
+                              // (forward_par) instead of the one serial host thread - the thread issuing a
+                              // second in-flight window otherwise paces behind each card in turn (issue
+                              // 7 ms/step alone, ~25 with two in flight: p5p-diag1), so the cards never
+                              // overlap; a worker a device paces only behind its own card
+    // DS4_PIPE_LAYER_TIME: the issuing host's time a layer of a pipelined window, summed over plt_n windows
+    // and printed every 256 (forward_serial; plt_eg is the eg_finish share inside the Engram layers)
+    bool plt_on = false;
+    double plt_layer[kMaxL] = {}, plt_hand = 0, plt_embed = 0, plt_eg = 0;
+    long long plt_n = 0;
     std::vector<uint32_t> prof;       // [nl][n_exp] routed-expert hits
     // ... as loaded (--no-expert-cache: what the flow's early reads go by, so a prompt is streamed and summed in the
     // same order whatever this process answered before)
@@ -1214,7 +1260,6 @@ struct Model::Impl {
         return a == ~uint64_t{0} ? a : a > helper_pending ? a - helper_pending : 0;
     }
     unsigned seq_issued = 0;
-    std::atomic<int> layer_of[kRing];
     std::thread service;
     std::atomic<bool> quit{false};
     bool sync_decode = std::getenv("DS4_SYNC") != nullptr;
@@ -3226,6 +3271,7 @@ struct Model::Impl {
             c_accd.resize((size_t) NH * S * DQ * (E / NH));
             c_yd.resize(S * E);
         }
+        if (!pipe_alloc(err)) return false;   // (MAYA_DS4_PIPE: the second sequence's state, out of the experts' room)
         // the experts: VRAM slots in what each device has left (after the PCIe lane's staging slots), the rest on the host
         if (!lane_alloc(err)) return false;
         if (!place_experts(err)) return false;
@@ -3340,7 +3386,6 @@ struct Model::Impl {
             resps = (Resp*) m;
             std::memset((void*) reqs, 0, sizeof(Req) * kRing);
             std::memset((void*) resps, 0, sizeof(Resp) * kRing);
-            for (auto& x : layer_of) x.store(-1);
             ahead_fl.assign(L.size() * 1024, 0);
             ahead_rank.assign(L.size() * 1024, 0);
             ahead_for.assign(L.size(), 0);
@@ -6584,6 +6629,278 @@ struct Model::Impl {
         return id.str();
     }
 
+    // ---- two requests in flight (MAYA_DS4_PIPE=1; Model's note).  pipe_alloc makes the second sequence's state
+    // at load, before the experts take what VRAM is left (its caches come out of their room: at 64K context some
+    // 38 + 25 MB on this model's split, a handful of experts a card).  Its window rings start zeroed, as the
+    // first sequence's do after reset(); the sources' rows are written before they are read, by position.
+    bool pipe_alloc(std::string& err) {
+        if (pipe_alloc_try(err)) return true;
+        (void) cudaGetLastError();   // (N-c: a failed dalloc's pending error must not be reported against a later launch)
+        // (N7: a second sequence that does not fit is a serving downgrade, not a failed load - what was
+        // allocated stays on the alloc lists, pipe_n stays 1, and serve() runs one request at a time)
+        std::fprintf(stderr, "ds4: MAYA_DS4_PIPE: the second sequence's state was not allocated (%s); "
+                             "one request at a time\n", err.c_str());
+        err.clear();
+        pipe_n = 1;
+        return true;
+    }
+    bool pipe_alloc_try(std::string& err) {
+        const char* v = ds4_env("DS4_PIPE");
+        const bool on = v != nullptr && std::atoi(v) != 0;
+        // DS4_PIPE_ALLOC (a test switch): the second sequence's state without pipelining - the same
+        // bytes out of the experts' room, so a lone request runs stock serve() at pipe placement
+        const char* av = ds4_env("DS4_PIPE_ALLOC");
+        const bool alloc_only = !on && av != nullptr && std::atoi(av) != 0;
+        if (!on && !alloc_only) return true;
+        PipeCtx& c = pipe_ctx[1];
+        std::vector<size_t> bytes(devs.size(), 0);
+        for (Layer& l0 : L)
+            for (int m = 0; m < l0.nm; ++m) {
+                Layer& l = member(l0, m);
+                Dev& d = devs[(size_t) l.dev];
+                uint8_t* w = nullptr;
+                if (!dalloc(d, w, (size_t) g.win * win_rb(), err, &d.caches)) return false;
+                c.win.push_back(w);
+                bytes[(size_t) l.dev] += (size_t) g.win * win_rb();
+                float *kv = nullptr, *sc = nullptr;
+                if (l.c_kv != nullptr &&
+                    (!dalloc(d, kv, (size_t) l.ratio * g.hd, err) || !dalloc(d, sc, (size_t) l.ratio * g.hd, err)))
+                    return false;
+                c.c_kv.push_back(kv);
+                c.c_score.push_back(sc);
+            }
+        pipe_ctx[0].win.assign(c.win.size(), nullptr);
+        pipe_ctx[0].c_kv.assign(c.c_kv.size(), nullptr);
+        pipe_ctx[0].c_score.assign(c.c_score.size(), nullptr);
+        for (const Src& s : srcs) {
+            std::vector<uint8_t*> cv(devs.size(), nullptr), iv(devs.size(), nullptr);
+            for (size_t di = 0; di < devs.size(); ++di) {
+                Dev& d = devs[di];
+                if (s.ckv[di] != nullptr && !dalloc(d, cv[di], (size_t) s.cap * ckv_rb(), err, &d.caches)) return false;
+                if (s.ik[di] != nullptr && !dalloc(d, iv[di], (size_t) s.cap * ik_rb(), err, &d.caches)) return false;
+                bytes[di] += (cv[di] ? (size_t) s.cap * ckv_rb() : 0) + (iv[di] ? (size_t) s.cap * ik_rb() : 0);
+            }
+            c.ckv.push_back(std::move(cv));
+            c.ik.push_back(std::move(iv));
+            pipe_ctx[0].ckv.emplace_back(devs.size(), nullptr);
+            pipe_ctx[0].ik.emplace_back(devs.size(), nullptr);
+        }
+        // the host side: window-sized (the first sequence's hold a prompt chunk's), a hand-off a device, the picks
+        const int cols = (pk.eg_ngram - 1) * pk.eg_heads;
+        c.eg_cap = kWin;
+        if (!halloc(c.h_emb, (size_t) kWin * g.dim, err) ||
+            !halloc(c.h_eg, (size_t) std::max(1, pk.eg_layers) * c.eg_cap * cols * (pk.eg_hd + pk.eg_hd / 32) + 64, err))
+            return false;
+        for (int li = 0; li < pk.eg_layers; ++li) c.eg_win.emplace_back(new EgBatch());
+        for (size_t di = 0; di < devs.size(); ++di) {
+            uint8_t* b = nullptr;
+            if (!halloc(b, bounce_bytes(), err)) return false;
+            c.bounce.push_back(b);
+            pipe_ctx[0].bounce.push_back(nullptr);
+            uint8_t* hb = nullptr;
+            if (!hmap(hb, bounce_bytes(), err)) return false;
+            c.hand.push_back(hb);
+            pipe_ctx[0].hand.push_back(nullptr);
+            cudaSetDevice(devs[di].id);
+            cudaEvent_t e = nullptr;
+            CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+            c.ev_out.push_back(e);
+            pipe_ctx[0].ev_out.push_back(nullptr);
+        }
+        for (int s = 0; s < 2; ++s) {
+            if (!halloc(pipe_ctx[s].tok_h, 1, err)) return false;
+            cudaSetDevice(devs[(size_t) head_dev].id);
+            CK(cudaEventCreateWithFlags(&pipe_ctx[s].ev_done, cudaEventDisableTiming));
+        }
+        pipe_n = on ? 2 : 1;   // (alloc_only: the state exists only to take its experts' room)
+        {
+            const char* pp = ds4_env("DS4_PIPE_PAR");
+            pipe_par = pp != nullptr && std::atoi(pp) != 0;
+            const char* pt = ds4_env("DS4_PIPE_LAYER_TIME");
+            plt_on = pt != nullptr && std::atoi(pt) != 0;
+        }
+        std::fprintf(stderr, alloc_only ? "ds4: DS4_PIPE_ALLOC: a second sequence's state allocated, "
+                                          "not pipelining"
+                                        : "ds4: two requests in flight (MAYA_DS4_PIPE): a second "
+                                          "sequence's state");
+        for (size_t di = 0; di < devs.size(); ++di)
+            std::fprintf(stderr, "%s CUDA%d %.1f MB", di ? "," : " -", devs[di].id, (double) bytes[di] / 1e6);
+        std::fprintf(stderr, " (out of the experts' room)\n");
+        return true;
+    }
+
+    // whether this load may pipeline (pipe_ready's reasons, Model::pipe_ready): the serial window path with one
+    // GPU's layers after another's, nothing that rewrites the plans or the caches between the windows in flight
+    bool pipe_ready(std::string& why) const {
+        if (pipe_n < 2) {
+            why = "MAYA_DS4_PIPE is not set";
+            return false;
+        }
+        if (devs.size() < 2) {
+            why = "one GPU (a second request would take the same card's turns)";
+            return false;
+        }
+        if (par) {
+            why = "the windows run on a thread a GPU (--threads / tensor parallel)";
+            return false;
+        }
+        if (pipe_par && workers.size() != devs.size()) {
+            why = "DS4_PIPE_PAR without a worker a GPU (the prompt path's threads are off)";
+            return false;
+        }
+        for (const Group& G : groups)
+            if (G.mem.size() != 1) {
+                why = "a tensor-parallel group";
+                return false;
+            }
+        for (const Src& s : srcs)
+            if (s.remote) {
+                why = "a KV source's rows cross the cards on this layer split";
+                return false;
+            }
+        if (helper_n > 0) {
+            why = "the helper GPU (DS4_HELPER)";
+            return false;
+        }
+        if (sync_decode) {
+            why = "DS4_SYNC (the host-routed decode)";
+            return false;
+        }
+        if (o.expert_cache) {
+            why = "the expert cache moves experts between tokens (--no-expert-cache to pipeline)";
+            return false;
+        }
+        if (disk_skip_w > 0.0f || ram_skip_w > 0.0f) {   // (N6: their skip decisions read per-answer RAM-tier state, so pipelined answers would depend on order)
+            why = "STRATA_DS4_DISK_SKIP_W / RAM_SKIP_W (the answer-changing expert skips)";
+            return false;
+        }
+        for (const Layer& l : L)
+            if (lane_class(l.il) >= 0) {
+                why = "the PCIe streaming lane (MAYA_DS4_STREAM=0 to pipeline)";
+                return false;
+            }
+        return true;
+    }
+
+    // the sequence the model works on: the bound one's state swapped out, sequence s's in (GLM's seq_bind).
+    // Host-only - no stream waits for anything: what a device or a reader thread still works on at a bind is a
+    // sequence's own (its state buffers, its pinned rows, its mailbox seqs), and the shared scratch is ordered
+    // by the streams themselves.  Callers bind only with no speculative window half rolled back and no live
+    // Engram batch, both of which a finished issue / round leaves behind.
+    void seq_bind(int s) {
+        if (pipe_n < 2 || s == pipe_cur || s < 0 || s >= pipe_n) return;
+        PipeCtx& o = pipe_ctx[pipe_cur];
+        PipeCtx& n = pipe_ctx[s];
+        const auto exch = [&](auto& live, auto& a, auto& b) {
+            std::swap(live, a);
+            std::swap(live, b);
+        };
+        size_t f = 0;
+        for (Layer& l0 : L)
+            for (int m = 0; m < l0.nm; ++m, ++f) {
+                Layer& l = member(l0, m);
+                exch(l.win, o.win[f], n.win[f]);
+                exch(l.c_kv, o.c_kv[f], n.c_kv[f]);
+                exch(l.c_score, o.c_score[f], n.c_score[f]);
+            }
+        for (size_t i = 0; i < srcs.size(); ++i) {
+            exch(srcs[i].ckv, o.ckv[i], n.ckv[i]);
+            exch(srcs[i].ik, o.ik[i], n.ik[i]);
+        }
+        for (size_t di = 0; di < devs.size(); ++di) {
+            exch(devs[di].bounce, o.bounce[di], n.bounce[di]);
+            exch(devs[di].ev_out, o.ev_out[di], n.ev_out[di]);
+            exch(devs[di].hand, o.hand[di], n.hand[di]);
+        }
+        exch(pos, o.pos, n.pos);
+        exch(toks, o.toks, n.toks);
+        exch(ctoks, o.ctoks, n.ctoks);
+        for (int k = 0; k < 3; ++k) exch(ck[k], o.ck[k], n.ck[k]);
+        exch(slot_held, o.slot_held, n.slot_held);
+        exch(n_logits, o.n_logits, n.n_logits);
+        exch(cur_topk_n, o.cur_topk_n, n.cur_topk_n);
+        exch(cur_cand_n, o.cur_cand_n, n.cur_cand_n);
+        exch(pen_n, o.pen_n, n.pen_n);
+        exch(pen_repeat, o.pen_repeat, n.pen_repeat);
+        exch(pen_freq, o.pen_freq, n.pen_freq);
+        exch(pen_present, o.pen_present, n.pen_present);
+        exch(h_emb, o.h_emb, n.h_emb);
+        exch(h_eg, o.h_eg, n.h_eg);
+        exch(eg_cap, o.eg_cap, n.eg_cap);
+        exch(eg_win, o.eg_win, n.eg_win);
+        exch(h_pen, o.h_pen, n.h_pen);
+        pipe_cur = s;
+    }
+
+    // the bound sequence's one-token step, enqueued and left running: forward() with its waits out
+    // (pipe_issuing), then its pick into the sequence's pinned token after an event to wait on
+    bool pipe_issue(int token, float temperature, float top_p, int top_k, float min_p, uint64_t seed,
+                    uint64_t counter, std::string& err) {
+        PipeCtx& c = pipe_ctx[pipe_cur];
+        if (c.inflight) {
+            err = "pipe: the bound sequence's token is still in flight";
+            return false;
+        }
+        pipe_issuing = true;
+        const bool ok = forward(&token, 1, 1, err, 0);
+        pipe_issuing = false;
+        if (!ok) return false;
+        Dev& d = devs[(size_t) head_dev];
+        cudaSetDevice(d.id);
+        strata::kernels::SamplerParams sp;
+        sp.temperature = temperature;
+        sp.greedy = temperature <= 0.0f;
+        sp.top_p = top_p;
+        sp.top_k = top_k;
+        sp.min_p = min_p;
+        sp.seed = seed;
+        sp.counter = counter;
+        int h = 0;
+        const int* hr = pen_rows((int64_t) toks.size(), 1, sp, h);
+        strata::kernels::sample_tokens(d.logits + (size_t) std::max(0, n_logits - 1) * g.vocab, 1, g.vocab, hr, h,
+                                       sp, d.tok, d.st);
+        CK(cudaMemcpyAsync(c.tok_h, d.tok, 4, cudaMemcpyDeviceToHost, d.st));
+        CK(cudaEventRecord(c.ev_done, d.st));
+        c.inflight = true;
+        return true;
+    }
+
+    // sequence s's issued token, waited for (its own event and pinned pick: the other sequence may be bound)
+    int pipe_take(int s, std::string& err) {
+        if (s < 0 || s >= pipe_n || !pipe_ctx[s].inflight) {
+            err = "pipe: no token of sequence " + std::to_string(s) + " in flight";
+            return -1;
+        }
+        PipeCtx& c = pipe_ctx[s];
+        cudaSetDevice(devs[(size_t) head_dev].id);
+        const cudaError_t e = cudaEventSynchronize(c.ev_done);
+        c.inflight = false;
+        if (e != cudaSuccess) {
+            err = std::string("pipe: the issued token's wait: ") + cudaGetErrorString(e);
+            return -1;
+        }
+        return *c.tok_h;
+    }
+
+    // what sequence s could reuse of `ids` (Model::seq_restorable, review S1): best_check's rule over the
+    // sequence's own checkpoints and position - the bound one's live in the Impl, an unbound one's in its
+    // PipeCtx.  An exact continuation reuses the whole state, as a bound prefill would.
+    int64_t seq_restorable(int s, const std::vector<int>& ids) const {
+        if (s < 0 || s >= pipe_n || ids.empty()) return 0;
+        const bool bound = s == pipe_cur;
+        const std::vector<int32_t>& t = bound ? toks : pipe_ctx[s].toks;
+        const int64_t spos = bound ? pos : pipe_ctx[s].pos;
+        const Check* sck = bound ? ck : pipe_ctx[s].ck;
+        size_t c = 0;
+        while (c < t.size() && c < ids.size() && t[c] == ids[c]) ++c;
+        if (!t.empty() && c == t.size() && t.size() < ids.size()) return (int64_t) t.size();
+        const int64_t limit = std::min<int64_t>((int64_t) c, (int64_t) ids.size() - 1);
+        int64_t b = 0;
+        for (int i = 0; i < 3; ++i)
+            if (sck[i].pos >= 0 && sck[i].pos <= limit && sck[i].pos <= spos && sck[i].pos > b) b = sck[i].pos;
+        return b;
+    }
+
     size_t bounce_bytes() const {
         return (size_t) kWin * ((size_t) g.hc * g.dim * 4 + 8 * 4 + topk_stride() * 4 + cand_stride() * 4);
     }
@@ -7530,6 +7847,7 @@ struct Model::Impl {
                 ++started;
                 ++rc_fills_started;
             }
+            if (!o.expert_cache) l.cpu_hits.clear();   // (R2-1: swap_tick is its only other reader and is off then; unchecked it grew for the load's life)
         }
     }
 
@@ -8815,22 +9133,33 @@ struct Model::Impl {
         }
     }
     void serve_lane() {
-        unsigned next = 1;
+        unsigned next = 1;   // the oldest seq not answered yet
+        // MAYA_DS4_PIPE: with two windows in flight one GPU publishes window B's first layers while the other is still
+        // on window A's last ones - answering strictly in seq order would hold B's GPU behind A's (no overlap), so any
+        // published seq in the ring is answered (each request's answer is its own: the same sums in any order)
+        const bool ooo = pipe_n > 1;
+        unsigned done[kRing] = {};   // the seq answered last in each slot
         rtrace_open();
         auto last = std::chrono::steady_clock::now();
         std::vector<Ent> ents, hents;
         std::vector<std::pair<int, int>> hpicks;   // (expert, t * kPicks + i), the helper's
         while (!quit.load(std::memory_order_relaxed)) {
-            Req& r = reqs[next % kRing];
-            if (*(volatile unsigned*) &r.seq != next) {
+            unsigned sq = next;
+            bool ready = *(volatile unsigned*) &reqs[next % kRing].seq == next;
+            for (unsigned k = 1; ooo && !ready && k < (unsigned) kRing; ++k) {
+                sq = next + k;
+                ready = done[sq % kRing] != sq && *(volatile unsigned*) &reqs[sq % kRing].seq == sq;
+            }
+            if (!ready) {
                 cpu_relax();
                 if (std::chrono::steady_clock::now() - last > std::chrono::milliseconds(2))
                     std::this_thread::sleep_for(std::chrono::microseconds(20));
                 continue;
             }
+            Req& r = reqs[sq % kRing];
             std::atomic_thread_fence(std::memory_order_acquire);
-            const int li = layer_of[next % kRing].load(std::memory_order_acquire);
-            Resp& rp = resps[next % kRing];
+            const int li = r.layer;   // (the request says its layer: published on the device with its seq)
+            Resp& rp = resps[sq % kRing];
             const int T = std::max(1, std::min(kWin, r.T));
             for (int t = 0; t < T; ++t) rp.cpu[t] = 0;
             if (li >= 0 && li < (int) L.size()) {
@@ -8838,7 +9167,7 @@ struct Model::Impl {
                 uint32_t* pr = prof.data() + (size_t) li * g.n_exp;
                 ents.clear();
                 // lookahead: the guesses made for this layer (when they are for this request), counted on decode
-                const uint8_t* fl = T == 1 && !ahead_for.empty() && ahead_for[(size_t) li] == next
+                const uint8_t* fl = T == 1 && !ahead_for.empty() && ahead_for[(size_t) li] == sq
                                         ? ahead_fl.data() + (size_t) li * 1024 : nullptr;
                 // the window's CPU-lane picks by expert (up to 8 tokens an entry), their weights by entry row
                 float wv[kWin * kPicks];
@@ -8879,7 +9208,7 @@ struct Model::Impl {
                                 hpicks.push_back({e, t * kPicks + i});
                                 continue;
                             }
-                            l.cpu_hits.push_back(e);
+                            if (o.expert_cache || l.rc_n > 0) l.cpu_hits.push_back(e);   // (S3: nothing else reads it, and nothing clears it then)
                             if ((light && !in_ram(l, e)) || (rsk && r.w[t][i] < ram_skip_w * wsum)) {
                                 ++st.skipped;
                                 continue;
@@ -8931,14 +9260,14 @@ struct Model::Impl {
                         st.ahead_rank_hit[rk[e] - 1] += hit;
                     }
                 }
-                if (ahead_mode > 0 && !ahead_for.empty()) ahead_ask(li, r, next, T);
+                if (ahead_mode > 0 && !ahead_for.empty()) ahead_ask(li, r, sq, T);
                 // the PCIe lane (a decoded token on a layer that streams): the picks it takes leave the CPU lane's, their
                 // copies start now (lane_take)
                 const int lc = T == 1 || (ln_win && T <= kWin) ? lane_class(li) : -1;
                 LaneTake lt;
                 if (lc >= 0) {
-                    if (T == 1) lane_take(l, ln_cls[(size_t) lc], picks, lt, next, r.ids);
-                    else lane_take_win(l, ln_cls[(size_t) lc], picks, lt, next, r.ids, T);
+                    if (T == 1) lane_take(l, ln_cls[(size_t) lc], picks, lt, sq, r.ids);
+                    else lane_take_win(l, ln_cls[(size_t) lc], picks, lt, sq, r.ids, T);
                 }
                 std::sort(picks.begin(), picks.end());
                 for (size_t a = 0; a < picks.size();) {
@@ -8960,7 +9289,7 @@ struct Model::Impl {
                 // only now get the others' time to come in from the SSD (their slots, so the sums, stay the same)
                 int ord[kWin * kPicks];
                 const int* po = nullptr;
-                if (ahead_order && !ahead_for.empty() && ahead_for[(size_t) li] == next && ents.size() > 1 &&
+                if (ahead_order && !ahead_for.empty() && ahead_for[(size_t) li] == sq && ents.size() > 1 &&
                     ents.size() <= (size_t) (kWin * kPicks)) {
                     const uint8_t* fa = ahead_fl.data() + (size_t) li * 1024;
                     int n = 0;
@@ -8997,12 +9326,13 @@ struct Model::Impl {
                 if (lc >= 0) lane_answer(ln_cls[(size_t) lc], lt);
                 if (hon) {
                     std::sort(hpicks.begin(), hpicks.end());
-                    helper_answer(l, r, rp, next, T, hpicks, hents);
+                    helper_answer(l, r, rp, sq, T, hpicks, hents);
                 }
             }
             std::atomic_thread_fence(std::memory_order_release);
-            *(volatile unsigned*) &rp.seq = next;
-            ++next;
+            *(volatile unsigned*) &rp.seq = sq;
+            done[sq % kRing] = sq;
+            while (done[next % kRing] == next) ++next;
             last = std::chrono::steady_clock::now();
         }
     }
@@ -10250,7 +10580,6 @@ struct Model::Impl {
             dp.seq[il] = 0;
             if (host_free(L[(size_t) il])) continue;
             dp.seq[il] = ++seq_issued;
-            layer_of[dp.seq[il] % kRing].store(il, std::memory_order_release);
         }
         const size_t hs = (size_t) T * H * D, rs = (size_t) g.win * g.hd;
         if (dump_d != nullptr && h_dump == nullptr &&
@@ -10404,9 +10733,10 @@ struct Model::Impl {
         h = 0;
         if (pen_n <= 0 || T < 1 || T > kWin) return nullptr;
         Dev& d = devs[(size_t) head_dev];
-        if (d_pen == nullptr) {
+        if (d_pen == nullptr || h_pen == nullptr) {   // (h_pen is the bound sequence's: each makes its own)
             std::string e;
-            if (!halloc(h_pen, (size_t) kWin * kPenCap, e) || !dalloc(d, d_pen, (size_t) kWin * kPenCap, e)) {
+            if ((d_pen == nullptr && !dalloc(d, d_pen, (size_t) kWin * kPenCap, e)) ||
+                (h_pen == nullptr && !halloc(h_pen, (size_t) kWin * kPenCap, e))) {
                 std::fprintf(stderr, "ds4: the penalty rows: %s - picks without the penalties\n", e.c_str());
                 pen_n = 0;
                 return nullptr;
@@ -12331,7 +12661,6 @@ struct Model::Impl {
             wp.seq[il] = 0;
             if (wp.async && !host_free(l)) {
                 wp.seq[il] = ++seq_issued;
-                layer_of[wp.seq[il] % kRing].store(il, std::memory_order_release);
             }
         }
     }
@@ -12413,6 +12742,7 @@ struct Model::Impl {
     // the DSpark drafter's taps: the streams' mean entering target layer il, on device d (after the last seeding read
     // h_taps)
     bool tap(Dev& d, int il, int T, std::string& err) {
+        if (pipe_issuing) return true;   // (a pipelined step does not seed the drafter: no taps to take)
         const auto it = std::find(g.d_targets.begin(), g.d_targets.end(), il);
         if (g.n_mtp == 0 || it == g.d_targets.end()) return true;
         const size_t j = (size_t) (it - g.d_targets.begin()), nt = g.d_targets.size();
@@ -12460,10 +12790,14 @@ struct Model::Impl {
             std::memcpy(h_emb + (size_t) t * D, emb_row(p0 + t, tk[t]), (size_t) D * 2);
         plan_window(p0, T, wplan);
         if (helper_n > 0 && wplan.async) helper_window(T, wplan);   // (DS4_HELPER: its share, in seq order)
-        prof_window = prof_on && T == 1;
+        prof_window = prof_on && T == 1 && !pipe_issuing;
         n_logits = std::min(logits_rows, T);
         const double tl = now_ms();
-        if (par) {
+        // DS4_PIPE_PAR: only the pipelined windows take the workers (the prompt path's, idle while decoding);
+        // every other window keeps the serial path, so a request alone is the stock loop byte for byte
+        const bool use_par = par || (pipe_issuing && pipe_par && workers.size() == devs.size());
+        if (use_par && !par) wplan.par = true;   // (its replicate / xfer choices; plan_window set it from par)
+        if (use_par) {
             if (!forward_par(p0, T, err)) return false;
         } else if (!forward_serial(p0, T, err)) return false;
         st.layer_ms += now_ms() - tl;
@@ -12474,11 +12808,12 @@ struct Model::Impl {
         Dev& d = devs[(size_t) head_dev];
         cudaSetDevice(d.id);
         const double th = now_ms();
-        CK(cudaStreamSynchronize(d.st));
+        if (!pipe_issuing) CK(cudaStreamSynchronize(d.st));   // (pipe_issue: the window is left running)
         st.head_ms += now_ms() - th;
         prof_collect();
         pos += T;
         st.tokens += T;
+        if (pipe_issuing) return true;   // (no cache tick between the windows in flight, no drafter seeding)
         cache_tick(T);
         if (seed_rows != 0 && !seed_drafter(p0, seed_rows < 0 ? T : seed_rows, 0, err)) return false;
         return true;
@@ -12488,12 +12823,19 @@ struct Model::Impl {
     bool forward_serial(int64_t p0, int T, std::string& err) {
         const int D = g.dim, H = g.hc;
         int cur = L[0].dev;
+        const bool plt = plt_on && pipe_issuing;   // DS4_PIPE_LAYER_TIME
+        double plt_t = plt ? now_ms() : 0;
         {
             Dev& d = devs[(size_t) cur];
             cudaSetDevice(d.id);
             CK(cudaMemcpyAsync(d.emb_rows, h_emb, (size_t) T * D * 2, cudaMemcpyHostToDevice, d.st));
             embed(d.emb_rows, T, d.h, D, H, d.st);
             init_pre(d.pre, T, d.st);
+        }
+        if (plt) {
+            const double t2 = now_ms();
+            plt_embed += t2 - plt_t;
+            plt_t = t2;
         }
         std::vector<float> dump;
         if (dump_h != nullptr) dump.resize((size_t) T * g.nl * H * D);
@@ -12518,9 +12860,19 @@ struct Model::Impl {
                 CK(cudaMemcpyAsync(b.topk, bb + nh + np, nk, cudaMemcpyHostToDevice, b.st));
                 CK(cudaMemcpyAsync(b.cand, bb + nh + np + nk, nc, cudaMemcpyHostToDevice, b.st));
                 cur = l.dev;
+                if (plt) {
+                    const double t2 = now_ms();
+                    plt_hand += t2 - plt_t;
+                    plt_t = t2;
+                }
             }
             if (!tap(devs[(size_t) l.dev], il, T, err)) return false;
             if (!layer(l, 0, p0, T, wplan, err)) return false;
+            if (plt) {
+                const double t2 = now_ms();
+                plt_layer[il] += t2 - plt_t;
+                plt_t = t2;
+            }
             if (dump_h != nullptr) {   // DS4_DUMP_H: every layer's residual stream, for tools/ds4/compare.py --layers
                 Dev& dd = devs[(size_t) l.dev];
                 std::vector<float> hv((size_t) T * H * D);
@@ -12533,6 +12885,15 @@ struct Model::Impl {
             }
         }
         if (dump_h != nullptr) std::fwrite(dump.data(), 4, dump.size(), dump_h);
+        if (plt && ++plt_n % 256 == 0) {
+            std::fprintf(stderr, "maya ds4 pipe timing layers over %lld windows: embed %.3f hand %.3f eg %.3f ms/window; layer host ms/window:",
+                         plt_n, plt_embed / (double) plt_n, plt_hand / (double) plt_n, plt_eg / (double) plt_n);
+            for (int il = 0; il < g.nl; ++il) std::fprintf(stderr, " %d:%.3f", il, plt_layer[il] / (double) plt_n);
+            std::fprintf(stderr, "\n");
+            std::memset(plt_layer, 0, sizeof plt_layer);
+            plt_hand = plt_embed = plt_eg = 0;
+            plt_n = 0;
+        }
         if (cur != head_dev) {
             err = "the head is not on the last layer's GPU";
             return false;
@@ -12676,7 +13037,9 @@ struct Model::Impl {
         if (l.eg >= 0) {
             const int cols = (pk.eg_ngram - 1) * pk.eg_heads, ehd = pk.eg_hd;
             const size_t per = (size_t) cols * (ehd + ehd / 32);
+            const double plt_eg0 = plt_on && pipe_issuing ? now_ms() : 0;
             eg_finish(*eg_win[(size_t) l.eg]);   // (asked for when the window began)
+            if (plt_eg0 != 0) plt_eg += now_ms() - plt_eg0;
             uint8_t* src = h_eg + (size_t) l.eg * eg_cap * per;
             for (int t = 0; t < T; ++t)   // [token][rows | scales] -> [all rows][all scales]
                 CK(cudaMemcpyAsync(d.eg_rows + (size_t) t * cols * ehd, src + (size_t) t * per, (size_t) cols * ehd,
@@ -12964,7 +13327,7 @@ struct Model::Impl {
             }
             route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
                           d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
-                          na[1]);
+                          na[1], l.il);
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
             swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;
@@ -13102,7 +13465,7 @@ struct Model::Impl {
                 }
                 ++pr[e];
                 l.heat[(size_t) e] += 1.0f;
-                if (l.slot[(size_t) e] < 0) l.cpu_hits.push_back(e);
+                if (l.slot[(size_t) e] < 0 && (o.expert_cache || l.rc_n > 0)) l.cpu_hits.push_back(e);   // (S3, as serve_lane)
                 per[(size_t) e].push_back({t, i});
             }
         }
@@ -13410,6 +13773,21 @@ bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::str
     return p_->slot_load(data, bytes, n_pos, err);
 }
 std::string Model::slot_identity() const { return p_->slot_identity(); }
+int Model::seq_count() const { return p_->pipe_n; }
+bool Model::pipe_ready(std::string& why) const { return p_->pipe_ready(why); }
+void Model::seq_bind(int s) { p_->seq_bind(s); }
+int Model::seq_bound() const { return p_->pipe_cur; }
+const std::vector<int32_t>& Model::seq_tokens(int s) const {
+    return s == p_->pipe_cur ? p_->toks : p_->pipe_ctx[s].toks;
+}
+int64_t Model::seq_restorable(int s, const std::vector<int>& ids) const { return p_->seq_restorable(s, ids); }
+int Model::window() const { return p_->g.win; }
+bool Model::pipe_issue(int token, float temperature, float top_p, int top_k, float min_p, uint64_t seed,
+                       uint64_t counter, std::string& err) {
+    return p_->pipe_issue(token, temperature, top_p, top_k, min_p, seed, counter, err);
+}
+int Model::pipe_take(int s, std::string& err) { return p_->pipe_take(s, err); }
+bool Model::pipe_inflight(int s) const { return s >= 0 && s < p_->pipe_n && p_->pipe_ctx[s].inflight; }
 void Model::save_profile() const { p_->save_profile(); }
 const Stats& Model::stats() const { return p_->st; }
 std::string Model::describe() const { return p_->describe(); }

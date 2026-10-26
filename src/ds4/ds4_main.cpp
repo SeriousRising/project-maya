@@ -35,6 +35,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -104,6 +105,9 @@ struct Lines {
     std::deque<std::string> q;
     bool eof = false;
     std::atomic<bool> stop{false};
+    std::set<long long> stop_rids;   // STOP <rid>: one request of several (serve_pipe; plain STOP is stop above)
+    bool multi = false;              // (S5) serve_pipe sets this before start(): only then does STOP <rid> end
+                                     // one request; stock serve() keeps stopping on every STOP line
     void start() {
         std::thread([this] {
             std::string l, buf;
@@ -135,7 +139,13 @@ struct Lines {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 std::lock_guard<std::mutex> lk(mu);
                 if (l == "STOP" || l.rfind("STOP ", 0) == 0) {
-                    stop.store(true);
+                    const long long rid = l.size() > 5 ? std::atoll(l.c_str() + 5) : 0;
+                    if (multi && rid > 0) {
+                        stop_rids.insert(rid);
+                        // (N3) a STOP that raced its DONE is never cleared; rids only grow, so the smallest
+                        // entries are finished requests' - keep the set bounded by dropping them
+                        while (stop_rids.size() > 1024) stop_rids.erase(stop_rids.begin());
+                    } else stop.store(true);
                     continue;
                 }
                 if (l == "QUIT") stop.store(true);
@@ -155,6 +165,21 @@ struct Lines {
         l = q.front();
         q.pop_front();
         return true;
+    }
+    bool try_next(std::string& l) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (q.empty()) return false;
+        l = q.front();
+        q.pop_front();
+        return true;
+    }
+    bool stopped_rid(long long rid) {
+        std::lock_guard<std::mutex> lk(mu);
+        return stop_rids.count(rid) > 0;
+    }
+    void clear_rid(long long rid) {
+        std::lock_guard<std::mutex> lk(mu);
+        stop_rids.erase(rid);
     }
 };
 
@@ -251,6 +276,7 @@ struct Req {
     // block still open after n tokens of the answer is closed - its next token is think_end - and the answer follows
     long long think_budget = 0;
     int think_end = -1;
+    long long rid = -1;   // rid=<id>: several conversations at once (serve_pipe; the server routes by it)
     std::string file;   // GENI: the pictures
     std::vector<int> ids;
 };
@@ -354,6 +380,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "penalty_present") r.pen_present = std::strtof(v.c_str(), nullptr);
         else if (k == "think_budget") r.think_budget = std::atoll(v.c_str());
         else if (k == "think_end") r.think_end = std::atoi(v.c_str());
+        else if (k == "rid") r.rid = std::atoll(v.c_str());
     }
     return !r.ids.empty() && (!geni || !r.file.empty());
 }
@@ -1103,6 +1130,518 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     return 0;
 }
 
+// ---- two requests in flight (MAYA_DS4_PIPE=1, Model::pipe_ready; the GLM serve's arrangement in
+// src/program/generate.cpp): GEN lines carry rid=<id> and every line a request causes carries it after its
+// keyword, STOP <rid> ends one request.  Each request runs in one of the model's two sequence states.  A
+// request alone decodes exactly as serve() does (round(), the drafter included); with two active, each next
+// token is a plain step enqueued whole (Model::pipe_issue) and taken when its turn comes (pipe_take), so each
+// card of the layer split works on a different request at the same time.  A prompt is read drained - no
+// issued token in flight - on its sequence, with serve()'s continuation / restore rules per sequence (the
+// kept-conversation slots and pictures are serve()'s alone: pipe mode is refused with a vision tower, and
+// MAYA_DS4_SLOT_KEEP has no effect here).  The DONE hit fields and STAT counters of two pipelined requests
+// share the model's counters, so they are each other's share too; the tokens are exact.
+int serve_pipe(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min) {
+    std::vector<int> eos = parse_ids(eos_list);
+    for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
+    std::printf("READY %lld stop multi=%d\n", (long long) m.max_context(), m.seq_count());
+    std::fflush(stdout);
+    std::fprintf(stderr, "maya ds4 serve (pipe): %d conversations at once; GEN <max_new> [keys] rid=<id> <ids>; "
+                         "STOP <id>, QUIT\n", m.seq_count());
+    if (std::getenv("STRATA_DS4_SLOT_KEEP") != nullptr && std::atoi(std::getenv("STRATA_DS4_SLOT_KEEP")) != 0)
+        std::fprintf(stderr, "maya ds4 serve (pipe): MAYA_DS4_SLOT_KEEP has no effect here - each sequence "
+                             "keeps its own conversation\n");
+    // diagnostics / gate controls (DS4_* pass maya.py's rename raw): NOSPEC makes a request alone take plain
+    // pipelined steps too, so a solo run and a concurrent run are the same computation (the text gate);
+    // DEPTH1 takes each issued token before issuing the next (the no-overlap control)
+    const auto pipe_env = [](const char* n) {
+        const char* v = std::getenv((std::string("STRATA_") + n).c_str());
+        if (v == nullptr) v = std::getenv(n);
+        return v != nullptr && std::atoi(v) != 0;
+    };
+    const bool pipe_nospec = pipe_env("DS4_PIPE_NOSPEC");
+    const bool pipe_depth1 = pipe_env("DS4_PIPE_DEPTH1");
+    const bool pipe_par = pipe_env("DS4_PIPE_PAR");
+    if (pipe_nospec || pipe_depth1 || pipe_par)
+        std::fprintf(stderr, "maya ds4 serve (pipe): DS4_PIPE_NOSPEC=%d DS4_PIPE_DEPTH1=%d DS4_PIPE_PAR=%d\n",
+                     (int) pipe_nospec, (int) pipe_depth1, (int) pipe_par);
+    Lines in;
+    in.multi = true;   // (S5: STOP <rid> ends one request here; stock serve() never sets this)
+    in.start();
+    unsigned long long counter = 0;   // the picks' counter, one chain for every request (as serve())
+    long long auto_rid = 0;           // a GEN without rid= (a direct harness): a route of its own
+
+    struct PGen {
+        Req r;
+        int seq = 0;
+        double t0 = 0, t1 = 0;   // the prompt's start, the decode's
+        strata::ds4::Stats s0, sd, s_dec;
+        size_t from = 0;         // prompt tokens the sequence already held
+        int64_t pos = 0;         // the sequence's position (its own: the model's pos() is the bound one's)
+        int tok = -1;            // sampled, at pos, not fed yet; once emitted, the next step feeds it
+        bool emitted = false;    // tok's T line is out
+        std::vector<int> got;    // a speculative round's rest, reversed (serve()'s stack)
+        long long produced = 0, limit = 0, d_off = 0, d_acc = 0;
+        bool cool = false, in_think = false, force_end = false;
+        bool inflight = false, done = false, stop_req = false, piped = false;
+        // (S4) the drafter's rings miss every pipelined position (pipe_issue never seeds): measure the
+        // acceptance of the first lone rounds after this request leaves the pipeline, and if it is clearly
+        // below solo levels (~0.8 kept in the serving logs), stop drafting until plain steps - which seed -
+        // have refilled a whole window of ring rows
+        long long post_rounds = 0, post_off = 0, post_acc = 0, draft_skip_until = -1;
+        bool post_done = false;
+        double t_issue = 0, t_take = 0, t_flight = 0, t_issued = 0;   // DS4_PIPE_TIME: host enqueue, the take's
+        long long n_pipe = 0;                                          // wait, enqueue-end to taken; the steps
+        std::string finish = "length";
+    };
+    std::vector<std::unique_ptr<PGen>> gens;   // active, admission order
+    std::deque<PGen*> flight;                  // issued, oldest first
+    std::deque<Req> waiting;                   // GEN lines no sequence can hold yet
+    const int nseq = m.seq_count();
+    std::vector<char> seq_busy((size_t) nseq, 0);
+    std::vector<uint64_t> seq_used((size_t) nseq, 0);
+    uint64_t seq_clock = 0;
+    bool quit = false;
+
+    const auto stopped = [&](const PGen& g) { return g.stop_req || in.stopped_rid(g.r.rid); };
+    const auto any_inflight = [&] {
+        for (const auto& g : gens)
+            if (g->inflight) return true;
+        return false;
+    };
+    // a request that never runs (an error before its prompt is read): its ERR, and where serve() prints one,
+    // its DONE (the multi server raises on the ERR; the DONE behind it is dropped as a gone request's)
+    const auto err_done = [&](long long rid, size_t ntok, const std::string& e, bool done_too) {
+        std::printf("ERR %lld %s\n", rid, e.c_str());
+        if (done_too) std::printf("DONE %lld 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", rid, ntok);
+        std::fflush(stdout);
+        in.clear_rid(rid);
+    };
+
+    // (S2) a window that fails after plan_window assigned its mailbox seqs leaves seqs that are never
+    // published: the CPU-lane service stalls at the first of them, the other request's GPU spins in
+    // wait_seq forever, and the server's stall check sees a busy GPU and never ends the engine.  In pipe
+    // mode such a failure (a failed forward inside pipe_issue / a round / a feed, or a failed pipe_take)
+    // is therefore fatal: every request in hand gets its ERR and the process exits, so the server
+    // restarts a clean engine instead of admitting new requests to a wedged one.
+    const auto fatal = [&](const std::string& e) -> void {
+        std::fprintf(stderr, "maya ds4 serve (pipe): fatal after work was enqueued: %s - exiting so the "
+                             "server restarts the engine\n", e.c_str());
+        for (const auto& g : gens) std::printf("ERR %lld %s\n", g->r.rid, e.c_str());
+        for (const Req& w : waiting) std::printf("ERR %lld %s\n", w.rid, e.c_str());
+        std::fflush(stdout);
+        std::fflush(stderr);
+        std::_Exit(3);
+    };
+
+    // the sequence for a prompt: the idle one that can reuse the most of it (S1: an exact continuation, or
+    // the best checkpoint at or below the common prefix - a template that re-renders history, dropping
+    // earlier turns' reasoning, still lands on the sequence that holds that chat, as stock serve()'s one
+    // state does; scoring only exact continuations bounced every turn to the other sequence for a full
+    // re-read), else the least recently used idle one (-1: every sequence is busy)
+    const auto pick_seq = [&](const Req& r) {
+        int best = -1;
+        int64_t best_c = 0;
+        for (int s = 0; s < nseq; ++s) {
+            if (seq_busy[(size_t) s]) continue;
+            const int64_t c = m.seq_restorable(s, r.ids);
+            if (c > 0 && (best < 0 || c > best_c ||
+                          (c == best_c && seq_used[(size_t) s] < seq_used[(size_t) best]))) {
+                best = s;
+                best_c = c;
+            }
+        }
+        if (best >= 0) return best;
+        for (int s = 0; s < nseq; ++s)
+            if (!seq_busy[(size_t) s] && (best < 0 || seq_used[(size_t) s] < seq_used[(size_t) best])) best = s;
+        return best;
+    };
+
+    // a prompt read on its (bound) sequence, nothing in flight: serve()'s continuation / restore / feed, the
+    // checkpoints and the first pick.  True: g is ready to emit g.tok.  False: its ERR / DONE are out.
+    const auto prefill = [&](PGen& g) -> bool {
+        const Req& r = g.r;
+        m.seq_bind(g.seq);
+        m.begin_request();
+        g.t0 = now_ms();
+        g.s0 = m.stats();
+        const auto& st = m.tokens();
+        const size_t n_state = st.size();
+        size_t c = 0;
+        while (c < n_state && c < r.ids.size() && st[c] == r.ids[c]) ++c;
+        size_t from = 0;
+        bool continued = false;
+        if (n_state > 0 && c == n_state && n_state < r.ids.size()) {
+            from = n_state;
+            continued = true;
+        } else {
+            const int64_t limit = (int64_t) std::min(c, r.ids.size() - 1);
+            if (m.restorable(limit) >= 0 && m.restore(limit)) from = (size_t) m.pos();
+            else m.reset();
+        }
+        g.from = from;
+        if ((int64_t) r.ids.size() + std::max(0LL, r.max_new) > m.max_context()) {
+            char b[256];
+            std::snprintf(b, sizeof b, "the prompt (%zu tokens) and max_new %lld are more than the context %lld",
+                          r.ids.size(), r.max_new, (long long) m.max_context());
+            err_done(r.rid, r.ids.size(), b, false);
+            return false;
+        }
+        std::string err;
+        bool ok = true;
+        const size_t total = r.ids.size();
+        size_t done = from, next_pp = from + 64;
+        m.set_progress([&](int64_t d) {
+            const double ms = now_ms() - g.t0;
+            std::printf("PP %lld %zu %zu %.1f %.1f %zu\n", r.rid, done + (size_t) d, total, ms,
+                        ms > 0 ? 1000.0 * (double) (done + (size_t) d - from) / ms : 0.0, from);
+            std::fflush(stdout);
+        });
+        static const bool last_window = std::getenv("DS4_LAST_WINDOW") != nullptr;
+        if (from > 0 && from < total) m.checkpoint(1);
+        m.set_cancel([&in, &r] { return in.stop.load() || in.stopped_rid(r.rid); });
+        bool stopped_now = false;
+        while (ok && done < total) {
+            if (in.stop.load() || in.stopped_rid(r.rid)) {
+                stopped_now = true;
+                break;
+            }
+            const size_t n = std::min<size_t>((size_t) m.feed_unit(), total - done);
+            const bool fin = done + n == total;
+            if (fin && last_window) {
+                ok = (n < 2 || m.feed(r.ids.data() + done, (int) n - 1, 0, err));
+                if (ok) m.checkpoint(1);
+                ok = ok && m.feed(r.ids.data() + done + n - 1, 1, 1, err);
+            } else
+                ok = fin ? m.feed_mark(r.ids.data() + done, (int) n, 1, 1, err)
+                         : m.feed(r.ids.data() + done, (int) n, 0, err);
+            done += n;
+            if (ok && (done >= next_pp || done == total)) {
+                const double ms = now_ms() - g.t0;
+                std::printf("PP %lld %zu %zu %.1f %.1f %zu\n", r.rid, done, total, ms,
+                            ms > 0 ? 1000.0 * (double) (done - from) / ms : 0.0, from);
+                std::fflush(stdout);
+                next_pp = done + 64;
+            }
+        }
+        m.set_cancel(nullptr);
+        m.set_progress(nullptr);
+        if (stopped_now || (!ok && m.cancelled())) {
+            const bool back = from > 0 && m.restore((int64_t) from) && (size_t) m.pos() == from;
+            if (!back) m.reset();
+            std::fprintf(stderr, "maya ds4 serve (pipe): request %lld stopped while reading the prompt of %zu "
+                                 "tokens, after %.0f ms%s\n", r.rid, total, now_ms() - g.t0,
+                         back ? "; the conversation before it is kept" : "");
+            std::printf("DONE %lld 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0\n", r.rid, total, now_ms() - g.t0,
+                        back ? from : (size_t) 0);
+            std::fflush(stdout);
+            in.clear_rid(r.rid);
+            return false;
+        }
+        if (!ok) {   // (S2: a feed that failed mid-window may have left unpublished seqs)
+            std::printf("ERR %lld %s\n", r.rid, err.c_str());   // (N-a: not in gens or waiting yet, so its ERR is written here; fatal writes the rest and flushes)
+            fatal(err);
+        }
+        m.checkpoint(0);
+        if (!continued) m.pin();
+        g.t1 = now_ms();
+        g.sd = m.stats();
+        g.limit = r.max_new > 0 ? r.max_new : m.max_context() - (long long) r.ids.size();
+        m.set_penalties(r.pen_n < 0 ? INT_MAX : r.pen_n,
+                        std::isfinite(r.pen_repeat) && r.pen_repeat > 0.0f ? r.pen_repeat : 1.0f,
+                        std::isfinite(r.pen_freq) ? r.pen_freq : 0.0f,
+                        std::isfinite(r.pen_present) ? r.pen_present : 0.0f);
+        g.tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, counter++);
+        g.s_dec = m.stats();
+        g.in_think = r.think_budget > 0 && r.think_end >= 0;
+        g.pos = m.pos();
+        return true;
+    };
+    // STAT for the Monitor every 8 tokens: this request's own rate, the model's shared counters (a pipelined
+    // neighbour's share in them too), the tiers as serve() prints them
+    const auto stat_line = [&](PGen& g) {
+        const strata::ds4::Stats& s = m.stats();
+        const double ms = now_ms() - g.t1;
+        const strata::ds4::Model::Tiers tr = m.tiers();
+        char b[256];
+        std::string out = "STAT";
+        std::snprintf(b, sizeof b, " tok_s=%.2f ms_tok=%.2f vram_used=%d ram_used=%d cpu_n=%d vram_gb=%.2f ram_gb=%.2f",
+                      ms > 0 ? 1000.0 * (double) g.produced / ms : 0.0,
+                      g.produced > 0 ? ms / (double) g.produced : 0.0, tr.vram, tr.ram, tr.cpu, tr.vram_gb, tr.ram_gb);
+        out += b;
+        if (g.d_off > 0) {
+            std::snprintf(b, sizeof b, " drafts=%.3f", (double) g.d_acc / (double) g.d_off);
+            out += b;
+        }
+        (void) s;
+        std::printf("%s\n", out.c_str());
+    };
+
+    // g.tok's T line and what follows it (the thinking close, the end tokens, the limits): true goes on
+    const auto emit_tok = [&](PGen& g) -> bool {
+        std::printf("T %lld %d\n", g.r.rid, g.tok);
+        ++g.produced;
+        if (g.in_think && g.tok == g.r.think_end) g.in_think = false;
+        if (g.produced % 8 == 0) stat_line(g);
+        std::fflush(stdout);
+        g.emitted = true;
+        for (int e : eos)
+            if (g.tok == e) {
+                g.finish = "stop";
+                return false;
+            }
+        return g.produced < g.limit && g.pos < m.max_context();
+    };
+
+    // a finished request: its DONE, the serve log's lines, its sequence idle again (its state stays for a
+    // prompt that continues it)
+    const auto finish_gen = [&](PGen& g) {
+        stat_line(g);
+        const double t2 = now_ms();
+        const strata::ds4::Stats& se = m.stats();
+        std::printf("DONE %lld %lld %zu %.1f %.1f %s %lld %lld %zu %lld %lld\n", g.r.rid, g.produced, g.r.ids.size(),
+                    g.t1 - g.t0, t2 - g.t1, g.finish.c_str(), g.d_acc, g.d_off, g.from,
+                    (long long) ((se.experts - g.sd.experts) - (se.cpu_experts - g.sd.cpu_experts)),
+                    (long long) (se.experts - g.sd.experts));
+        std::fflush(stdout);
+        const auto& s = m.stats();
+        std::fprintf(stderr,
+                     "maya ds4 serve (pipe): request %lld prompt %zu tokens = %zu reused + %zu read in %.0f ms "
+                     "(%.1f tok/s), %lld generated in %.0f ms (%.2f tok/s)%s\n",
+                     g.r.rid, g.r.ids.size(), g.from, g.r.ids.size() - g.from, g.t1 - g.t0,
+                     g.t1 > g.t0 ? 1000.0 * (double) (g.r.ids.size() - g.from) / (g.t1 - g.t0) : 0.0, g.produced,
+                     t2 - g.t1, t2 > g.t1 ? 1000.0 * (double) g.produced / (t2 - g.t1) : 0.0,
+                     g.piped ? " (pipelined)" : "");
+        if (g.d_off > 0)
+            std::fprintf(stderr, "maya ds4 serve (pipe): request %lld drafts %lld of %lld kept\n", g.r.rid, g.d_acc,
+                         g.d_off);
+        if (g.piped && g.n_pipe > 0)   // where a pipelined step's time went, and the model's (shared) counters
+            std::fprintf(stderr,
+                         "maya ds4 serve (pipe): request %lld pipe timing over %lld steps: issue %.2f ms/step, "
+                         "take wait %.2f, in flight %.2f; shared since its decode began: layer host %.2f ms/token "
+                         "(%lld tokens), cpu lane %.2f ms / %.1f experts per token, engram %.2f ms/token\n",
+                         g.r.rid, g.n_pipe, g.t_issue / (double) g.n_pipe, g.t_take / (double) g.n_pipe,
+                         g.t_flight / (double) g.n_pipe,
+                         s.tokens > g.s_dec.tokens ? (s.layer_ms - g.s_dec.layer_ms) / (double) (s.tokens - g.s_dec.tokens) : 0.0,
+                         (long long) (s.tokens - g.s_dec.tokens),
+                         s.tokens > g.s_dec.tokens ? (s.cpu_ms - g.s_dec.cpu_ms) / (double) (s.tokens - g.s_dec.tokens) : 0.0,
+                         s.tokens > g.s_dec.tokens ? (double) (s.cpu_experts - g.s_dec.cpu_experts) / (double) (s.tokens - g.s_dec.tokens) : 0.0,
+                         s.tokens > g.s_dec.tokens ? (s.engram_ms - g.s_dec.engram_ms) / (double) (s.tokens - g.s_dec.tokens) : 0.0);
+        if (!g.piped) prof_line(g.s_dec, s);
+        in.clear_rid(g.r.rid);
+        seq_busy[(size_t) g.seq] = 0;
+        seq_used[(size_t) g.seq] = ++seq_clock;
+        if (!any_inflight()) m.save_profile();
+    };
+
+    // the next token of a request alone: serve()'s speculative round on its (bound) sequence.  Its tokens
+    // land in got (reversed); the caller pops one into tok.  False: the request ends (finish set).
+    const auto alone_round = [&](PGen& g) -> bool {
+        m.seq_bind(g.seq);
+        int room = (int) std::min<long long>(g.limit - g.produced, m.max_context() - m.pos());
+        const bool close_think = g.in_think && g.produced >= g.r.think_budget;
+        if (close_think) room = 1;
+        else if (g.in_think) room = (int) std::min<long long>(room, g.r.think_budget - g.produced);
+        int off = 0, acc = 0;
+        bool try_spec = (g.r.spec < 0 ? spec : g.r.spec != 0) && !g.cool;
+        if (g.produced < g.draft_skip_until) try_spec = false;   // (S4: plain steps reseed the drafter's rings)
+        std::string err;
+        if (!round(m, g.tok, room, try_spec, g.r.conf >= 0 ? g.r.conf : conf_min, g.r.temperature, g.r.top_p,
+                   g.r.top_k, g.r.min_p, g.r.seed, counter, g.got, off, acc, err, g.r.cum))
+            fatal(err);   // (S2)
+        g.d_off += off;
+        g.d_acc += acc;
+        g.cool = try_spec && off == 0;
+        if (g.piped && !g.post_done && g.produced >= g.draft_skip_until) {   // (S4 measurement)
+            ++g.post_rounds;
+            g.post_off += off;
+            g.post_acc += acc;
+            if (g.post_rounds >= 10) {
+                g.post_done = true;
+                const double a = g.post_off > 0 ? (double) g.post_acc / (double) g.post_off : 0.0;
+                std::fprintf(stderr, "maya ds4 serve (pipe): request %lld post-pipeline drafts: %lld of %lld "
+                                     "kept over its first %lld lone rounds (%.3f)\n",
+                             g.r.rid, g.post_acc, g.post_off, g.post_rounds, a);
+                if (g.post_off >= 10 && a < 0.4) {
+                    g.draft_skip_until = g.produced + m.window();
+                    std::fprintf(stderr, "maya ds4 serve (pipe): request %lld: acceptance clearly below "
+                                         "solo - no drafting for the next %d tokens while plain steps "
+                                         "refill the drafter's rings\n", g.r.rid, m.window());
+                }
+            }
+        }
+        if (close_think && !g.got.empty()) g.got.back() = g.r.think_end;
+        std::reverse(g.got.begin(), g.got.end());
+        g.pos = m.pos();
+        return true;
+    };
+
+    // the next token of a pipelined request: a plain step enqueued whole (its thinking budget closes by
+    // replacing the token it makes, as round() does with room 1)
+    const auto issue_step = [&](PGen& g) -> bool {
+        m.seq_bind(g.seq);
+        g.force_end = g.in_think && g.produced >= g.r.think_budget;
+        std::string err;
+        const double ti = now_ms();
+        if (!m.pipe_issue(g.tok, g.r.temperature, g.r.top_p, g.r.top_k, g.r.min_p, g.r.seed, counter, err))
+            fatal(err);   // (S2)
+        g.t_issued = now_ms();
+        g.t_issue += g.t_issued - ti;
+        ++g.n_pipe;
+        ++counter;   // (one pick)
+        g.pos = m.pos();
+        g.inflight = true;
+        g.piped = true;
+        if (!g.post_done) g.post_rounds = g.post_off = g.post_acc = 0;   // (S4: count only rounds after the last pipelined stretch)
+        flight.push_back(&g);
+        return true;
+    };
+
+    // the oldest issued token back (the host waits here at depth 1; at depth 2 the cards are on the other
+    // request meanwhile)
+    const auto take_front = [&] {
+        PGen& g = *flight.front();
+        flight.pop_front();
+        std::string err;
+        const double tt = now_ms();
+        const int t = m.pipe_take(g.seq, err);
+        const double te = now_ms();
+        g.t_take += te - tt;
+        g.t_flight += te - g.t_issued;
+        g.inflight = false;
+        if (t < 0) fatal(err);   // (S2)
+        {
+            g.tok = g.force_end ? g.r.think_end : t;
+            g.force_end = false;
+            g.emitted = false;
+        }
+    };
+
+    bool stop_all = false;   // a plain STOP (or QUIT): every request ends at its next step
+    const auto handle_line = [&](const std::string& line) {
+        if (line == "QUIT") {
+            quit = true;
+            stop_all = true;
+            for (auto& g : gens) g->stop_req = true;
+            return;
+        }
+        const bool geni = line.rfind("GENI ", 0) == 0;
+        if (!geni && line.rfind("GEN ", 0) != 0) {
+            std::printf("ERR unsupported command '%s' (GEN, GENI, STOP and QUIT)\n",
+                        line.substr(0, line.find(' ')).c_str());
+            std::fflush(stdout);
+            return;
+        }
+        Req r;
+        if (!parse_gen(line, r, geni)) {
+            const size_t k = line.find(" rid=");
+            const long long rid = k != std::string::npos ? std::atoll(line.c_str() + k + 5) : 0;
+            if (rid > 0) std::printf("ERR %lld expected: GEN <max_new> [keys] rid=<id> <id,id,...>\n", rid);
+            else std::printf("ERR expected: GEN <max_new> [keys] rid=<id> <id,id,...>\n");
+            std::fflush(stdout);
+            return;
+        }
+        if (r.rid <= 0) r.rid = ++auto_rid;
+        if (geni) {   // (serve_pipe runs only without a vision tower: serve() has the pictures)
+            err_done(r.rid, r.ids.size(), "this engine has no vision tower, so it cannot read pictures", true);
+            return;
+        }
+        waiting.push_back(std::move(r));
+    };
+
+    while (true) {
+        // input first: block only when there is nothing else to do
+        if (gens.empty() && waiting.empty() && !quit) {
+            std::string line;
+            if (!in.next(line)) break;
+            handle_line(line);
+        } else {
+            std::string line;
+            while (in.try_next(line)) handle_line(line);
+        }
+        if (in.stop.exchange(false)) {   // a plain STOP since the last turn of the loop
+            stop_all = true;
+            for (auto& g : gens) g->stop_req = true;
+        }
+        if (quit || stop_all)
+            while (!waiting.empty()) {
+                err_done(waiting.front().rid, waiting.front().ids.size(), "the engine is stopping", false);
+                waiting.pop_front();
+            }
+        // admissions, drained (a prompt is never read under a token in flight)
+        while (!quit && !stop_all && !waiting.empty() && !any_inflight()) {
+            if (in.stopped_rid(waiting.front().rid)) {   // (N-e: stopped while waiting - answered without touching a sequence)
+                const Req& w = waiting.front();
+                std::printf("DONE %lld 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", w.rid, w.ids.size());
+                std::fflush(stdout);
+                in.clear_rid(w.rid);
+                waiting.pop_front();
+                continue;
+            }
+            const int s = pick_seq(waiting.front());
+            if (s < 0) break;
+            auto g = std::make_unique<PGen>();
+            g->r = std::move(waiting.front());
+            waiting.pop_front();
+            g->seq = s;
+            seq_busy[(size_t) s] = 1;
+            seq_used[(size_t) s] = ++seq_clock;
+            if (prefill(*g)) gens.push_back(std::move(g));
+            else {
+                seq_busy[(size_t) s] = 0;
+                seq_used[(size_t) s] = ++seq_clock;
+            }
+        }
+        // a pass over the requests, oldest first: write the token each holds, then set its next one computing
+        // (a speculative round alone, an issued plain step with a neighbour - what a round left in got is
+        // written first, so a request that was alone joins the pipeline at its round's end)
+        size_t active = 0;
+        for (const auto& g : gens) active += !g->done;
+        for (auto& gp : gens) {
+            PGen& g = *gp;
+            if (g.done || g.inflight) continue;
+            if (!g.emitted) {
+                if (stopped(g)) {
+                    g.finish = "cancel";
+                    g.done = true;
+                    continue;
+                }
+                if (!emit_tok(g)) {
+                    g.done = true;
+                    continue;
+                }
+            }
+            if (!g.got.empty()) {
+                g.tok = g.got.back();
+                g.got.pop_back();
+                g.emitted = false;
+            } else if (active <= 1 && waiting.empty() && !pipe_nospec) {
+                if (!alone_round(g)) {
+                    g.done = true;
+                    continue;
+                }
+                g.tok = g.got.back();
+                g.got.pop_back();
+                g.emitted = false;
+            } else if (!issue_step(g)) {
+                g.done = true;
+                continue;
+            }
+            if (pipe_depth1 && !flight.empty()) take_front();   // (the no-overlap control)
+        }
+        // the oldest issued token back (the host waits here: the cards are on the other request meanwhile)
+        if (!flight.empty()) take_front();
+        for (size_t i = gens.size(); i-- > 0;)
+            if (gens[i]->done) {
+                finish_gen(*gens[i]);
+                gens.erase(gens.begin() + (long) i);
+            }
+        if (quit && gens.empty()) break;
+        if (stop_all && gens.empty()) stop_all = false;   // (a plain STOP ends the requests, not the engine)
+    }
+    m.save_profile();
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1209,7 +1748,24 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
-    if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack);
+    if (serve_mode) {
+        // MAYA_DS4_PIPE=1 (read as STRATA_DS4_PIPE, or DS4_PIPE): two requests in flight, pipelined across the
+        // layer split (serve_pipe) - only where this load may (pipe_ready) and the model reads no pictures
+        const char* pv = std::getenv("STRATA_DS4_PIPE");
+        if (pv == nullptr) pv = std::getenv("DS4_PIPE");
+        if (pv != nullptr && std::atoi(pv) != 0) {
+            std::string why;
+            if (m.image_token() >= 0)
+                std::fprintf(stderr, "maya ds4 serve: MAYA_DS4_PIPE with a vision tower - one request at a "
+                                     "time, as before (pictures are serve()'s)\n");
+            else if (m.pipe_ready(why))
+                return serve_pipe(m, eos, spec, o.dspark_conf);
+            else
+                std::fprintf(stderr, "maya ds4 serve: MAYA_DS4_PIPE not pipelining (%s) - one request at a time, "
+                                     "as before\n", why.c_str());
+        }
+        return serve(m, eos, spec, o.dspark_conf, o.pack);
+    }
     if (!ppl.empty()) {   // --ppl FILE: a line a sequence of ids (BOS + text), each in one forward, tokens 2.. scored
         std::ifstream in(ppl);
         std::string line;

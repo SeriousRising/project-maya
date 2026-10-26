@@ -2345,11 +2345,12 @@ __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restric
     }
 }
 
-__global__ void publish_kernel(Req* req, int T, unsigned seq, int na0, int na1) {
+__global__ void publish_kernel(Req* req, int T, unsigned seq, int na0, int na1, int layer) {
     __threadfence_system();
     req->na[0] = na0;
     req->na[1] = na1;
     req->T = T;
+    req->layer = layer;
     __threadfence_system();
     *(volatile unsigned*) &req->seq = seq;
 }
@@ -2803,10 +2804,10 @@ int cdiv(int a, int b) { return (a + b - 1) / b; }
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,
-                   unsigned vl, int na0, int na1) {
+                   unsigned vl, int na0, int na1, int layer) {
     route_publish_kernel<<<T, 512, 0, s>>>(logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
                                            vl != 0 ? bias_vl : nullptr, vl);
-    if (req != nullptr) publish_kernel<<<1, 1, 0, s>>>(req, T, seq, na0, na1);
+    if (req != nullptr) publish_kernel<<<1, 1, 0, s>>>(req, T, seq, na0, na1, layer);
 }
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s) {
     if (req != nullptr && m > 0 && T > 0 && n <= 1024 && off + m <= kAhead)

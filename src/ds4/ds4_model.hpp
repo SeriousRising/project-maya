@@ -193,6 +193,32 @@ public:
     };
     Tiers tiers() const;
 
+    /// Two requests in flight, pipelined across a layer split (MAYA_DS4_PIPE=1, off by default; GLM's
+    /// glm_multi.cu arrangement): two sequence states (every window ring, the compressors' partial groups and
+    /// each source's compressed KV and index keys, the drafter blocks' rings included), bound one at a time by
+    /// swapping the pointers at them - the weights, the activations and the prompt path's buffers stay shared,
+    /// each device's stream running one sequence's token at a time whichever it belongs to.  seq_count() is 2
+    /// when the second state was allocated at load (before the expert pool, out of its room), else 1.
+    /// pipe_ready() says whether this load may pipeline (its reason when not).  pipe_issue() enqueues the
+    /// bound sequence's one-token step and its pick (nothing waited for; the token at pos(), not fed yet, as
+    /// step()'s), pipe_take(s) waits for sequence s's issued token and returns it.  Prompts, checkpoints and
+    /// the speculative rounds run bound and drained, as before, one sequence at a time.
+    int seq_count() const;
+    bool pipe_ready(std::string& why) const;
+    void seq_bind(int s);
+    int seq_bound() const;
+    const std::vector<int32_t>& seq_tokens(int s) const;
+    /// How much of `ids` sequence s could reuse without being bound (review S1): its length when `ids`
+    /// continues it whole, else the best checkpoint position at or below min(common prefix, ids - 1) -
+    /// what a bound prefill's restorable() would find.  0: nothing usable.
+    int64_t seq_restorable(int s, const std::vector<int>& ids) const;
+    /// The attention window (rows a ring holds); serve_pipe's post-pipeline drafter refill length (S4).
+    int window() const;
+    bool pipe_issue(int token, float temperature, float top_p, int top_k, float min_p, uint64_t seed,
+                    uint64_t counter, std::string& err);
+    int pipe_take(int s, std::string& err);
+    bool pipe_inflight(int s) const;
+
     struct Impl;
 
 private:
