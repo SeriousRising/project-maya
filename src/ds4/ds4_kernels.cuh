@@ -75,6 +75,10 @@ void hc_pre_norm(const float* h, const float* mix, const float* w, int dim, int 
 /// out[t][k][e] = post[t][k] y[t][e] + sum_j comb[t][j][k] res[t][j][e]  (out must not alias res).
 void hc_post(const float* y, const float* res, const float* post, const float* comb, int dim, int hc, int T,
              float* out, cudaStream_t s);
+/// hc_post, then hc_pre_norm(out, mix, w, ..., x): one kernel at this model's shape (dim 5120, hc 4), the same bits
+/// (DS4_RW_HC_FUSE).  DS4_RW_HC_PRE=1: hc_pre_norm's kernel at that shape issues all its loads at once (the same bits).
+void hc_post_pre_norm(const float* y, const float* res, const float* post, const float* comb, const float* mix,
+                      const float* w, int dim, int hc, int T, float eps, float* out, float* x, cudaStream_t s);
 /// hc_post with out = res (h), the same arithmetic: a chunk keeps one copy of its streams.
 void hc_post_inplace(const float* y, float* h, const float* post, const float* comb, int dim, int hc, int T,
                      cudaStream_t s);

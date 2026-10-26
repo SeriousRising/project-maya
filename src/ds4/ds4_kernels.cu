@@ -383,6 +383,79 @@ __global__ void __launch_bounds__(1024) hc_pre_norm_kernel(const float* __restri
     for (int e = threadIdx.x; e < dim; e += blockDim.x, ++n) x[e] = w != nullptr ? r[n] * inv * w[e] : r[n];
 }
 
+// hc_pre_norm_kernel at dim = N * 1024, hc = HC (DS4_RW_HC_PRE): every load issued up front, the same element ->
+// thread map and operations (the mix sum in s order, ss in n order, block_sum), so the same bits; the sums pinned to
+// the stock kernels' compiled forms (SASS: FFMA chains from 0) - the inlined fused kernel otherwise contracts them
+// another way
+template <int N, int HC>
+__device__ __forceinline__ void hc_pre_norm_rows(const float (&a_in)[N][HC], const float* __restrict__ mix,
+                                                 const float* __restrict__ w, int dim, float eps, float* __restrict__ x) {
+    float m[HC], wv[N], r[N];
+#pragma unroll
+    for (int s = 0; s < HC; ++s) m[s] = mix[s];
+#pragma unroll
+    for (int n = 0; n < N; ++n) wv[n] = w != nullptr ? w[threadIdx.x + n * 1024] : 0.0f;
+    float ss = 0.0f;
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+        float a = 0.0f;
+#pragma unroll
+        for (int s = 0; s < HC; ++s) a = __fmaf_rn(m[s], a_in[n][s], a);
+        r[n] = a;
+        ss = __fmaf_rn(a, a, ss);
+    }
+    const float inv = rsqrtf(block_sum(ss) / (float) dim + eps);
+#pragma unroll
+    for (int n = 0; n < N; ++n) x[threadIdx.x + n * 1024] = w != nullptr ? r[n] * inv * wv[n] : r[n];
+}
+template <int N, int HC>
+__global__ void __launch_bounds__(1024) hc_pre_norm_n_kernel(const float* __restrict__ h, const float* __restrict__ mix,
+                                                             const float* __restrict__ w, int dim, float eps,
+                                                             float* __restrict__ x) {
+    const int t = blockIdx.x;
+    h += (size_t) t * HC * dim;
+    float hv[N][HC];
+#pragma unroll
+    for (int n = 0; n < N; ++n)
+#pragma unroll
+        for (int s = 0; s < HC; ++s) hv[n][s] = h[(size_t) s * dim + threadIdx.x + n * 1024];
+    hc_pre_norm_rows<N, HC>(hv, mix + (size_t) t * 8, w, dim, eps, x + (size_t) t * dim);
+}
+// DS4_RW_HC_FUSE: hc_post (out = post y + comb^T res) and then hc_pre_norm of out, one block a token: out is written
+// and its pre-norm taken from the registers, each value by hc_post_kernel's and hc_pre_norm_kernel's operations
+template <int N, int HC>
+__global__ void __launch_bounds__(1024) hc_post_pre_norm_kernel(const float* __restrict__ y, const float* __restrict__ res,
+                                                                const float* __restrict__ post, const float* __restrict__ comb,
+                                                                const float* __restrict__ mix, const float* __restrict__ w,
+                                                                int dim, float eps, float* __restrict__ out,
+                                                                float* __restrict__ x) {
+    const int t = blockIdx.x;
+    res += (size_t) t * HC * dim;
+    out += (size_t) t * HC * dim;
+    float yv[N], rv[N][HC], o[N][HC], pv[HC], cv[HC * HC];
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+        yv[n] = y[(size_t) t * dim + threadIdx.x + n * 1024];
+#pragma unroll
+        for (int j = 0; j < HC; ++j) rv[n][j] = res[(size_t) j * dim + threadIdx.x + n * 1024];
+    }
+#pragma unroll
+    for (int k = 0; k < HC; ++k) pv[k] = post[(size_t) t * 8 + k];
+#pragma unroll
+    for (int i = 0; i < HC * HC; ++i) cv[i] = comb[(size_t) t * 64 + i];
+#pragma unroll
+    for (int n = 0; n < N; ++n)
+#pragma unroll
+        for (int k = 0; k < HC; ++k) {
+            float a = __fmul_rn(pv[k], yv[n]);   // (hc_post_kernel's SASS: FMUL, then an FFMA chain over j)
+#pragma unroll
+            for (int j = 0; j < HC; ++j) a = __fmaf_rn(cv[j * HC + k], rv[n][j], a);
+            o[n][k] = a;
+            out[(size_t) k * dim + threadIdx.x + n * 1024] = a;
+        }
+    hc_pre_norm_rows<N, HC>(o, mix + (size_t) t * 8, w, dim, eps, x + (size_t) t * dim);
+}
+
 __global__ void hc_post_kernel(const float* __restrict__ y, const float* __restrict__ res,
                                const float* __restrict__ post, const float* __restrict__ comb, int dim, int hc,
                                float* __restrict__ out) {
@@ -2853,9 +2926,26 @@ void hc_split(const float* mixes, const float* scale, const float* base, int hc,
               float* pre, float* post, float* comb, cudaStream_t s) {
     hc_split_kernel<<<T, 32, 0, s>>>(mixes, scale, base, hc, iters, hc_eps, pre, post, comb);
 }
+static bool rw_hc_pre() {
+    static const bool on = [] {
+        const char* e = std::getenv("DS4_RW_HC_PRE");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return on;
+}
 void hc_pre_norm(const float* h, const float* mix, const float* w, int dim, int hc, int T, float eps, float* x,
                  cudaStream_t s) {
-    hc_pre_norm_kernel<<<T, 1024, 0, s>>>(h, mix, w, dim, hc, eps, x);
+    if (rw_hc_pre() && dim == 5 * 1024 && hc == 4) hc_pre_norm_n_kernel<5, 4><<<T, 1024, 0, s>>>(h, mix, w, dim, eps, x);
+    else hc_pre_norm_kernel<<<T, 1024, 0, s>>>(h, mix, w, dim, hc, eps, x);
+}
+void hc_post_pre_norm(const float* y, const float* res, const float* post, const float* comb, const float* mix,
+                      const float* w, int dim, int hc, int T, float eps, float* out, float* x, cudaStream_t s) {
+    if (dim == 5 * 1024 && hc == 4) {
+        hc_post_pre_norm_kernel<5, 4><<<T, 1024, 0, s>>>(y, res, post, comb, mix, w, dim, eps, out, x);
+        return;
+    }
+    hc_post(y, res, post, comb, dim, hc, T, out, s);
+    hc_pre_norm(out, mix, w, dim, hc, T, eps, x, s);
 }
 void hc_post(const float* y, const float* res, const float* post, const float* comb, int dim, int hc, int T,
              float* out, cudaStream_t s) {

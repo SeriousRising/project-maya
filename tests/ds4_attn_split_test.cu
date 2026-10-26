@@ -8,6 +8,8 @@
 //   DS4_ATTN_SPLIT=1 ./ds4_attn_split_test --rope   (DS4_RW_SPLIT_ROPE: sparse_attn with AttnRope against finish(q),
 //     sparse_attn, finish(o) on the same inputs, bit for bit, T = 1..6 at several positions; then both timed.  With
 //     DS4_ATTN_SPLIT=0 it checks the stock fallback the same way)
+//   ./ds4_attn_split_test --hc   (DS4_RW_HC_PRE / DS4_RW_HC_FUSE: hc_pre_norm_n_kernel against hc_pre_norm_kernel and
+//     hc_post_pre_norm_kernel against hc_post_kernel + hc_pre_norm_kernel, bit for bit at dim 5120, hc 4, T = 1..6; timed)
 // Build: cmake --build build --target ds4_attn_split_test (target next to ds4_gguf_test in CMakeLists.txt)
 #include "../src/ds4/ds4_kernels.cu"
 
@@ -63,12 +65,13 @@ int main(int argc, char** argv) {
     const float scale = 1.0f / std::sqrt((float) d);
     const char* dump = nullptr;
     const char* cmp = nullptr;
-    bool time_only = false, rope_mode = false;
+    bool time_only = false, rope_mode = false, hc_mode = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--dump") == 0 && i + 1 < argc) dump = argv[++i];
         else if (std::strcmp(argv[i], "--cmp") == 0 && i + 1 < argc) cmp = argv[++i];
         else if (std::strcmp(argv[i], "--time") == 0) time_only = true;
         else if (std::strcmp(argv[i], "--rope") == 0) rope_mode = true;
+        else if (std::strcmp(argv[i], "--hc") == 0) hc_mode = true;
     }
     cudaDeviceProp p{};
     CK(cudaGetDeviceProperties(&p, 0));
@@ -125,6 +128,83 @@ int main(int argc, char** argv) {
                             {512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512},
                             {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}}};
 
+    if (hc_mode) {
+        const int D = 5120, H = 4, TM = 6;
+        const float eps = 1e-6f;
+        std::uniform_real_distribution<float> u01(0.0f, 1.0f);
+        std::vector<float> h_h((size_t) TM * H * D), h_y((size_t) TM * D), h_w(D), h_mix(TM * 8), h_post(TM * 8), h_comb(TM * 64);
+        for (auto& v : h_h) v = nd(rng) * 0.7f;
+        for (auto& v : h_y) v = nd(rng) * 0.3f;
+        for (auto& v : h_w) v = 0.5f + u01(rng);
+        for (auto& v : h_mix) v = u01(rng) + 1e-6f;
+        for (auto& v : h_post) v = 2.0f * u01(rng);
+        for (auto& v : h_comb) v = 0.5f * u01(rng);
+        float *d_h, *d_y, *d_w, *d_mix, *d_post, *d_comb, *d_o1, *d_o2, *d_x1, *d_x2;
+        auto up = [](float*& p, const std::vector<float>& v) {
+            CK(cudaMalloc(&p, v.size() * 4));
+            CK(cudaMemcpy(p, v.data(), v.size() * 4, cudaMemcpyHostToDevice));
+        };
+        up(d_h, h_h), up(d_y, h_y), up(d_w, h_w), up(d_mix, h_mix), up(d_post, h_post), up(d_comb, h_comb);
+        CK(cudaMalloc(&d_o1, h_h.size() * 4));
+        CK(cudaMalloc(&d_o2, h_h.size() * 4));
+        CK(cudaMalloc(&d_x1, h_y.size() * 4));
+        CK(cudaMalloc(&d_x2, h_y.size() * 4));
+        auto same = [](const float* a, const float* b, size_t n) {
+            std::vector<uint32_t> x(n), y(n);
+            CK(cudaMemcpy(x.data(), a, n * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(y.data(), b, n * 4, cudaMemcpyDeviceToHost));
+            size_t nd_ = 0;
+            for (size_t i = 0; i < n; ++i) nd_ += x[i] != y[i];
+            return nd_;
+        };
+        bool hok = true;
+        for (int T = 1; T <= TM; ++T)
+            for (int wn = 0; wn < 2; ++wn) {
+                const float* w = wn ? nullptr : d_w;
+                CK(cudaMemset(d_x1, 0xff, h_y.size() * 4));
+                CK(cudaMemset(d_x2, 0xee, h_y.size() * 4));
+                hc_pre_norm_kernel<<<T, 1024>>>(d_h, d_mix, w, D, H, eps, d_x1);
+                hc_pre_norm_n_kernel<5, 4><<<T, 1024>>>(d_h, d_mix, w, D, eps, d_x2);
+                CK(cudaGetLastError());
+                const size_t dp = same(d_x1, d_x2, (size_t) T * D);
+                CK(cudaMemset(d_o1, 0xff, h_h.size() * 4));
+                CK(cudaMemset(d_o2, 0xee, h_h.size() * 4));
+                hc_post_kernel<<<dim3(cdiv(D * H, kThreads), T), kThreads>>>(d_y, d_h, d_post, d_comb, D, H, d_o1);
+                hc_pre_norm_kernel<<<T, 1024>>>(d_o1, d_mix, w, D, H, eps, d_x1);
+                hc_post_pre_norm_kernel<5, 4><<<T, 1024>>>(d_y, d_h, d_post, d_comb, d_mix, w, D, eps, d_o2, d_x2);
+                CK(cudaGetLastError());
+                const size_t dpo = same(d_o1, d_o2, (size_t) T * H * D), dpx = same(d_x1, d_x2, (size_t) T * D);
+                hok = hok && dp == 0 && dpo == 0 && dpx == 0;
+                std::printf("hc T=%d w %s: pre_norm differing %zu / %d; post+pre: h differing %zu / %d, x differing %zu  %s\n", T,
+                            w ? "yes" : "null", dp, T * D, dpo, T * H * D, dpx, dp + dpo + dpx == 0 ? "bitwise" : "FAIL");
+            }
+        cudaEvent_t e0, e1;
+        CK(cudaEventCreate(&e0));
+        CK(cudaEventCreate(&e1));
+        for (int T : {1, 5}) {
+            float ms[4];
+            for (int k = 0; k < 4; ++k) {
+                auto run = [&] {
+                    if (k == 0) hc_pre_norm_kernel<<<T, 1024>>>(d_h, d_mix, d_w, D, H, eps, d_x1);
+                    else if (k == 1) hc_pre_norm_n_kernel<5, 4><<<T, 1024>>>(d_h, d_mix, d_w, D, eps, d_x2);
+                    else if (k == 2) {
+                        hc_post_kernel<<<dim3(cdiv(D * H, kThreads), T), kThreads>>>(d_y, d_h, d_post, d_comb, D, H, d_o1);
+                        hc_pre_norm_kernel<<<T, 1024>>>(d_o1, d_mix, d_w, D, H, eps, d_x1);
+                    } else hc_post_pre_norm_kernel<5, 4><<<T, 1024>>>(d_y, d_h, d_post, d_comb, d_mix, d_w, D, eps, d_o2, d_x2);
+                };
+                for (int i = 0; i < 10; ++i) run();
+                CK(cudaEventRecord(e0));
+                for (int i = 0; i < 500; ++i) run();
+                CK(cudaEventRecord(e1));
+                CK(cudaEventSynchronize(e1));
+                CK(cudaEventElapsedTime(&ms[k], e0, e1));
+            }
+            std::printf("hc time T=%d: pre_norm %.2f -> %.2f us; post + pre_norm %.2f -> fused %.2f us\n", T, ms[0] * 2, ms[1] * 2,
+                        ms[2] * 2, ms[3] * 2);
+        }
+        std::printf("%s\n", hok ? "HC ALL BITWISE" : "HC FAILED");
+        return hok ? 0 : 1;
+    }
     if (rope_mode) {
         std::vector<Cfg> rc = {
             {"T=1 deep", 1, {128}, {512}, {0}},
