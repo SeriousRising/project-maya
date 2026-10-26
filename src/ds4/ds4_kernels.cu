@@ -2173,6 +2173,24 @@ __global__ void __launch_bounds__(1024) confidence_kernel(const float* __restric
     if (threadIdx.x == 0) out[t] = 1.0f / (1.0f + expf(-a));
 }
 
+// the softmax's top probability of each row of V logits (a block a row): 1 / sum exp(l - max)
+__global__ void __launch_bounds__(1024) top1_prob_kernel(const float* __restrict__ lg, int V, float* __restrict__ out) {
+    __shared__ float red[32];
+    const float* r = lg + (size_t) blockIdx.x * V;
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    float mx = -3.0e38f;
+    for (int i = threadIdx.x; i < V; i += blockDim.x) mx = fmaxf(mx, r[i]);
+    mx = warp_max(mx);
+    if (lane == 0) red[w] = mx;
+    __syncthreads();
+    mx = red[0];
+    for (int k = 1; k < (int) (blockDim.x >> 5); ++k) mx = fmaxf(mx, red[k]);
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < V; i += blockDim.x) s += __expf(r[i] - mx);
+    s = block_sum(s);
+    if (threadIdx.x == 0) out[blockIdx.x] = 1.0f / s;
+}
+
 // ---------------------------------------------------------------- engram
 __global__ void engram_dequant_kernel(const uint8_t* __restrict__ rows, const uint8_t* __restrict__ scales, int hd,
                                       float* __restrict__ out, int fmt) {
@@ -3639,6 +3657,9 @@ void markov_pick(const unsigned* slots, int nm, unsigned seq, int* tok, const ui
 void confidence(const float* x, const uint16_t* E, const int* tok, const float* w, int T, int dim, int R, float* out,
                 cudaStream_t s) {
     confidence_kernel<<<T, 1024, 0, s>>>(x, E, tok, w, dim, R, out);
+}
+void top1_prob(const float* logits, int T, int V, float* out, cudaStream_t s) {
+    top1_prob_kernel<<<T, 1024, 0, s>>>(logits, V, out);
 }
 
 void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s, int fmt) {

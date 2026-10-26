@@ -1029,6 +1029,11 @@ struct Model::Impl {
     float* h_taps = nullptr;          // pinned [kWin][targets][dim]: the last window's taps (each block device's seeding
                                       // read it: Dev::ev_seed; the next window's taps wait for every one, wait_seed)
     float* d_confv = nullptr;         // on the head device
+    // DS4_RW_DRAFT_P1=θ (0: off): no drafter pass when the trunk's last pick had a top probability under θ (p1, the
+    // bound sequence's last pick's; 1 when not known - a pipelined step's)
+    float p1_min = std::getenv("DS4_RW_DRAFT_P1") ? (float) std::atof(std::getenv("DS4_RW_DRAFT_P1")) : 0.0f;
+    float p1 = 1.0f;
+    float* d_p1 = nullptr;            // on the head device: the window's rows' top probabilities
     int* d_ints = nullptr;            // on the head device: drafts in, picks out
     float conf_threshold = std::getenv("DS4_DSPARK_CONF") ? (float) std::atof(std::getenv("DS4_DSPARK_CONF")) : 0.5f;
     // a sampled round's drafts: the distribution q each one was drawn from (its kept list, on the head device) for
@@ -2971,7 +2976,8 @@ struct Model::Impl {
                 return false;
             if (g.n_mtp > 0 && !dalloc(d, d.tap, (size_t) tap_cap * D, err)) return false;
             if (g.n_mtp > 0 && (int) di == head_dev &&
-                (!dalloc(d, d_confv, kWin, err) || !dalloc(d, d_ints, 64, err) || !dalloc(d, d_specq, kWin, err)))
+                (!dalloc(d, d_confv, kWin, err) || !dalloc(d, d_ints, 64, err) || !dalloc(d, d_specq, kWin, err) ||
+                 (p1_min > 0.0f && !dalloc(d, d_p1, kWin, err))))
                 return false;
             CK(cudaEventCreateWithFlags(&d.ev_out, cudaEventDisableTiming));
             cudaSetDevice(d.id);
@@ -6840,6 +6846,7 @@ struct Model::Impl {
         exch(eg_win, o.eg_win, n.eg_win);
         exch(h_pen, o.h_pen, n.h_pen);
         pipe_cur = s;
+        p1 = 1.0f;   // (the other sequence's pick)
     }
 
     // the bound sequence's one-token step, enqueued and left running: forward() with its waits out
@@ -10857,6 +10864,7 @@ struct Model::Impl {
         Dev& hd = devs[(size_t) head_dev];
         cudaSetDevice(hd.id);
         int m = 0;
+        float pv[kWin];   // (DS4_RW_DRAFT_P1: the rows' top probabilities)
         // (penalties: row t counts the tokens up to its own position - y and the drafts before it, toks[0 .. p0 + 1 + t))
         if (temperature <= 0.0f) {
             strata::kernels::SamplerParams sp;
@@ -10864,8 +10872,10 @@ struct Model::Impl {
             sp.temperature = 0.0f;
             int h = 0;
             const int* hr = pen_rows(p0 + 1, T, sp, h);
+            if (d_p1 != nullptr) top1_prob(hd.logits, T, V, d_p1, hd.st);
             strata::kernels::sample_tokens(hd.logits, T, V, hr, h, sp, d_ints + 16, hd.st);   // (the T rows at once)
             CK(cudaMemcpyAsync(h_idx, d_ints + 16, (size_t) T * 4, cudaMemcpyDeviceToHost, hd.st));
+            if (d_p1 != nullptr) CK(cudaMemcpyAsync(pv, d_p1, (size_t) T * 4, cudaMemcpyDeviceToHost, hd.st));
             CK(cudaStreamSynchronize(hd.st));
             while (m < n && h_idx[m] == drafts[(size_t) m]) ++m;
             next = h_idx[m];
@@ -10897,8 +10907,10 @@ struct Model::Impl {
             sp.counter = counter;
             int h = 0;
             const int* hr = pen_rows(p0 + 1, n, sp, h);
+            if (d_p1 != nullptr) top1_prob(hd.logits, T, V, d_p1, hd.st);
             strata::kernels::sample_verify(hd.logits, n, V, sp, d_specq, d_ints + 32, d_ints + 16, hd.st, hr, h);
             CK(cudaMemcpyAsync(h_idx, d_ints + 16, (size_t) n * 4, cudaMemcpyDeviceToHost, hd.st));
+            if (d_p1 != nullptr) CK(cudaMemcpyAsync(pv, d_p1, (size_t) T * 4, cudaMemcpyDeviceToHost, hd.st));
             CK(cudaStreamSynchronize(hd.st));
             while (m < n && h_idx[m] == drafts[(size_t) m]) ++m;
             next = m < n ? h_idx[m]
@@ -10906,6 +10918,7 @@ struct Model::Impl {
                                       p0 + 1 + n);
         }
         drafts_q = false;
+        if (d_p1 != nullptr) p1 = pv[m];   // (next's row)
         rollback(p0, T, m + 1);
         if (!seed_drafter(p0, m + 1, 0, err)) return false;
         accepted = m;
@@ -12811,6 +12824,7 @@ struct Model::Impl {
     }
 
     bool forward(const int* tk, int T, int logits_rows, std::string& err, int seed_rows = -1) {
+        p1 = 1.0f;   // (until sample() / verify() measure the window's pick)
         if (T < 1 || T > kWin) {
             err = "a window of " + std::to_string(T) + " tokens";
             return false;
@@ -13611,11 +13625,15 @@ struct Model::Impl {
         sp.counter = counter;
         int h = 0;
         const int* hr = pen_rows((int64_t) toks.size(), 1, sp, h);   // (the last fed token's row: every token consumed)
-        strata::kernels::sample_tokens(d.logits + (size_t) std::max(0, n_logits - 1) * g.vocab, 1, g.vocab, hr, h,
-                                       sp, d.tok, d.st);
+        const float* row = d.logits + (size_t) std::max(0, n_logits - 1) * g.vocab;
+        if (d_p1 != nullptr) top1_prob(row, 1, g.vocab, d_p1, d.st);
+        strata::kernels::sample_tokens(row, 1, g.vocab, hr, h, sp, d.tok, d.st);
         int t = -1;
+        float p = 1.0f;
         cudaMemcpyAsync(&t, d.tok, 4, cudaMemcpyDeviceToHost, d.st);
+        if (d_p1 != nullptr) cudaMemcpyAsync(&p, d_p1, 4, cudaMemcpyDeviceToHost, d.st);
         cudaStreamSynchronize(d.st);
+        p1 = p;
         return t;
     }
 
@@ -13805,6 +13823,11 @@ void Model::set_images(std::vector<Image> images) {
     p_->imgs = std::move(images);
 }
 int Model::draft_block() const { return p_->g.n_mtp > 0 ? p_->g.d_block : 0; }
+bool Model::draft_unsure() {
+    if (p_->d_p1 == nullptr || p_->p1 >= p_->p1_min) return false;
+    ++p_->st.draft_p1_skips;
+    return true;
+}
 bool Model::draft(int y, std::vector<int>& d, std::vector<float>& c, std::string& err, float t, float tp, int tk,
                   float mp, uint64_t seed, uint64_t counter, int max_n, float conf_min, float cum_min) {
     return p_->draft(y, d, c, err, t, tp, tk, mp, seed, counter, max_n, conf_min, cum_min);

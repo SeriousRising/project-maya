@@ -217,13 +217,16 @@ std::string per_position(const strata::ds4::Stats& s0, const strata::ds4::Stats&
 std::string dspark_time(const strata::ds4::Stats& s0, const strata::ds4::Stats& s1, double ms) {
     const long long np = s1.drafts_rounds - s0.drafts_rounds, nv = s1.verify_rounds - s0.verify_rounds;
     const double dm = s1.draft_ms - s0.draft_ms, vm = s1.verify_ms - s0.verify_ms;
-    char b[256];
+    char b[320];
     std::snprintf(b, sizeof b, "drafter %.2f ms a pass over %lld passes (%lld with every draft cut, %.2f head rows a "
                   "pass), verify %.2f ms a window over %lld windows; %.1f%% / %.1f%% of the decode's %.0f ms",
                   np > 0 ? dm / (double) np : 0.0, np, np - nv,
                   np > 0 ? (double) (s1.draft_head_rows - s0.draft_head_rows) / (double) np : 0.0,
                   nv > 0 ? vm / (double) nv : 0.0, nv, ms > 0 ? 100.0 * dm / ms : 0.0, ms > 0 ? 100.0 * vm / ms : 0.0, ms);
-    return b;
+    std::string r = b;
+    if (s1.draft_p1_skips > s0.draft_p1_skips)   // (DS4_RW_DRAFT_P1)
+        r += "; " + std::to_string(s1.draft_p1_skips - s0.draft_p1_skips) + " passes left out (the trunk's pick unsure)";
+    return r;
 }
 
 // The drafts' cut on the product of their confidences (DeepInfer's cumulative rule, GLM's spec_cum): a draft is
@@ -249,7 +252,7 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
     out.clear();
     offered = accepted = 0;
     drafted = false;
-    if (spec && room > 1 && m.draft_block() > 0) {
+    if (spec && room > 1 && m.draft_block() > 0 && !m.draft_unsure()) {
         drafted = true;
         std::vector<int> drafts;
         std::vector<float> conf;
