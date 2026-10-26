@@ -1067,6 +1067,9 @@ struct Model::Impl {
     // DS4_INDEX_CHECK=1: each window's indexer scores (the tensor cores' kernel) again on the CUDA cores, into the score
     // rows past the window's - the -inf the same, and the largest difference of the row's largest, every 256 calls
     bool index_check = std::getenv("DS4_INDEX_CHECK") != nullptr;
+    // DS4_RW_SPLIT_ROPE=1: decode's finish(q) and finish(o) go to sparse_attn (AttnRope), which folds them into the
+    // split kernels (bitwise the same)
+    bool rw_split_rope = std::getenv("DS4_RW_SPLIT_ROPE") != nullptr && std::atoi(std::getenv("DS4_RW_SPLIT_ROPE")) != 0;
     std::atomic<long long> ixc_calls{0}, ixc_bad{0};
     std::atomic<uint32_t> ixc_worst{0};   // (a float's bits)
     void index_check_rows(Dev& d, int il, const float* q, const float* w, const uint8_t* kp, int T, int n, const int* cand,
@@ -13085,12 +13088,14 @@ struct Model::Impl {
         finish(d.qr, T, g.q_lora, g.q_lora, fq, s);
         if (NHL > 0) {
             if (!mv(d, {job(l.wq_b, d.qr, d.q, T, g.q_lora, HQ)}, err)) return false;
-            Finish fr;
-            fr.rd = g.rd;
-            fr.pos = (int) p0;
-            fr.vpp = NHL;
-            fr.freqs = freqs;
-            finish(d.q, T * NHL, HD, HD, fr, s);
+            if (!rw_split_rope) {
+                Finish fr;
+                fr.rd = g.rd;
+                fr.pos = (int) p0;
+                fr.vpp = NHL;
+                fr.freqs = freqs;
+                finish(d.q, T * NHL, HD, HD, fr, s);
+            }
         }
         // the window rows: the ring's (positions p0 - win ..) then this window's, each query its own 128.  A DSpark
         // block's ring holds the trunk's main KV (positions <= p0 - 1, seeded); its block of drafts attends to all of
@@ -13280,16 +13285,22 @@ struct Model::Impl {
             iota_rows(d.topk, T, T, (int) topk_stride(), s);
         }
         if (NHL > 0) {
+            AttnRope rope;
+            rope.freqs = freqs;
+            rope.pos = (int) p0;
+            rope.rd = g.rd;
             sparse_attn(d.q, d.ext, ckv, d.topk, (int) topk_stride(), ar, l.sink, NHL, HD, T,
-                        1.0f / std::sqrt((float) HD), d.o, s, ckv_fmt, 0, &d.attn_scr);
-            Finish fo;
-            fo.rd = g.rd;
-            fo.pos = (int) p0;
-            fo.vpp = NHL;
-            fo.freqs = freqs;
-            fo.inverse = 1;
-            fo.quant = 1;
-            finish(d.o, T * NHL, HD, HD, fo, s);
+                        1.0f / std::sqrt((float) HD), d.o, s, ckv_fmt, 0, &d.attn_scr, rw_split_rope ? &rope : nullptr);
+            if (!rw_split_rope) {
+                Finish fo;
+                fo.rd = g.rd;
+                fo.pos = (int) p0;
+                fo.vpp = NHL;
+                fo.freqs = freqs;
+                fo.inverse = 1;
+                fo.quant = 1;
+                finish(d.o, T * NHL, HD, HD, fo, s);
+            }
             x3::MvJob j[16];
             const int per = HQ / OG;
             for (int gi = 0; gi < OG; ++gi)

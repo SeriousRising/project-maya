@@ -40,18 +40,38 @@ __device__ __forceinline__ float wmax(float v) {
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
     return v;
 }
+__device__ __forceinline__ float pow2_ceil_(float x) {   // ds4_kernels.cu's pow2_ceil (defined after this header)
+    const uint32_t b = __float_as_uint(x);
+    const int e = (int) ((b >> 23) & 0xffu) - 127 + ((b & 0x7fffffu) != 0u ? 1 : 0);
+    return __uint_as_float((uint32_t) (e + 127) << 23);
+}
+
+// DS4_RW_SPLIT_ROPE: finish(q)'s RoPE folded into attn_part's q load and finish(o)'s inverse RoPE + FP8 rounding into
+// attn_merge's store (rope dim 64 = values 448..511, query t at position pos + t).  Bitwise finish_kernel's: the same
+// angle, cosf / sinf, and its compiled pair sequence (SASS of the p5-serve build) - even a' = fma(a, c, -(b s)), odd
+// b' = fma(a, s, b c), each product rounded; the FP8 group's absmax and rounding are finish's (quant 1).
+struct SplitRope {
+    const float* freqs = nullptr;
+    int pos = 0;
+};
+__device__ __forceinline__ void rope_pair(float& a, float& b, float c, float s) {
+    const float e = __fmaf_rn(a, c, -__fmul_rn(b, s));
+    b = __fmaf_rn(a, s, __fmul_rn(b, c));
+    a = e;
+}
 
 // d = 512 only (a thread owns 2 output values, a lane 16 values of a row)
-template <int G, int R>
+template <int G, int R, bool kRope = false>
 __global__ void __launch_bounds__(256) attn_part(const float* __restrict__ q, const uint16_t* __restrict__ win,
                                                  const uint8_t* __restrict__ ckv, size_t ckv_row_bytes, const int* __restrict__ sel,
                                                  int sel_stride, AttnRows ar, int heads, float scale, float* __restrict__ part,
-                                                 float* __restrict__ ml, int nsplit) {
+                                                 float* __restrict__ ml, int nsplit, SplitRope rp = {}) {
     constexpr int D = 512;
     __shared__ __align__(16) uint16_t rows[R][D];
     __shared__ float sc[G][R];
     __shared__ float4 pr[R][(G + 3) / 4];
     __shared__ float mloc[G], lloc[G];
+    __shared__ float rcs[kRope ? 64 : 1];   // (kRope: cos, sin of the 32 rope pairs)
     const int hg = blockIdx.x, chunk = blockIdx.y, t = blockIdx.z;
     const int n_win = ar.nwin[t], n_sel = ar.nsel[t], total = n_win + n_sel;
     const int j0 = chunk * R;
@@ -93,6 +113,11 @@ __global__ void __launch_bounds__(256) attn_part(const float* __restrict__ q, co
             cwv[i] = *(const uint2*) (r + lane * 8);
             sbv[i] = r[D / 2 + lane];
         }
+    if (kRope && wp == 0) {   // (while the row loads fly)
+        const float ang = (float) (rp.pos + t) * rp.freqs[lane];
+        rcs[lane] = cosf(ang);
+        rcs[32 + lane] = sinf(ang);
+    }
 #pragma unroll
     for (int i = 0; i < RPW; ++i) {
         const int jj = wp + 8 * i;
@@ -119,6 +144,15 @@ __global__ void __launch_bounds__(256) attn_part(const float* __restrict__ q, co
         }
     }
     __syncthreads();
+    if (kRope && lane >= 28) {   // values 448..511: lane 28 + k / 8's pairs
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int i = (lane - 28) * 8 + k;
+            const float c = rcs[i], sn = rcs[32 + i];
+#pragma unroll
+            for (int g = 0; g < G; ++g) rope_pair(qv[g][2 * k], qv[g][2 * k + 1], c, sn);
+        }
+    }
     // ---- scores
     for (int jj = wp; jj < nr; jj += 8) {
         const uint4 a = *(const uint4*) &rows[jj][lane * 16], b = *(const uint4*) &rows[jj][lane * 16 + 8];
@@ -169,8 +203,9 @@ __global__ void __launch_bounds__(256) attn_part(const float* __restrict__ q, co
     }
 }
 
+template <bool kRope = false>
 __global__ void __launch_bounds__(256) attn_merge(const float* __restrict__ part, const float* __restrict__ ml, const float* __restrict__ sink,
-                                                  int heads, int nsplit, int R, AttnRows ar, float* __restrict__ out) {
+                                                  int heads, int nsplit, int R, AttnRows ar, float* __restrict__ out, SplitRope rp = {}) {
     constexpr int D = 512;
     const int h = blockIdx.x, t = blockIdx.y;
     const int total = ar.nwin[t] + ar.nsel[t];
@@ -188,7 +223,21 @@ __global__ void __launch_bounds__(256) attn_merge(const float* __restrict__ part
         a0 += w * v.x;
         a1 += w * v.y;
     }
-    *(float2*) (out + ((size_t) t * heads + h) * D + c) = make_float2(a0 / den, a1 / den);
+    float v0 = a0 / den, v1 = a1 / den;
+    if (kRope) {
+        if (c >= D - 64) {   // the inverse RoPE: finish's sin negated
+            const float ang = (float) (rp.pos + t) * rp.freqs[(c - (D - 64)) >> 1];
+            rope_pair(v0, v1, cosf(ang), -sinf(ang));
+        }
+        // FP8 E4M3 with a power-of-two scale per 32 values (16 threads)
+        float a = fmaxf(fabsf(v0), fabsf(v1));
+#pragma unroll
+        for (int o = 8; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+        const float s = pow2_ceil_(fmaxf(a, 1e-4f) * (1.0f / 448.0f));
+        v0 = e4m3_round(fminf(fmaxf(v0 / s, -448.0f), 448.0f)) * s;
+        v1 = e4m3_round(fminf(fmaxf(v1 / s, -448.0f), 448.0f)) * s;
+    }
+    *(float2*) (out + ((size_t) t * heads + h) * D + c) = make_float2(v0, v1);
 }
 
 struct AttnSplitScratch {
@@ -201,8 +250,14 @@ struct AttnSplitScratch {
 template <int G, int R>
 void sparse_attn_split(const float* q, const uint16_t* win, const uint8_t* ckv, size_t ckv_row_bytes, const int* sel, int sel_stride,
                        const AttnRows& ar, const float* sink, int heads, int T, float scale, float* out, const AttnSplitScratch& sc,
-                       int total_max, cudaStream_t s) {
+                       int total_max, cudaStream_t s, const SplitRope* rope = nullptr) {
     const int nsplit = (total_max + R - 1) / R;
+    if (rope != nullptr) {
+        attn_part<G, R, true><<<dim3(heads / G, nsplit, T), 256, 0, s>>>(q, win, ckv, ckv_row_bytes, sel, sel_stride, ar, heads, scale,
+                                                                       sc.part, sc.ml, sc.nsplit, *rope);
+        attn_merge<true><<<dim3(heads, T), 256, 0, s>>>(sc.part, sc.ml, sink, heads, sc.nsplit, R, ar, out, *rope);
+        return;
+    }
     attn_part<G, R><<<dim3(heads / G, nsplit, T), 256, 0, s>>>(q, win, ckv, ckv_row_bytes, sel, sel_stride, ar, heads, scale, sc.part, sc.ml, sc.nsplit);
     attn_merge<<<dim3(heads, T), 256, 0, s>>>(sc.part, sc.ml, sink, heads, sc.nsplit, R, ar, out);
 }

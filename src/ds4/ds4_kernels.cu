@@ -3521,13 +3521,17 @@ static void sparse_attn_stock(const float* q, const uint16_t* win, const void* c
 namespace {
 // DS4_ATTN_SPLIT_CHECK=N: the first N split calls also run the stock dispatch on the same live inputs into a
 // side buffer and print the largest difference (a synchronising debug path; never set it for timing)
-void attn_split_check(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
-                      const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
-                      int ckv_fmt, int heads_per_block, const AttnScratch* scr, int total_max) {
+int split_check_budget() {
     static const int budget = [] {
         const char* e = std::getenv("DS4_ATTN_SPLIT_CHECK");
         return e != nullptr ? std::atoi(e) : 0;
     }();
+    return budget;
+}
+void attn_split_check(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
+                      const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
+                      int ckv_fmt, int heads_per_block, const AttnScratch* scr, int total_max) {
+    const int budget = split_check_budget();
     if (budget <= 0) return;
     if (stream_capturing(s)) {   // (the check mallocs and synchronises: it cannot run inside a capture)
         static std::atomic<bool> warned{false};
@@ -3570,11 +3574,13 @@ void attn_split_check(const float* q, const uint16_t* win, const void* ckv, cons
                  "attn split check: dev=%d T=%d heads=%d rows<=%d nsel0=%d values=%zu max_abs=%.9g max_abs_over_max=%.9g max_rel=%.9g bad=%zu nonfinite=%zu\n",
                  dev, T, heads, total_max, a.nsel[0], n, max_abs, omax > 0 ? max_abs / omax : 0.0, max_rel, bad, nonfinite);
 }
-}  // namespace
 
-void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
-                 const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
-                 int ckv_fmt, int heads_per_block, const AttnScratch* scr) {
+// the split path if this call qualifies (true: launched); rope: its folded RoPE / FP8 epilogue (no split check then -
+// the check compares against stock on the same q)
+bool sparse_attn_split_try(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
+                           const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out,
+                           cudaStream_t s, int ckv_fmt, int heads_per_block, const AttnScratch* scr,
+                           const attnsplit::SplitRope* rope) {
     // a decode step / short verify window of packed rows: the split-KV kernel (Strata's CUDA lab, ds4_attn_split.cuh; 2.9x at
     // one query on an A4000).  The same inputs; the merge sums the chunks in another order, so the bits differ in the last
     // place (4e-7 against a double reference).  DS4_ATTN_SPLIT=1 turns it on (off by default).  It never pre-empts a prompt
@@ -3587,14 +3593,49 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
             const attnsplit::AttnSplitScratch sc = split_scratch(s, heads);
             if (sc.part != nullptr) {
                 attnsplit::sparse_attn_split<kSplitG, kSplitR>(q, win, (const uint8_t*) ckv, kv_row_bytes(kKvFp4, d), sel,
-                                                               sel_stride, a, sink, heads, T, scale, out, sc, total_max, s);
-                attn_split_check(q, win, ckv, sel, sel_stride, a, sink, heads, d, T, scale, out, s, ckv_fmt,
-                                 heads_per_block, scr, total_max);
-                return;
+                                                               sel_stride, a, sink, heads, T, scale, out, sc, total_max, s,
+                                                               rope);
+                if (rope == nullptr)
+                    attn_split_check(q, win, ckv, sel, sel_stride, a, sink, heads, d, T, scale, out, s, ckv_fmt,
+                                     heads_per_block, scr, total_max);
+                return true;
             }
         }
     }
-    sparse_attn_stock(q, win, ckv, sel, sel_stride, a, sink, heads, d, T, scale, out, s, ckv_fmt, heads_per_block, scr);
+    return false;
+}
+}  // namespace
+
+void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
+                 const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
+                 int ckv_fmt, int heads_per_block, const AttnScratch* scr, const AttnRope* rope) {
+    if (rope != nullptr && rope->rd == 64 && d == 512 && split_check_budget() <= 0) {
+        const attnsplit::SplitRope sr{rope->freqs, rope->pos};
+        if (sparse_attn_split_try(q, win, ckv, sel, sel_stride, a, sink, heads, d, T, scale, out, s, ckv_fmt,
+                                  heads_per_block, scr, &sr))
+            return;
+    }
+    if (rope != nullptr) {   // the caller's finish(q), here
+        Finish f;
+        f.rd = rope->rd;
+        f.pos = rope->pos;
+        f.vpp = heads;
+        f.freqs = rope->freqs;
+        finish(const_cast<float*>(q), T * heads, d, d, f, s);
+    }
+    if (!sparse_attn_split_try(q, win, ckv, sel, sel_stride, a, sink, heads, d, T, scale, out, s, ckv_fmt,
+                               heads_per_block, scr, nullptr))
+        sparse_attn_stock(q, win, ckv, sel, sel_stride, a, sink, heads, d, T, scale, out, s, ckv_fmt, heads_per_block, scr);
+    if (rope != nullptr) {   // and its finish(o)
+        Finish f;
+        f.rd = rope->rd;
+        f.pos = rope->pos;
+        f.vpp = heads;
+        f.freqs = rope->freqs;
+        f.inverse = 1;
+        f.quant = 1;
+        finish(out, T * heads, d, d, f, s);
+    }
 }
 
 void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, cudaStream_t s) {

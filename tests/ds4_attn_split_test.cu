@@ -5,6 +5,9 @@
 //   DS4_ATTN_SPLIT=1 ./ds4_attn_split_test --dump split.bin --cmp stock.bin
 // Each run asserts its own outputs against the double reference; --cmp also reports split-vs-stock.
 //   DS4_ATTN_SPLIT=0/1 ./ds4_attn_split_test --time     (times whichever path the env selects)
+//   DS4_ATTN_SPLIT=1 ./ds4_attn_split_test --rope   (DS4_RW_SPLIT_ROPE: sparse_attn with AttnRope against finish(q),
+//     sparse_attn, finish(o) on the same inputs, bit for bit, T = 1..6 at several positions; then both timed.  With
+//     DS4_ATTN_SPLIT=0 it checks the stock fallback the same way)
 // Build: cmake --build build --target ds4_attn_split_test (target next to ds4_gguf_test in CMakeLists.txt)
 #include "../src/ds4/ds4_kernels.cu"
 
@@ -60,11 +63,12 @@ int main(int argc, char** argv) {
     const float scale = 1.0f / std::sqrt((float) d);
     const char* dump = nullptr;
     const char* cmp = nullptr;
-    bool time_only = false;
+    bool time_only = false, rope_mode = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--dump") == 0 && i + 1 < argc) dump = argv[++i];
         else if (std::strcmp(argv[i], "--cmp") == 0 && i + 1 < argc) cmp = argv[++i];
         else if (std::strcmp(argv[i], "--time") == 0) time_only = true;
+        else if (std::strcmp(argv[i], "--rope") == 0) rope_mode = true;
     }
     cudaDeviceProp p{};
     CK(cudaGetDeviceProperties(&p, 0));
@@ -120,6 +124,130 @@ int main(int argc, char** argv) {
                             {128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128},
                             {512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512},
                             {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}}};
+
+    if (rope_mode) {
+        std::vector<Cfg> rc = {
+            {"T=1 deep", 1, {128}, {512}, {0}},
+            {"T=1 first token", 1, {1}, {0}, {0}},
+            {"T=2 verify", 2, {128, 128}, {512, 511}, {0, 1}},
+            {"T=3 verify", 3, {128, 128, 128}, {512, 300, 40}, {0, 1, 2}},
+            {"T=4 verify", 4, {128, 64, 3, 128}, {512, 300, 0, 40}, {0, 5, 9, 2}},
+            {"T=5 verify mixed", 5, {128, 64, 3, 128, 17}, {512, 300, 0, 40, 129}, {0, 5, 9, 2, 40}},
+            {"T=6 verify deep", 6, {128, 128, 128, 128, 128, 128}, {512, 512, 512, 512, 512, 512}, {0, 1, 2, 3, 4, 5}},
+        };
+        std::vector<float> h_fr(32);
+        for (int i = 0; i < 32; ++i) h_fr[i] = (float) std::pow(10000.0, -2.0 * i / 64.0);
+        float* d_fr;
+        CK(cudaMalloc(&d_fr, 32 * 4));
+        CK(cudaMemcpy(d_fr, h_fr.data(), 32 * 4, cudaMemcpyHostToDevice));
+        const int poss[] = {0, 127, 8189, 40000, 65530};
+        bool rok = true;
+        for (const Cfg& c : rc) {
+            const int T = c.T;
+            AttnRows ar{};
+            for (int t = 0; t < T; ++t) {
+                ar.win0[t] = c.win0[t];
+                ar.nwin[t] = c.nwin[t];
+                ar.nsel[t] = c.nsel[t];
+            }
+            const size_t nq = (size_t) T * heads * d;
+            std::vector<uint16_t> h_win((size_t) n_winrows * d);
+            for (auto& v : h_win) v = h_f2bf(nd(rng) * wmag);
+            std::vector<float> h_q(nq), h_sink(heads);
+            for (auto& v : h_q) v = nd(rng) * qmag;
+            for (auto& v : h_sink) v = nd(rng) * 2.0f;
+            std::vector<int> h_sel((size_t) T * kcap);
+            for (auto& v : h_sel) v = rowpick(rng);
+            uint16_t* d_win;
+            float *d_q0, *d_q, *d_sink, *d_o1, *d_o2;
+            int* d_sel;
+            CK(cudaMalloc(&d_win, h_win.size() * 2));
+            CK(cudaMalloc(&d_q0, nq * 4));
+            CK(cudaMalloc(&d_q, nq * 4));
+            CK(cudaMalloc(&d_sink, heads * 4));
+            CK(cudaMalloc(&d_sel, h_sel.size() * 4));
+            CK(cudaMalloc(&d_o1, nq * 4));
+            CK(cudaMalloc(&d_o2, nq * 4));
+            CK(cudaMemcpy(d_win, h_win.data(), h_win.size() * 2, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(d_q0, h_q.data(), nq * 4, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(d_sink, h_sink.data(), heads * 4, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(d_sel, h_sel.data(), h_sel.size() * 4, cudaMemcpyHostToDevice));
+            for (int pos : poss) {
+                AttnRope rope;
+                rope.freqs = d_fr;
+                rope.pos = pos;
+                rope.rd = 64;
+                Finish fq;   // the engine's unfused chain (ds4_model.cu decode layer)
+                fq.rd = 64;
+                fq.pos = pos;
+                fq.vpp = heads;
+                fq.freqs = d_fr;
+                Finish fo = fq;
+                fo.inverse = 1;
+                fo.quant = 1;
+                auto unfused = [&] {
+                    CK(cudaMemcpyAsync(d_q, d_q0, nq * 4, cudaMemcpyDeviceToDevice, 0));
+                    finish(d_q, T * heads, d, d, fq, 0);
+                    sparse_attn(d_q, d_win, d_ckv, d_sel, kcap, ar, d_sink, heads, d, T, scale, d_o1, 0, kKvFp4, 0, nullptr);
+                    finish(d_o1, T * heads, d, d, fo, 0);
+                };
+                auto fused = [&] {
+                    CK(cudaMemcpyAsync(d_q, d_q0, nq * 4, cudaMemcpyDeviceToDevice, 0));
+                    sparse_attn(d_q, d_win, d_ckv, d_sel, kcap, ar, d_sink, heads, d, T, scale, d_o2, 0, kKvFp4, 0, nullptr, &rope);
+                };
+                CK(cudaMemset(d_o1, 0xff, nq * 4));
+                CK(cudaMemset(d_o2, 0xee, nq * 4));
+                unfused();
+                fused();
+                CK(cudaGetLastError());
+                CK(cudaDeviceSynchronize());
+                std::vector<uint32_t> o1(nq), o2(nq);
+                CK(cudaMemcpy(o1.data(), d_o1, nq * 4, cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(o2.data(), d_o2, nq * 4, cudaMemcpyDeviceToHost));
+                size_t ndiff = 0, nrope = 0, shown = 0;
+                for (size_t i = 0; i < nq; ++i)
+                    if (o1[i] != o2[i]) {
+                        ++ndiff;
+                        nrope += (i % d) >= 448;
+                        if (shown++ < 4) {
+                            float a, b;
+                            std::memcpy(&a, &o1[i], 4);
+                            std::memcpy(&b, &o2[i], 4);
+                            std::printf("    diff t=%zu h=%zu i=%zu unfused %.9g fused %.9g\n", i / d / heads, i / d % heads, i % d, a, b);
+                        }
+                    }
+                rok = rok && ndiff == 0;
+                std::printf("rope %-18s pos %5d: values %zu, differing %zu (%zu in the rope dims)  %s\n", c.name, pos, nq, ndiff,
+                            nrope, ndiff == 0 ? "bitwise" : "FAIL");
+                if (pos == 8189) {   // timing (the q copy in both)
+                    cudaEvent_t e0, e1;
+                    CK(cudaEventCreate(&e0));
+                    CK(cudaEventCreate(&e1));
+                    float ms[2];
+                    for (int k = 0; k < 2; ++k) {
+                        for (int i = 0; i < 5; ++i) k ? fused() : unfused();
+                        CK(cudaEventRecord(e0));
+                        for (int i = 0; i < 200; ++i) k ? fused() : unfused();
+                        CK(cudaEventRecord(e1));
+                        CK(cudaEventSynchronize(e1));
+                        CK(cudaEventElapsedTime(&ms[k], e0, e1));
+                    }
+                    std::printf("     time: unfused %.1f us, fused %.1f us a call\n", ms[0] / 200 * 1000, ms[1] / 200 * 1000);
+                    CK(cudaEventDestroy(e0));
+                    CK(cudaEventDestroy(e1));
+                }
+            }
+            CK(cudaFree(d_win));
+            CK(cudaFree(d_q0));
+            CK(cudaFree(d_q));
+            CK(cudaFree(d_sink));
+            CK(cudaFree(d_sel));
+            CK(cudaFree(d_o1));
+            CK(cudaFree(d_o2));
+        }
+        std::printf("%s\n", rok ? "ROPE ALL BITWISE" : "ROPE FAILED");
+        return rok ? 0 : 1;
+    }
 
     std::vector<float> all_out;
     bool ok = true;

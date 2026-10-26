@@ -180,9 +180,17 @@ struct AttnRows {
     int gen = 0, t0 = 0, win = 0, R = 0, kcap = 0;
     long long p0 = 0, lo = 0;
 };
+/// rope (DS4_RW_SPLIT_ROPE): q is taken before its RoPE and out is left after finish(o)'s - as the caller's
+/// finish(q) (rd, pos + t, freqs) before and finish(o) (the same, inverse, quant 1) after would; the split path folds
+/// both into its kernels (bitwise), any other path runs those two finishes here (rotating q in place).
+struct AttnRope {
+    const float* freqs = nullptr;
+    int pos = 0, rd = 0;
+};
 void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                  const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
-                 int ckv_fmt = kKvFp4, int heads_per_block = 0, const AttnScratch* scr = nullptr);
+                 int ckv_fmt = kKvFp4, int heads_per_block = 0, const AttnScratch* scr = nullptr,
+                 const AttnRope* rope = nullptr);
 /// DS4_ATTN_SPLIT's scratch for (the current device, s, heads), allocated at load time so no decode call ever
 /// mallocs inside a stream capture.  A no-op unless the split path is on; the caller's device must be current.
 void attn_split_prewarm(cudaStream_t s, int heads);
