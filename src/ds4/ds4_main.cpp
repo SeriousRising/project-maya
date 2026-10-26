@@ -218,10 +218,11 @@ std::string dspark_time(const strata::ds4::Stats& s0, const strata::ds4::Stats& 
     const long long np = s1.drafts_rounds - s0.drafts_rounds, nv = s1.verify_rounds - s0.verify_rounds;
     const double dm = s1.draft_ms - s0.draft_ms, vm = s1.verify_ms - s0.verify_ms;
     char b[256];
-    std::snprintf(b, sizeof b, "drafter %.2f ms a pass over %lld passes (%lld with every draft cut), verify %.2f ms a "
-                  "window over %lld windows; %.1f%% / %.1f%% of the decode's %.0f ms", np > 0 ? dm / (double) np : 0.0,
-                  np, np - nv, nv > 0 ? vm / (double) nv : 0.0, nv, ms > 0 ? 100.0 * dm / ms : 0.0,
-                  ms > 0 ? 100.0 * vm / ms : 0.0, ms);
+    std::snprintf(b, sizeof b, "drafter %.2f ms a pass over %lld passes (%lld with every draft cut, %.2f head rows a "
+                  "pass), verify %.2f ms a window over %lld windows; %.1f%% / %.1f%% of the decode's %.0f ms",
+                  np > 0 ? dm / (double) np : 0.0, np, np - nv,
+                  np > 0 ? (double) (s1.draft_head_rows - s0.draft_head_rows) / (double) np : 0.0,
+                  nv > 0 ? vm / (double) nv : 0.0, nv, ms > 0 ? 100.0 * dm / ms : 0.0, ms > 0 ? 100.0 * vm / ms : 0.0, ms);
     return b;
 }
 
@@ -252,9 +253,11 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
         drafted = true;
         std::vector<int> drafts;
         std::vector<float> conf;
-        if (!m.draft(tok, drafts, conf, err, temperature, top_p, top_k, min_p, seed, counter)) return false;
-        int keep = 0;
         if (cum_min < 0) cum_min = dspark_cum_default();
+        if (!m.draft(tok, drafts, conf, err, temperature, top_p, top_k, min_p, seed, counter, room - 1, conf_min,
+                     cum_min))
+            return false;
+        int keep = 0;
         float cum = 1.0f;
         while (keep < (int) drafts.size() && keep < room - 1 && conf[(size_t) keep] >= conf_min &&
                (cum *= conf[(size_t) keep]) >= cum_min)
@@ -1979,6 +1982,7 @@ int main(int argc, char** argv) {
                      rounds, d_off, d_acc, (double) out.size() / (double) rounds, (s1.draft_ms - s0.draft_ms) / nv,
                      s1.verify_ms - s0.verify_ms, (long long) (s1.verify_rounds - s0.verify_rounds));
         std::fprintf(stderr, "dspark %s\n", per_position(s0, s1).c_str());
+        std::fprintf(stderr, "dspark %s\n", dspark_time(s0, s1, now_ms() - t1).c_str());
     }
     const double t2 = now_ms();
     const auto& s = m.stats();
