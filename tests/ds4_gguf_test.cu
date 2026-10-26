@@ -780,6 +780,19 @@ void test_mv_q(int type, cudaStream_t s) {
         char what[96];
         std::snprintf(what, sizeof(what), "mv %s, %d activations", tn(type), nc);
         expect(what, y.data(), want.data(), want.size(), 2e-5);
+        for (int sub : {1, 4})   // the first activations alone (the 1- / 4-column kernels) give the same bits as in the batch
+            if (sub < nc) {
+                j.ncol = sub;
+                float* dy1 = dev(std::vector<float>((size_t) n * sub));
+                j.y = dy1;
+                gg::mv(&j, 1, s);
+                CU(cudaStreamSynchronize(s));
+                const std::vector<float> y1 = host(dy1, (size_t) n * sub);
+                const bool same = std::memcmp(y1.data(), y.data(), (size_t) n * sub * 4) == 0;
+                if (!same) ++g_fail;
+                std::printf("  ... %d of them alone, bit for bit%*s %s\n", sub, 18, "", same ? "ok" : "FAIL");
+                cudaFree(dy1);
+            }
         cudaFree(dx), cudaFree(db), cudaFree(dy), cudaFree(dw);
     }
 }

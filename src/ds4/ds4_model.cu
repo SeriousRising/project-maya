@@ -12699,8 +12699,9 @@ struct Model::Impl {
         const size_t ld = mi == 0 ? (size_t) V : (size_t) vn;
         cudaSetDevice(d.id);
         // (an EXL3 head: as many activations at a time as its split-K partials fit the scratch - 8 for a shared head, 4
-        // for a whole one, each pass reading the whole share; a GGUF's: 4 at a time, as before)
-        const int per = d.head.fmt != 0 ? 4 : std::max(1, x3::mv_cols(d.head));
+        // for a whole one, each pass reading the whole share; a GGUF's: 8 at a time - a 5-row draft or a T <= 8 verify
+        // in one read of the head, each row's sums the same at any column count)
+        const int per = d.head.fmt != 0 ? 8 : std::max(1, x3::mv_cols(d.head));
         for (int c = 0; c < rows; c += per)
             if (!mv(d, {job(d.head, xn + (size_t) c * D, out + (size_t) c * ld, std::min(per, rows - c), D, ld)}, err))
                 return false;
