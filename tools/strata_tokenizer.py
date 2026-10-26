@@ -16,6 +16,7 @@ emoji (4-byte), combining marks, whitespace runs, and C0 control bytes.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import sys
 
@@ -286,10 +287,21 @@ class Tokenizer:
         return out
 
     def _encode_segment(self, text: str) -> list[int]:
-        """_encode_plain, remembering long segments (the text between two special tokens: a message, a tool result):
+        """_encode_plain, remembering segments (the text between two special tokens: a message, a tool result):
         BPE never merges across a special token, so a re-sent conversation's earlier messages encode to the same ids
-        and come from here (LRU, up to ~1M tokens)."""
-        if len(text) < 2048:
+        and come from here (LRU, up to ~1M tokens).  rw-13: the floor was 2048 chars, above most agent messages
+        (short user turns, tool calls, small tool results), so the small-message majority was re-tokenized on
+        every turn; 256 keeps the key/hash overhead off truly tiny spans.  DS4_RW_SEG_CACHE_MIN overrides it
+        (2048 restores the old behaviour).  The 1M-token LRU below bounds the ids; at this floor the entry
+        count stays in the low tens of thousands."""
+        floor = self.__dict__.get("_seg_min")
+        if floor is None:
+            try:
+                floor = max(1, int(os.environ.get("DS4_RW_SEG_CACHE_MIN", "256") or 256))
+            except ValueError:
+                floor = 256
+            self.__dict__["_seg_min"] = floor
+        if len(text) < floor:
             return self._encode_plain(text)
         cache = self.__dict__.get("_seg_cache")
         if cache is None:
