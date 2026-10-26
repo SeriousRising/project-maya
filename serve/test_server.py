@@ -468,6 +468,62 @@ class NoDelayStreaming(unittest.TestCase):
             conn.close(), client.close(), listener.close()
 
 
+class BurstEngine(MockEngine):
+    """A MockEngine whose tokens are all 'already queued' (DSpark's bursts): burst_pending reports how
+    many script tokens have not been yielded yet, so Service.run may coalesce without ever waiting."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self._left = 0
+
+    def burst_pending(self):
+        return self._left
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self._left = len(self.script[:max_new])
+        for t in super().generate(ids, max_new, sampling, cancel, embeddings):
+            self._left -= 1
+            yield t
+
+
+class SseBursts(unittest.TestCase):
+    """rw-13: tokens that arrive in an engine burst go out as one SSE chunk per burst instead of one
+    json.dumps + flush per token.  The concatenated deltas (and every non-text chunk) are unchanged."""
+
+    SCRIPT = "some reasoning words</think>\n\nHello brave new world, this is the answer."
+
+    def chunks(self, engine_cls, env=None):
+        import os
+        from unittest import mock
+
+        from serve.server import openai_chunks
+        tok = ByteTokenizer()
+        svc = Service(engine_cls(tok, self.SCRIPT, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        with mock.patch.dict(os.environ, env or {}):
+            return [c for c in openai_chunks(svc, {"model": "m", "stream": True}, [1, 2, 3], True, None,
+                                             500, threading.Event()) if c is not None]
+
+    @staticmethod
+    def texts(chunks, key):
+        return "".join(c["choices"][0]["delta"].get(key, "") for c in chunks)
+
+    def test_burst_coalesces_without_changing_bytes(self):
+        plain = self.chunks(MockEngine)
+        burst = self.chunks(BurstEngine)
+        for key in ("reasoning_content", "content"):
+            self.assertEqual(self.texts(burst, key), self.texts(plain, key), key)
+        self.assertLess(len(burst), len(plain) // 4)          # ~per token -> ~per burst
+        self.assertEqual(burst[-1]["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(burst[0]["choices"][0]["delta"].get("role"), "assistant")
+
+    def test_env_switch_restores_per_token_chunks(self):
+        off = self.chunks(BurstEngine, env={"DS4_RW_SSE_BURST": "0"})
+        plain = self.chunks(MockEngine)
+        self.assertEqual(len(off), len(plain))
+        self.assertEqual(self.texts(off, "content"), self.texts(plain, "content"))
+
+
 class ClientShapes(unittest.TestCase):
     """What real clients send: Claude Code posts /v1/messages?beta=true (issue #55) and puts hook context into the
     conversation as a mid-conversation system message (issue #56); some OpenAI clients send a late developer message."""

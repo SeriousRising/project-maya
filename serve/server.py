@@ -290,6 +290,12 @@ class FairLock:
         self.release()
 
 
+def sse_burst_enabled() -> bool:
+    """DS4_RW_SSE_BURST=0: one SSE chunk per token again.  On (the default), tokens the engine has
+    already queued for this request go out as one merged delta per burst (see Service.run)."""
+    return os.environ.get("DS4_RW_SSE_BURST", "1") != "0"
+
+
 def fair_slice_seconds() -> float:
     """STRATA_FAIR_SLICE_S: a request that has been answering this long while others wait gives the engine to the next
     one and queues again behind them (0, the default: it keeps the engine to the end, as before)."""
@@ -771,6 +777,12 @@ class StrataEngine:
         else:
             self._last = v
 
+    def burst_pending(self) -> int:
+        """rw-13: engine lines already routed to this thread's request and not yet consumed (multi mode).
+        Service.run merges a burst's text into one SSE delta while this is nonzero - the next token is
+        already here, so merging never waits.  Single mode reads the pipe directly: always 0."""
+        return getattr(self._tls, "pending", 0) if self.multi else 0
+
     def _parse_done(self, line):
         f = line.split()
         self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
@@ -1103,6 +1115,7 @@ class StrataEngine:
                 if line is None:
                     done = True
                     raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                self._tls.pending = q.qsize()   # rw-13: lines of this burst still queued (burst_pending)
                 heard = time.monotonic()
                 stall.clear()
                 f = line.split()
@@ -1154,6 +1167,7 @@ class StrataEngine:
                 if self._routes.get(rid) is q:                # (a restarted engine's table may hold another one)
                     del self._routes[rid]
             self._tls.rid = None
+            self._tls.pending = 0
 
     def pause(self, keep: bool = False):
         """End the request in flight at its next step and keep the conversation's state with what it wrote (the
@@ -2681,9 +2695,24 @@ class Service:
                 gen = attempts()
                 for ev in pre_events:                   # a required call's opening (prepare put it in the prompt)
                     yield "event", ev
+                # rw-13 (DS4_RW_SSE_BURST): text events are held while the engine already has more of this
+                # burst queued for us, and consecutive ones of a kind merge into one event - one SSE chunk
+                # (one json.dumps, one flush) per burst instead of per token.  Holding never waits: a
+                # nonzero burst_pending means the next token is already here.  Anything else (a tool
+                # event, a ping, a stop, the end, an error) sends what is held first, in order.
+                burst = sse_burst_enabled()
+                pending_fn = getattr(self.engine, "burst_pending", None) if burst else None
+                held_evs: list = []
+
+                def take_held():
+                    out, held_evs[:] = held_evs[:], []
+                    return out
+
                 try:
                     for t in gen:
                         if t is None:                   # heartbeat while the engine is quiet
+                            for ev in take_held():
+                                yield "event", ev
                             last_print = self._progress(last_print)
                             pr = getattr(self.engine, "progress", None)   # (read, total, reuse, ms), the PP parse
                             yield "ping", ({"total": pr[1], "cache": pr[2], "processed": pr[0],
@@ -2700,6 +2729,8 @@ class Service:
                         if t in self.stop_ids:
                             finish = "stop"
                             raw_ids.append(t)
+                            for ev in take_held():
+                                yield "event", ev
                             break
                         if parser.state == "reasoning":
                             reasoning_tokens += 1
@@ -2721,13 +2752,27 @@ class Service:
                         self._note(n, evs)
                         last_print = self._progress(last_print)
                         for ev in evs:
-                            yield "event", ev
+                            if pending_fn is not None and ev.text and ev.kind in ("reasoning", "content", "tool_args"):
+                                last = held_evs[-1] if held_evs else None
+                                if last is not None and last.kind == ev.kind and last.call is ev.call:
+                                    held_evs[-1] = Event(ev.kind, last.text + ev.text, call=ev.call)
+                                else:
+                                    held_evs.append(ev)
+                            else:
+                                for held_ev in take_held():
+                                    yield "event", held_ev
+                                yield "event", ev
                             if single_tool and ev.kind == "tool_call" and ev.complete:
                                 stopped = True
                                 break
+                        if stopped or pending_fn is None or not pending_fn():
+                            for ev in take_held():
+                                yield "event", ev
                         if stopped:
                             finish = "stop"
                             break
+                    for ev in take_held():
+                        yield "event", ev
                     if held:                    # the run ended on what only looked like a marker's start
                         for ev in parser.feed(held):
                             yield "event", ev
@@ -2736,6 +2781,8 @@ class Service:
                         finish = "cancel"
                 except EngineDied as e:
                     finish = "error"
+                    for ev in take_held():      # what the burst had already produced still goes out
+                        yield "event", ev
                     note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
                     print(f"[maya] {e}. {note} The next request starts the engine again."
                           f"{' Its log: ' + self.engine.log_path if getattr(self.engine, 'log_path', None) else ''}",
@@ -2748,12 +2795,16 @@ class Service:
                         finish = "length"
                         print(f"[maya] the engine's numbers went non-finite after {n} tokens ({e}): the answer ends "
                               "there", flush=True)
+                        for ev in take_held():
+                            yield "event", ev
                         if held:
                             for ev in parser.feed(held):
                                 yield "event", ev
                             held = ""
                     else:
                         finish = "error"
+                        for ev in take_held():
+                            yield "event", ev
                         print(f"[maya] the engine reported an error: {e}", flush=True)
                         raise
                 finally:
