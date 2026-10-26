@@ -240,13 +240,16 @@ float dspark_cum_default() {
 
 // One round of decoding after `tok` (the token at pos(), not fed yet): with the drafter, its drafts while their
 // confidence holds (at most `room` - 1 of them), verified together; else a plain step.  `out` gets the tokens that follow
-// tok (the accepted drafts, then the trunk's next), the last of them the next round's tok.
+// tok (the accepted drafts, then the trunk's next), the last of them the next round's tok.  `drafted`: the drafter ran
+// (a round with room for one token does without it).
 bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, float temperature, float top_p, int top_k,
            float min_p, unsigned long long seed, unsigned long long& counter, std::vector<int>& out, int& offered,
-           int& accepted, std::string& err, float cum_min = -1.0f) {
+           int& accepted, bool& drafted, std::string& err, float cum_min = -1.0f) {
     out.clear();
     offered = accepted = 0;
+    drafted = false;
     if (spec && room > 1 && m.draft_block() > 0) {
+        drafted = true;
         std::vector<int> drafts;
         std::vector<float> conf;
         if (!m.draft(tok, drafts, conf, err, temperature, top_p, top_k, min_p, seed, counter)) return false;
@@ -1070,19 +1073,20 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 if (close_think) room = 1;
                 else if (in_think) room = (int) std::min<long long>(room, r.think_budget - produced);
                 int off = 0, acc = 0;
+                bool drafted = false;
                 // a round whose drafts were all below the confidence floor: the next one does without the drafter
                 // (a request's spec / dspark_conf keys over the engine's: the speed calibration measures both ways)
                 const bool try_spec = (r.spec < 0 ? spec : r.spec != 0) && !cool;
                 if (!round(m, tok, room, try_spec, r.conf >= 0 ? r.conf : conf_min, r.temperature, r.top_p, r.top_k,
                            r.min_p, r.seed, counter, got,
-                           off, acc, err, r.cum)) {
+                           off, acc, drafted, err, r.cum)) {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
                     finish = "cancel";
                     break;
                 }
                 d_off += off;
                 d_acc += acc;
-                cool = try_spec && off == 0;
+                cool = drafted && off == 0;
                 if (close_think && !got.empty()) got.back() = r.think_end;   // (room 1: one token, not fed yet)
                 std::reverse(got.begin(), got.end());
                 dump_rows();
@@ -1202,7 +1206,7 @@ int serve_pipe(strata::ds4::Model& m, const std::string& eos_list, bool spec, fl
         // acceptance of the first lone rounds after this request leaves the pipeline, and if it is clearly
         // below solo levels (~0.8 kept in the serving logs), stop drafting until plain steps - which seed -
         // have refilled a whole window of ring rows
-        long long post_rounds = 0, post_off = 0, post_acc = 0, draft_skip_until = -1;
+        long long post_rounds = 0, post_off = 0, post_acc = 0, post_pass = 0, draft_skip_until = -1;
         bool post_done = false;
         double t_issue = 0, t_take = 0, t_flight = 0, t_issued = 0;   // DS4_PIPE_TIME: host enqueue, the take's
         long long n_pipe = 0;                                          // wait, enqueue-end to taken; the steps
@@ -1460,26 +1464,30 @@ int serve_pipe(strata::ds4::Model& m, const std::string& eos_list, bool spec, fl
         if (close_think) room = 1;
         else if (g.in_think) room = (int) std::min<long long>(room, g.r.think_budget - g.produced);
         int off = 0, acc = 0;
+        bool drafted = false;
         bool try_spec = (g.r.spec < 0 ? spec : g.r.spec != 0) && !g.cool;
         if (g.produced < g.draft_skip_until) try_spec = false;   // (S4: plain steps reseed the drafter's rings)
         std::string err;
         if (!round(m, g.tok, room, try_spec, g.r.conf >= 0 ? g.r.conf : conf_min, g.r.temperature, g.r.top_p,
-                   g.r.top_k, g.r.min_p, g.r.seed, counter, g.got, off, acc, err, g.r.cum))
+                   g.r.top_k, g.r.min_p, g.r.seed, counter, g.got, off, acc, drafted, err, g.r.cum))
             fatal(err);   // (S2)
         g.d_off += off;
         g.d_acc += acc;
-        g.cool = try_spec && off == 0;
+        g.cool = drafted && off == 0;
         if (g.piped && !g.post_done && g.produced >= g.draft_skip_until) {   // (S4 measurement)
             ++g.post_rounds;
             g.post_off += off;
             g.post_acc += acc;
+            g.post_pass += drafted;
             if (g.post_rounds >= 10) {
                 g.post_done = true;
                 const double a = g.post_off > 0 ? (double) g.post_acc / (double) g.post_off : 0.0;
                 std::fprintf(stderr, "maya ds4 serve (pipe): request %lld post-pipeline drafts: %lld of %lld "
-                                     "kept over its first %lld lone rounds (%.3f)\n",
-                             g.r.rid, g.post_acc, g.post_off, g.post_rounds, a);
-                if (g.post_off >= 10 && a < 0.4) {
+                                     "kept over its first %lld lone rounds, %lld drafter passes (%.3f)\n",
+                             g.r.rid, g.post_acc, g.post_off, g.post_rounds, g.post_pass, a);
+                // (or under one draft offered every two drafter passes - solo offers ~1.5 a pass: stale rings whose
+                //  drafts all fall below the floor, '0 of 0 kept', which the acceptance alone never caught)
+                if ((g.post_off >= 10 && a < 0.4) || g.post_off * 2 < g.post_pass) {
                     g.draft_skip_until = g.produced + m.window();
                     std::fprintf(stderr, "maya ds4 serve (pipe): request %lld: acceptance clearly below "
                                          "solo - no drafting for the next %d tokens while plain steps "
@@ -1509,7 +1517,7 @@ int serve_pipe(strata::ds4::Model& m, const std::string& eos_list, bool spec, fl
         g.pos = m.pos();
         g.inflight = true;
         g.piped = true;
-        if (!g.post_done) g.post_rounds = g.post_off = g.post_acc = 0;   // (S4: count only rounds after the last pipelined stretch)
+        if (!g.post_done) g.post_rounds = g.post_off = g.post_acc = g.post_pass = 0;   // (S4: count only rounds after the last pipelined stretch)
         flight.push_back(&g);
         return true;
     };
@@ -1943,16 +1951,17 @@ int main(int argc, char** argv) {
             if (tok == 1 || (int) out.size() >= n) break;
             if (got.empty()) {
                 int off = 0, acc = 0;
+                bool drafted = false;
                 const bool try_spec = spec && !cool;
                 if (!round(m, tok, n - (int) out.size(), try_spec, o.dspark_conf, temp, 1.0f, temp > 0 ? 64 : 1, 0.0f,
-                           cli_seed, counter, got, off, acc, err)) {
+                           cli_seed, counter, got, off, acc, drafted, err)) {
                     std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
                     return 1;
                 }
                 d_off += off;
                 d_acc += acc;
                 ++rounds;
-                cool = try_spec && off == 0;
+                cool = drafted && off == 0;
                 std::reverse(got.begin(), got.end());
             }
             tok = got.back();
