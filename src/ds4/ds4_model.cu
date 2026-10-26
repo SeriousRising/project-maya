@@ -4073,7 +4073,7 @@ struct Model::Impl {
             ++c.it_ram;
             return;
         }
-        if (in_ram && copy_mode && NH == 1 && rw_flow_direct && zc_ok(l, e)) {   // (rw-03: DMA'd from where its
+        if (in_ram && copy_mode && NH == 1 && rw_flow_direct && !o.expert_cache && zc_ok(l, e)) {   // (review S2: a cache swap may rewrite a copy mid-DMA)   // (rw-03: DMA'd from where its
             // pinned copy lies, as the RAM tier's branch above: the member's gate / up rows at their offset in the
             // copy, its down whole; host addresses - zc_mat's delta is for device-side pulls, a DMA's source is
             // the pinned pages themselves)
@@ -5692,7 +5692,7 @@ struct Model::Impl {
         //  alone streams nothing at decode)
         if (lane_env_off() && !rw_flow_direct) return false;
         // (off the one-GPU path: only when asked - DS4_STREAM_ZC=1, or MAYA_DS4_PIN_BY_NEED's own opt-in)
-        if (!ln_one && v == nullptr && !pin_by_need && !rw_flow_direct) return false;
+        if (!ln_one && v == nullptr && !pin_by_need && !(rw_flow_direct && lane_env_off())) return false;   // (review S1: with the lane on, the switch does not turn on in-place pulls)
         for (const LaneDev& D : ln_dev)   // (an integrated GPU's kernels may read the staging in place: theirs)
             if (D.integrated) return false;
         return zc_host_ptr() || (pin_by_need && devs.size() == 1);
