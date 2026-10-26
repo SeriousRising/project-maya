@@ -427,18 +427,38 @@ class StableToolOrder(unittest.TestCase):
         self.assertEqual(self.names(oa(one, two)), ["nsx::probe", "plain"])
         self.assertEqual(self.names(oa(two, one)), ["nsx::probe", "plain"])
 
+    def deepseek_prompt(self, req):
+        """The prompt the DeepSeek converter + encoder make of `req` (what the engine is sent)."""
+        from serve.frontend import openai_to_messages
+        msgs, tools, kwargs = openai_to_messages(req, deepseek=True)
+        return ChatTemplate(ROOT / "tools/ds4/chat_template.jinja").render(msgs, tools=tools, **kwargs)
+
+    PAD_REQ = {"tools": [{"type": "function", "function": {"name": "pad_render_probe", "parameters": {}}}]}
+
     def test_deepseek_whitespace_reasoning_pad_is_not_rendered(self):
         # rw-13: Hermes pads a history turn that has no reasoning text with reasoning_content=" " (its
         # must-echo tier for DeepSeek-named models).  Rendered literally, that space sits where the engine
-        # holds an empty think block and breaks the shared prefix at that boundary every turn.
-        from serve.frontend import openai_to_messages
-        msgs, _, _ = openai_to_messages({"messages": [
+        # holds an empty think block and breaks the shared prefix at that boundary every turn.  The claim
+        # is about the rendered prompt, so the assertions read it, not the converted messages.
+        prompt = self.deepseek_prompt({"messages": [
             {"role": "user", "content": "q"},
-            {"role": "assistant", "content": "a", "reasoning_content": " "},
-            {"role": "assistant", "content": "b", "reasoning_content": "real thinking"},
-            {"role": "user", "content": "q2"}]}, deepseek=True)
-        self.assertFalse(msgs[1].get("reasoning_content"))
-        self.assertEqual(msgs[2]["reasoning_content"], "real thinking")
+            {"role": "assistant", "content": "aONE", "reasoning_content": " "},
+            {"role": "user", "content": "q2"},
+            {"role": "assistant", "content": "aTWO", "reasoning_content": "real thinking"},
+            {"role": "user", "content": "q3"}], **self.PAD_REQ})
+        self.assertIn("<think></think>aONE", prompt)
+        self.assertNotIn("<think> </think>", prompt)
+        self.assertIn("<think>real thinking</think>aTWO", prompt)
+
+    def test_deepseek_model_whitespace_reasoning_is_rendered_as_sent(self):
+        # rw-13 review S2: only Hermes's exact " " is a pad.  The model itself can write
+        # <think>\n\n</think>; a client echoing that reasoning_content back verbatim must re-render
+        # the identical prompt, or prefix reuse breaks at that turn on every later request.
+        prompt = self.deepseek_prompt({"messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "aONE", "reasoning_content": "\n\n"},
+            {"role": "user", "content": "q2"}], **self.PAD_REQ})
+        self.assertIn("<think>\n\n</think>aONE", prompt)
 
 
 class NoDelayStreaming(unittest.TestCase):

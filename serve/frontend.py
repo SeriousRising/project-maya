@@ -461,10 +461,12 @@ def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], l
             if message.get("role") == "developer":
                 message["role"] = "system"
             rc = message.get("reasoning_content")
-            if isinstance(rc, str) and not rc.strip():
-                # rw-13: a whitespace-only value is a client's must-echo pad (Hermes sends " " for a history
-                # turn with no reasoning text), not reasoning the model produced.  Rendered literally it puts
-                # a space where the engine holds an empty think block, breaking prompt-prefix reuse there.
+            if rc == " ":
+                # rw-13: exactly Hermes's " " pad (its must-echo tier sends it for a history turn with no
+                # reasoning text), not reasoning the model produced - the model can write whitespace of
+                # its own (a "<think>\n\n</think>" turn), and that must re-render as sent.  The pad,
+                # rendered literally, puts a space where the engine holds an empty think block, breaking
+                # prompt-prefix reuse there.
                 message.pop("reasoning_content", None)
             if _has_media(message.get("content")):
                 message["content"] = _parts_of(message["content"])
