@@ -221,6 +221,14 @@ int main(int argc, char** argv) {
              {512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512},
              {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}},
         };
+        static const char* rnames[] = {"T=7", "T=8", "T=9", "T=11", "T=12", "T=13", "T=14", "T=15"};
+        int ri = 0;
+        for (int T : {7, 8, 9, 11, 12, 13, 14, 15}) {   // (every T to kWin: the T=16 rows, cut)
+            Cfg c = rc[8];
+            c.name = rnames[ri++];
+            c.T = T;
+            rc.push_back(c);
+        }
         std::vector<float> h_fr(32);
         for (int i = 0; i < 32; ++i) h_fr[i] = (float) std::pow(10000.0, -2.0 * i / 64.0);
         float* d_fr;

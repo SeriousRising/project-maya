@@ -2888,6 +2888,8 @@ __global__ void publish_kernel(Req* req, int T, unsigned seq, int na0, int na1, 
     if (resp == nullptr || cpu_any == nullptr) return;
     const int any = *(volatile int*) cpu_any;
     *cpu_any = 0;
+    // (the ring proof needs one device's seqs to stay well inside kRing / 2 of the host's watermark: seqs are global
+    //  over every layer and the drafter, so the per-device gap is ~21 at a 20/20 split - recheck for uneven splits)
     if (any || (int) (seq - *(volatile const unsigned*) host_done) >= kRing / 2) return;
     for (int t = 0; t < T; ++t) resp->cpu[t] = 0;
     __threadfence_system();

@@ -11344,7 +11344,7 @@ struct Model::Impl {
                         Req* rq = (Req*) (set[0] + at[kReq]);
                         route_ahead(F(0, kLogA), rba, an, c.m, T, rq, 0, s);
                         route_publish(F(0, kLog), rb0, n, l.k_exp, T, g.route_scale, vt, x, D, (int*) F(0, kIdx),
-                                      F(0, kW), (unsigned long long*) F(0, kPlan), rq, seq, s, bv, vl, c.m, 0);
+                                      F(0, kW), (unsigned long long*) F(0, kPlan), rq, seq, s, bv, vl, c.m, 0, l.il);
                         return true;
                     },
                     [&] {
@@ -11370,6 +11370,7 @@ struct Model::Impl {
                         a.a_n = an;
                         a.m = c.m;
                         a.T = T;
+                        a.layer = l.il;   // (the request's layer: compared with the old path's like every byte)
                         return route_pair(a, s);
                     },
                     c.logits == 0 ? (size_t) n : 1024, c.logits == 0 ? (size_t) an : 1024, l.k_exp);
