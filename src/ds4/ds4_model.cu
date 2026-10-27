@@ -1075,6 +1075,11 @@ struct Model::Impl {
     // DS4_INDEX_CHECK=1: each window's indexer scores (the tensor cores' kernel) again on the CUDA cores, into the score
     // rows past the window's - the -inf the same, and the largest difference of the row's largest, every 256 calls
     bool index_check = std::getenv("DS4_INDEX_CHECK") != nullptr;
+    // DS4_RW_SPLIT_ROPE=1: decode's finish(q) and finish(o) go to sparse_attn (AttnRope), which folds them into the
+    // split kernels (bitwise the same)
+    bool rw_split_rope = std::getenv("DS4_RW_SPLIT_ROPE") != nullptr && std::atoi(std::getenv("DS4_RW_SPLIT_ROPE")) != 0;
+    // DS4_RW_HC_FUSE=1: decode's attention hc_post and the FFN's hc_pre_norm in one kernel (hc_post_pre_norm, bitwise)
+    bool rw_hc_fuse = std::getenv("DS4_RW_HC_FUSE") != nullptr && std::atoi(std::getenv("DS4_RW_HC_FUSE")) != 0;
     std::atomic<long long> ixc_calls{0}, ixc_bad{0};
     std::atomic<uint32_t> ixc_worst{0};   // (a float's bits)
     void index_check_rows(Dev& d, int il, const float* q, const float* w, const uint8_t* kp, int T, int n, const int* cand,
@@ -13147,12 +13152,14 @@ struct Model::Impl {
         finish(d.qr, T, g.q_lora, g.q_lora, fq, s);
         if (NHL > 0) {
             if (!mv(d, {job(l.wq_b, d.qr, d.q, T, g.q_lora, HQ)}, err)) return false;
-            Finish fr;
-            fr.rd = g.rd;
-            fr.pos = (int) p0;
-            fr.vpp = NHL;
-            fr.freqs = freqs;
-            finish(d.q, T * NHL, HD, HD, fr, s);
+            if (!rw_split_rope) {
+                Finish fr;
+                fr.rd = g.rd;
+                fr.pos = (int) p0;
+                fr.vpp = NHL;
+                fr.freqs = freqs;
+                finish(d.q, T * NHL, HD, HD, fr, s);
+            }
         }
         // the window rows: the ring's (positions p0 - win ..) then this window's, each query its own 128.  A DSpark
         // block's ring holds the trunk's main KV (positions <= p0 - 1, seeded); its block of drafts attends to all of
@@ -13342,16 +13349,22 @@ struct Model::Impl {
             iota_rows(d.topk, T, T, (int) topk_stride(), s);
         }
         if (NHL > 0) {
+            AttnRope rope;
+            rope.freqs = freqs;
+            rope.pos = (int) p0;
+            rope.rd = g.rd;
             sparse_attn(d.q, d.ext, ckv, d.topk, (int) topk_stride(), ar, l.sink, NHL, HD, T,
-                        1.0f / std::sqrt((float) HD), d.o, s, ckv_fmt, 0, &d.attn_scr);
-            Finish fo;
-            fo.rd = g.rd;
-            fo.pos = (int) p0;
-            fo.vpp = NHL;
-            fo.freqs = freqs;
-            fo.inverse = 1;
-            fo.quant = 1;
-            finish(d.o, T * NHL, HD, HD, fo, s);
+                        1.0f / std::sqrt((float) HD), d.o, s, ckv_fmt, 0, &d.attn_scr, rw_split_rope ? &rope : nullptr);
+            if (!rw_split_rope) {
+                Finish fo;
+                fo.rd = g.rd;
+                fo.pos = (int) p0;
+                fo.vpp = NHL;
+                fo.freqs = freqs;
+                fo.inverse = 1;
+                fo.quant = 1;
+                finish(d.o, T * NHL, HD, HD, fo, s);
+            }
             x3::MvJob j[16];
             const int per = HQ / OG;
             for (int gi = 0; gi < OG; ++gi)
@@ -13361,7 +13374,8 @@ struct Model::Impl {
         } else CK(cudaMemsetAsync(d.ao, 0, (size_t) T * D * sizeof(*d.ao), s));   // (no heads: nothing to add)
         if (nm > 1) allreduce(d.ao, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
         if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
-        hc_post(d.ao, d.h, d.a_post, d.a_comb, D, H, T, d.h2, s);
+        if (rw_hc_fuse) hc_post_pre_norm(d.ao, d.h, d.a_post, d.a_comb, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.h2, d.x, s);
+        else hc_post(d.ao, d.h, d.a_post, d.a_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, 1000 + l.il, p0, T);   // (DS4_DUMP_L: after the attention)
         prof_mark(d, 1);
@@ -13374,7 +13388,7 @@ struct Model::Impl {
         hc_mix(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, hcs);
         hc_split(d.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, d.f_pre, d.f_post, d.f_comb, hcs);
         if (hs) CK(cudaEventRecord(d.hc_done, d.st2));
-        hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
+        if (!rw_hc_fuse) hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
         if (wp.async) {
             // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
             // make the same plan) while the device runs the shared expert and the VRAM experts (from the plan the

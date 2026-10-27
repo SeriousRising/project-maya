@@ -75,6 +75,10 @@ void hc_pre_norm(const float* h, const float* mix, const float* w, int dim, int 
 /// out[t][k][e] = post[t][k] y[t][e] + sum_j comb[t][j][k] res[t][j][e]  (out must not alias res).
 void hc_post(const float* y, const float* res, const float* post, const float* comb, int dim, int hc, int T,
              float* out, cudaStream_t s);
+/// hc_post, then hc_pre_norm(out, mix, w, ..., x): one kernel at this model's shape (dim 5120, hc 4), the same bits
+/// (DS4_RW_HC_FUSE).  DS4_RW_HC_PRE=1: hc_pre_norm's kernel at that shape issues all its loads at once (the same bits).
+void hc_post_pre_norm(const float* y, const float* res, const float* post, const float* comb, const float* mix,
+                      const float* w, int dim, int hc, int T, float eps, float* out, float* x, cudaStream_t s);
 /// hc_post with out = res (h), the same arithmetic: a chunk keeps one copy of its streams.
 void hc_post_inplace(const float* y, float* h, const float* post, const float* comb, int dim, int hc, int T,
                      cudaStream_t s);
@@ -180,9 +184,17 @@ struct AttnRows {
     int gen = 0, t0 = 0, win = 0, R = 0, kcap = 0;
     long long p0 = 0, lo = 0;
 };
+/// rope (DS4_RW_SPLIT_ROPE): q is taken before its RoPE and out is left after finish(o)'s - as the caller's
+/// finish(q) (rd, pos + t, freqs) before and finish(o) (the same, inverse, quant 1) after would; the split path folds
+/// both into its kernels (bitwise), any other path runs those two finishes here (rotating q in place).
+struct AttnRope {
+    const float* freqs = nullptr;
+    int pos = 0, rd = 0;
+};
 void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                  const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
-                 int ckv_fmt = kKvFp4, int heads_per_block = 0, const AttnScratch* scr = nullptr);
+                 int ckv_fmt = kKvFp4, int heads_per_block = 0, const AttnScratch* scr = nullptr,
+                 const AttnRope* rope = nullptr);
 /// DS4_ATTN_SPLIT's scratch for (the current device, s, heads), allocated at load time so no decode call ever
 /// mallocs inside a stream capture.  A no-op unless the split path is on; the caller's device must be current.
 void attn_split_prewarm(cudaStream_t s, int heads);
