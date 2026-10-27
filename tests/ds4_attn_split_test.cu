@@ -6,10 +6,10 @@
 // Each run asserts its own outputs against the double reference; --cmp also reports split-vs-stock.
 //   DS4_ATTN_SPLIT=0/1 ./ds4_attn_split_test --time     (times whichever path the env selects)
 //   DS4_ATTN_SPLIT=1 ./ds4_attn_split_test --rope   (DS4_RW_SPLIT_ROPE: sparse_attn with AttnRope against finish(q),
-//     sparse_attn, finish(o) on the same inputs, bit for bit, T = 1..6 at several positions; then both timed.  With
+//     sparse_attn, finish(o) on the same inputs, bit for bit, T = 1..6, 10, 16 at several positions; then both timed.  With
 //     DS4_ATTN_SPLIT=0 it checks the stock fallback the same way)
 //   ./ds4_attn_split_test --hc   (DS4_RW_HC_PRE / DS4_RW_HC_FUSE: hc_pre_norm_n_kernel against hc_pre_norm_kernel and
-//     hc_post_pre_norm_kernel against hc_post_kernel + hc_pre_norm_kernel, bit for bit at dim 5120, hc 4, T = 1..6; timed)
+//     hc_post_pre_norm_kernel against hc_post_kernel + hc_pre_norm_kernel, bit for bit at dim 5120, hc 4, T = 1..16; timed)
 // Build: cmake --build build --target ds4_attn_split_test (target next to ds4_gguf_test in CMakeLists.txt)
 #include "../src/ds4/ds4_kernels.cu"
 
@@ -129,7 +129,7 @@ int main(int argc, char** argv) {
                             {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}}};
 
     if (hc_mode) {
-        const int D = 5120, H = 4, TM = 6;
+        const int D = 5120, H = 4, TM = 16;   // (T up to kWin: v1.1.31's prompt-lookup windows)
         const float eps = 1e-6f;
         std::uniform_real_distribution<float> u01(0.0f, 1.0f);
         std::vector<float> h_h((size_t) TM * H * D), h_y((size_t) TM * D), h_w(D), h_mix(TM * 8), h_post(TM * 8), h_comb(TM * 64);
@@ -214,6 +214,12 @@ int main(int argc, char** argv) {
             {"T=4 verify", 4, {128, 64, 3, 128}, {512, 300, 0, 40}, {0, 5, 9, 2}},
             {"T=5 verify mixed", 5, {128, 64, 3, 128, 17}, {512, 300, 0, 40, 129}, {0, 5, 9, 2, 40}},
             {"T=6 verify deep", 6, {128, 128, 128, 128, 128, 128}, {512, 512, 512, 512, 512, 512}, {0, 1, 2, 3, 4, 5}},
+            // (v1.1.31 prompt lookup: verify windows up to kWin)
+            {"T=10 lookup mixed", 10, {128, 64, 3, 128, 17, 128, 128, 1, 90, 128}, {512, 300, 0, 40, 129, 512, 7, 0, 260, 512},
+             {0, 5, 9, 2, 40, 6, 7, 8, 30, 9}},
+            {"T=16 lookup deep", 16, {128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128},
+             {512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512},
+             {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}},
         };
         std::vector<float> h_fr(32);
         for (int i = 0; i < 32; ++i) h_fr[i] = (float) std::pow(10000.0, -2.0 * i / 64.0);
