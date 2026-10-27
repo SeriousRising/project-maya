@@ -725,6 +725,8 @@ struct Chunk {
     cudaEvent_t cpu_ev = nullptr;            // the gather into cpu_x16 done
     std::vector<CpuItem> cpu_items;
     std::vector<int> cpu_tok;                // (DS4_RW_FLOW_CPU_CHECK) each packed row's token
+    std::vector<float> cpu_ref, cpu_gy;      // (DS4_RW_FLOW_CPU_CHECK >= 3) each packed row in F32 / from the GPU
+    int cpu_grab = 0;                        // (and how many rows the GPU gave)
     std::future<void> cpu_job;
     uint64_t it_cpu = 0, cpu_rows = 0;
     double cpu_ms = 0;
@@ -1323,7 +1325,9 @@ struct Model::Impl {
     // DS4_RW_FLOW_CPU=1: every flow device hands some streamed experts to the CPU lane; =2: only the slowest link's
     int rw_flow_cpu = std::getenv("DS4_RW_FLOW_CPU") ? std::atoi(std::getenv("DS4_RW_FLOW_CPU")) : 0;
     // DS4_RW_FLOW_CPU_CHECK=1: each CPU-taken expert again in F32 (flow_cpu_check), its distance printed a layer; =2: and
-    // the F32 rows used in its place (the rest of the path then carries no CPU-lane rounding)
+    // the F32 rows used in its place (the rest of the path then carries no CPU-lane rounding); =3: the GPU computes the
+    // taken experts as well and its rows are used (lane and F32 compared against them; the logits are switch 0's); =4:
+    // as 3, but the GPU's rows summed through the CPU path's copy and combine (only the sums' order differs)
     int rw_flow_cpu_check = std::getenv("DS4_RW_FLOW_CPU_CHECK") ? std::atoi(std::getenv("DS4_RW_FLOW_CPU_CHECK")) : 0;
     // shortcut: a layer's CPU rows capped (the buffers' size); the link-time balance stops far below it on this rig
     static constexpr int kFlowCpuRows = 2048;
@@ -4267,7 +4271,7 @@ struct Model::Impl {
             cpu += t;
             link -= s_ms - up;
             rows += n;
-            c.cpu_take[(size_t) x.second] = 1;
+            c.cpu_take[(size_t) x.second] = rw_flow_cpu_check < 3;   // (>= 3: the GPU computes it as well)
             c.cpu_items.push_back({x.second, vs[x.second], b[(size_t) vs[x.second]], n, 0});
         }
         std::sort(c.cpu_items.begin(), c.cpu_items.end(), [](const Chunk::CpuItem& p, const Chunk::CpuItem& q) {
@@ -4346,7 +4350,8 @@ struct Model::Impl {
         }
         std::vector<float> gt((size_t) FF), ut((size_t) FF), ref((size_t) E);
         double d_max = 0, d_ss = 0, r_ss = 0, d_early = 0, r_early = 0, w_ref = 0;
-        int w_e = -1, w_tok = -1, rows = 0;
+        int w_e = -1, w_tok = -1, rows = 0, early_t = 0;
+        if (rw_flow_cpu_check >= 3) c.cpu_ref.resize(c.cpu_x.size());
         for (const Chunk::CpuItem& it : c.cpu_items)
             for (int i = 0; i < it.n; ++i) {
                 const size_t r = (size_t) (it.off + i);
@@ -4387,17 +4392,85 @@ struct Model::Impl {
                     r_early = rm;
                 }
                 if (rw_flow_cpu_check == 2) std::memcpy(y, ref.data(), (size_t) E * 4);
+                if (rw_flow_cpu_check >= 3) std::memcpy(c.cpu_ref.data() + r * E, ref.data(), (size_t) E * 4);
+                if (tok >= 0 && tok < 4) early_t |= 1 << tok;
                 ++rows;
             }
         std::fprintf(stderr, "ds4: flow CPU check: CUDA%d layer %d: %zu experts, %d rows: lane vs F32 max |diff| %.4g "
                              "(expert %d, token %d, its max |F32| %.4g), RMS %.4g of the F32 output; tokens 0-3: max "
-                             "|diff| %.4g of max |F32| %.4g\n",
+                             "|diff| %.4g of max |F32| %.4g (taken: %s%s%s%s)\n",
                      devs[(size_t) c.dev].id, l.il, c.cpu_items.size(), rows, d_max, w_e, w_tok, w_ref,
-                     r_ss > 0 ? std::sqrt(d_ss / r_ss) : 0.0, d_early, r_early);
+                     r_ss > 0 ? std::sqrt(d_ss / r_ss) : 0.0, d_early, r_early, early_t & 1 ? "0 " : "",
+                     early_t & 2 ? "1 " : "", early_t & 4 ? "2 " : "", early_t & 8 ? "3 " : "");
+    }
+    // DS4_RW_FLOW_CPU_CHECK >= 3 (run_set, a piece of rows [a, a + n) in c.y before its combine): the taken experts'
+    // rows the GPU computed, kept (and =4: zeroed, so the GPU's combine adds nothing for them - flow_cpu_finish adds
+    // them through the CPU path's copy and combine instead)
+    bool flow_cpu_grab(Dev& d, Chunk& c, int a, int n, std::string& err) {
+        bool sync = false;
+        for (const Chunk::CpuItem& it : c.cpu_items) {
+            const int lo = std::max(a, it.a), hi = std::min(a + n, it.a + it.n);
+            if (lo >= hi) continue;
+            if (!sync) CK(cudaStreamSynchronize(d.st));
+            sync = true;
+            c.cpu_gy.resize((size_t) kFlowCpuRows * g.dim);
+            CK(cudaMemcpy(c.cpu_gy.data() + (size_t) (it.off + lo - it.a) * g.dim, c.y + (size_t) (lo - a) * g.dim,
+                          (size_t) (hi - lo) * g.dim * 4, cudaMemcpyDeviceToHost));
+            if (rw_flow_cpu_check == 4)
+                CK(cudaMemsetAsync(c.y + (size_t) (lo - a) * g.dim, 0, (size_t) (hi - lo) * g.dim * 4, d.st));
+            c.cpu_grab += hi - lo;
+        }
+        return true;
+    }
+    // DS4_RW_FLOW_CPU_CHECK >= 3: the lane's and the F32 rows against the GPU's for the same rows (same inputs: the
+    // model's state is the GPU path's) - =3 then drops the CPU's rows (the GPU's are already summed), =4 sums the GPU's
+    // through the CPU path
+    void flow_cpu_vs_gpu(Chunk& c, const Layer& l) {
+        const int E = g.dim;
+        const Chunk::CpuItem& last = c.cpu_items.back();
+        const size_t R = (size_t) (last.off + last.n);
+        if (c.cpu_ref.size() < R * E || c.cpu_gy.size() < R * E) {
+            std::fprintf(stderr, "ds4: flow CPU vs GPU: layer %d not compared\n", l.il);
+            if (rw_flow_cpu_check == 4) std::abort();   // (=4 would sum the lane's rows in the GPU's place)
+            return;
+        }
+        double dl = 0, df = 0, sl = 0, sf = 0, sg = 0, el = 0, ef = 0, eg = 0;
+        for (size_t r = 0; r < R; ++r) {
+            const bool early = c.cpu_tok[r] >= 0 && c.cpu_tok[r] < 4;
+            for (int j = 0; j < E; ++j) {
+                const double gv = c.cpu_gy[r * E + j], a = std::fabs(c.cpu_y[r * E + j] - gv),
+                             b = std::fabs(c.cpu_ref[r * E + j] - gv);
+                dl = std::max(dl, a);
+                df = std::max(df, b);
+                sl += a * a;
+                sf += b * b;
+                sg += gv * gv;
+                if (early) {
+                    el = std::max(el, a);
+                    ef = std::max(ef, b);
+                    eg = std::max(eg, std::fabs(gv));
+                }
+            }
+        }
+        std::fprintf(stderr, "ds4: flow CPU vs GPU: CUDA%d layer %d: %d of %zu rows from the GPU: lane max |diff| %.4g "
+                             "RMS %.4g, F32 max |diff| %.4g RMS %.4g (RMS: of the GPU output's); tokens 0-3: lane %.4g, "
+                             "F32 %.4g of max |GPU| %.4g
+",
+                     devs[(size_t) c.dev].id, l.il, c.cpu_grab, R, dl, sg > 0 ? std::sqrt(sl / sg) : 0.0, df,
+                     sg > 0 ? std::sqrt(sf / sg) : 0.0, el, ef, eg);
+        if (rw_flow_cpu_check == 4) std::memcpy(c.cpu_y, c.cpu_gy.data(), R * E * 4);
     }
     bool flow_cpu_finish(Dev& d, Chunk& c, const Layer& l, int T, std::string& err) {
         if (c.cpu_items.empty()) return true;
         c.cpu_job.get();
+        if (rw_flow_cpu_check >= 3) {
+            flow_cpu_vs_gpu(c, l);
+            c.cpu_grab = 0;
+            if (rw_flow_cpu_check == 3) {
+                c.cpu_items.clear();
+                return true;
+            }
+        }
         for (const Chunk::CpuItem& it : c.cpu_items) {
             CK(cudaMemcpyAsync(c.y, c.cpu_y + (size_t) it.off * g.dim, (size_t) it.n * g.dim * 4,
                                cudaMemcpyHostToDevice, d.st));
@@ -4784,6 +4857,7 @@ struct Model::Impl {
                     std::fwrite(yv.data(), 4, yv.size(), dump_y);
                     std::fflush(dump_y);
                 }
+                if (rw_flow_cpu_check >= 3 && !c.cpu_items.empty() && !flow_cpu_grab(d, c, a, nrows, err)) return false;
                 moe_combine(c.acc, c.y, c.pos, c.rw, T, l.k_exp, a, a + nrows, D, d.st);
             }
             i0 = j;
