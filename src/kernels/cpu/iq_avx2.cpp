@@ -502,9 +502,9 @@ inline void row_dot_iq1m(const uint8_t* row, int nblocks, const block_q8_K* cons
 }
 
 template <int TY, int NT>
-inline void row_dot_any(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
-    if constexpr (TY == 29) {
-        if (iq1m_pdep()) row_dot_iq1m<NT, true>(row, nblocks, y, res);
+inline void row_dot_any(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res, bool pd) {
+    if constexpr (TY == 29) {   // (pd: iq1m_pdep(), read once a loop by the caller - review r2 S3)
+        if (pd) row_dot_iq1m<NT, true>(row, nblocks, y, res);
         else row_dot_iq1m<NT, false>(row, nblocks, y, res);
     }
     else if constexpr (TY == 17) row_dot_iq2xs<NT>(row, nblocks, y, res);
@@ -519,9 +519,10 @@ void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const voi
     for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
     const int nb = n / QK_K;
     float g[NT], u[NT];
+    const bool pd = TY == 29 && iq1m_pdep();
     for (int r = r0; r < r1; ++r) {
-        row_dot_any<TY, NT>(blob + (size_t) r * gu_row, nb, y, g);
-        row_dot_any<TY, NT>(blob + up_off + (size_t) r * gu_row, nb, y, u);
+        row_dot_any<TY, NT>(blob + (size_t) r * gu_row, nb, y, g, pd);
+        row_dot_any<TY, NT>(blob + up_off + (size_t) r * gu_row, nb, y, u, pd);
         for (int t = 0; t < NT; ++t) ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
     }
 }
@@ -531,8 +532,9 @@ void dot_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act,
     const block_q8_K* y[NT];
     for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
     float res[NT];
+    const bool pd = TY == 29 && iq1m_pdep();
     for (int r = r0; r < r1; ++r) {
-        row_dot_any<TY, NT>(w + (size_t) r * row_bytes, n / QK_K, y, res);
+        row_dot_any<TY, NT>(w + (size_t) r * row_bytes, n / QK_K, y, res, pd);
         for (int t = 0; t < NT; ++t) out[t][r] = res[t];
     }
 }
