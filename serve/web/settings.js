@@ -3,7 +3,7 @@
 // updates.  A change applies at once; the two that restart the model ask first.
 import {html, useEffect, useRef, useState} from "./preact.js";
 import {MOD, api, ctxfmt, fmt, gb, isPhone, modelName, store} from "./lib.js";
-import {DEFAULTS, LEVELS, P, PRESETS, S, confirmDialog, copyText, emit, presetOf, savePrefs, schemeChoice, setScheme, setTheme,
+import {DEFAULTS, LEVELS, P, PENALTIES, PRESETS, S, confirmDialog, copyText, emit, presetOf, resetPrefs, savePrefs, schemeChoice, setScheme, setTheme,
         themeChoice, thinkTitles, toast} from "./state.js";
 import {usd} from "./sidebar.js";
 import {confirmContext, confirmPort, ctxEstimate, ctxStops, fetchReport, loadCtxInfo, loadMcp, loadPortInfo, loadShared,
@@ -126,7 +126,8 @@ function ChatDefaults() {
             on ? "API clients use these settings from their next request." : "Other apps use their own settings again.");
     } catch (e) { toast("error", "Not saved for other apps", e.message, 6000); }
   };
-  const names = {reasoning_effort: "thinking", temperature: "temperature", top_p: "top-p", top_k: "top-k", min_p: "min-p", seed: "seed", max_tokens: "max tokens"};
+  const names = {reasoning_effort: "thinking", temperature: "temperature", top_p: "top-p", top_k: "top-k", min_p: "min-p", seed: "seed", max_tokens: "max tokens",
+                 repetition_penalty: "repetition penalty", frequency_penalty: "frequency penalty", presence_penalty: "presence penalty"};
   const sharedNow = S.shared.on && S.shared.now && Object.keys(S.shared.now).length
     ? "API clients get now: " + Object.entries(S.shared.now).map(([k, v]) => `${names[k] || k} ${v}`).join(", ")
     : "API clients get them for anything they don't set themselves.";
@@ -155,11 +156,18 @@ function ChatDefaults() {
         <input class="input" inputmode="numeric" placeholder="Random" value=${P.seed}
           onInput=${(e) => set({seed: e.target.value.replace(/\D/g, "")})}/></label>
     </div>
+    <p class="set-row__sub">Penalties: none by default (no model has any as a standard). Set one to discourage repeats.</p>
+    <div class="set-pair set-pair--3">
+      ${[["repetition_penalty", "Repetition", "1.0 off, e.g. 1.1"], ["frequency_penalty", "Frequency", "0 off, e.g. 0.3"],
+         ["presence_penalty", "Presence", "0 off, e.g. 0.3"]].map(([k, label, ph]) => html`<label class="field"><span class="field__label">${label}</span>
+        <input class="input" inputmode="decimal" placeholder=${ph} value=${P[k]} aria-label=${`${label} penalty`}
+          onInput=${(e) => set({[k]: e.target.value.replace(/[^\d.]/g, "")})}/></label>`)}
+    </div>
     <${Row} label="Use these for other apps too" sub=${sharedNow}>
       <${Switch} label="Use these for other apps too" on=${S.shared.on} onChange=${share}/><//>
     <div class="set-foot"><button type="button" class="btn btn--secondary btn--sm" onClick=${() => {
-      const d = {...DEFAULTS};
-      set({thinking: d.thinking, temperature: d.temperature, top_p: d.top_p, top_k: d.top_k, min_p: d.min_p, max: "", seed: ""});
+      resetPrefs(["thinking", "temperature", "top_p", "top_k", "min_p", "max", "seed", ...PENALTIES]);   // (the model's own again)
+      syncShared();
       toast("success", "Back to the defaults", "The model's recommended settings.");
     }}>Reset to the defaults</button></div>`;
 }

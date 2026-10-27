@@ -73,6 +73,47 @@ class BenchExeSelection(unittest.TestCase):
             expect = maya.DS4_EXE if maya.config_family(cfg) == "deepseek" else maya.EXE
             self.assertEqual(maya.bench_exe(cfg), expect)
 
+    def test_minimax_config_gets_the_mm3_binary(self):
+        with patch.object(maya, "config_family", return_value="minimax"), \
+                patch.object(maya, "MM3_EXE", Path("/build-hip/maya-mm3")):
+            self.assertEqual(maya.bench_exe({"exe": "/build-hip/maya-mm3", "args": []}), Path("/build-hip/maya-mm3"))
+
+
+class BenchRequests(unittest.TestCase):
+    """#549: each family's own chat format and short answers out of the mean; #420 / #509: a --parallel engine's GEN
+    carries rid=0 and its DONE line its id."""
+
+    def test_chat_formats(self):
+        self.assertEqual(maya.bench_chat("glm", Path("/none"))("hi"), "[gMASK]<sop><|user|>\nhi<|assistant|>\n</think>")
+        self.assertEqual(maya.bench_chat("deepseek", Path("/none"))("hi"),
+                         "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>")
+
+    def test_minimax_uses_its_own_template(self):
+        try:
+            import jinja2  # noqa: F401
+        except ImportError:
+            self.skipTest("jinja2 not installed")
+        s = maya.bench_chat("minimax", Path("/none"))("hi")
+        self.assertNotIn("[gMASK]", s)
+        self.assertIn("hi", s)
+
+    def test_gen_line(self):
+        self.assertEqual(maya.bench_gen_line(256, [1, 2], False), "GEN 256 temperature=0 1,2\n")
+        self.assertEqual(maya.bench_gen_line(256, [1, 2], True), "GEN 256 temperature=0 rid=0 1,2\n")
+
+    def test_reply(self):
+        self.assertEqual(maya.bench_reply("DONE 256 9 1.0 2.0 length\n", False)[:2], ["DONE", "256"])
+        self.assertEqual(maya.bench_reply("DONE 0 256 9 1.0 2.0 length\n", True)[:2], ["DONE", "256"])
+        self.assertIsNone(maya.bench_reply("DONE 3 256 9 1.0 2.0 length\n", True))   # (another request's)
+        self.assertEqual(maya.bench_reply("ERR this engine runs several conversations: GEN needs rid=<id>", True)[0],
+                         "ERR")
+        self.assertIsNone(maya.bench_reply("PP 64 128 1.0 2.0 0", False))
+
+    def test_short_answer_not_in_the_mean(self):
+        r = [("decode", "a", 20.0, 256), ("decode", "b", 40.0, 11), ("decode", "c", 22.0, 256), ("prefill", "x", 900.0)]
+        self.assertEqual(maya.bench_decode_mean(r), (21.0, 2))
+        self.assertEqual(maya.bench_decode_mean([("decode", "b", 40.0, 11)]), (40.0, 1))   # (all short: all of them)
+
 
 if __name__ == "__main__":
     unittest.main()

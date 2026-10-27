@@ -4,6 +4,75 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.34 - 2026-10-27
+
+DeepSeek and MiniMax answer several requests at once, fixes for one-GPU and tensor-parallel speed, Qwen-3.8-Flash-Next
+(CYBER-FROST) in the setup, each model's own defaults in the chat, your own EXL3 folders in the setup, and a new README.
+
+- **DeepSeek-V4.1-Flash and MiniMax-M3.1-Flash answer several requests at once** (#332): `./maya.sh --parallel 4`
+  (Windows: `START-MAYA.bat --parallel 4`; up to 8), or the Models page's Answers at once, as for GLM-5.3-Flash - for
+  agents that run several sessions, or several people on one PC. Each conversation keeps its own state; two at once
+  write about 1.6x the tokens per second of one after another on a V100 with most of DeepSeek Maya-XS's experts in
+  RAM. MiniMax keeps every conversation's cache in VRAM, so KV streaming and its drafter
+  are off while more than one runs, and the setup recommends a context that leaves them room. Thanks to
+  @mrsirg97-rgb for the comparison in #557.
+- **DeepSeek on one GPU with every expert in RAM** (#551, @talisp): the one-GPU decode path now turns itself off where
+  nothing would ever stream from the disk (`--mmap-experts off`, or auto with all of them copied); it cost 4-9% of
+  decode on the reporter's L40S, and decode was 2.2x faster without it on a V100 test PC. Nothing to set.
+- **MiniMax CPU lane** (#552, @talisp): `--cpu-threads N` now means N threads in all, as for DeepSeek (it started
+  N + 1: about 1.3x faster decode with N = the cores); by default 2 cores stay free for the engine's other work on a
+  CPU without SMT (a VM's vCPUs), and decode times the CPU lane again when the start-up timing was off.
+- **MiniMax prompts on one GPU** (#552): the prompt calibration also tries larger chunks where most experts stay in
+  RAM and keeps one only when it reads prompts clearly faster without slowing decode: 1.9x faster prompts on a V100
+  with a quarter of the experts in VRAM.
+- **MiniMax tensor parallel with DSpark** (#556, @bandito1): the VRAM the drafter's GPU uses alone was left empty on
+  the other GPU of its group; that GPU now fills it with more experts (about 1.2x decode on a two-GPU test with half
+  of the experts outside VRAM).
+- **Qwen-3.8-Flash-Next (CYBER-FROST) in the setup:** its Q5_K_M GGUF, pinned and checked, with its MTP drafter built
+  from the GGUF's own block (no second download), its experts read straight from the GGUF where RAM cannot hold them
+  all, INT8 KV cache, and the model card's settings (temperature 1.0, top-p 0.95, top-k 20; reasoning efforts low,
+  medium and xhigh). Text only.
+- **Each model's own defaults:** the setup writes each model's card sampling and thinking level into its config every
+  time, the chat uses them until you choose something, and switching models starts at the new model's own. GLM gets
+  its Max level and penalty fields; Top-k and Min-p "off" take effect; a chat continued on another model takes its
+  nearest thinking level; the same seed gives the same answer on DeepSeek and MiniMax. The chat follows a streaming
+  answer until you scroll, and notifications get a close button.
+- **Your own quants in the setup** (#545 @sebastian-burlacu, #547 @misty-soverin, #528 @woodsonl): `--model-dir`
+  takes an EXL3 folder of GLM-5.3-Flash or MiniMax-M3.1-Flash at any bit rate, checked file by file, with the
+  folder's own sampling and chat template; a GLM GGUF with another expert count (a pruned model) no longer gets the
+  shipped 288-expert profile. The model list is shorter: unsloth's DeepSeek UD-Q4_K_XL and turboderp's GLM
+  EXL3 sc_4.10bpw are no longer offered (named by hand, or set up before, they work as before).
+- **DeepSeek expert tables** (#550, @handmade0octopus): two races closed - a streamed expert no longer lands in a
+  recent slot while its swap is pending, and a table update waits for the device's earlier one.
+- **DeepSeek tensor parallel: a stopped prompt no longer wedges the pair** (#539, @zhangxiaoxing): one GPU spinning
+  and the other idle until a restart. A request that stops moving for 10 minutes now ends the engine with a report and
+  the server starts it again; an engine stopped by a signal is no longer reported as out of RAM (#494).
+- **More fixes:** DeepSeek on a 2-socket PC no longer gets killed for memory at load with RAM free (#507,
+  @zhangxiaoxing); `--calibrate` measures the layer split too on two to four equal GPUs (#502, @noonghunna); one busy
+  moment at MiniMax's start no longer moves every expert to the GPU for the session (#548, @noonghunna); `--bench`
+  uses MiniMax's own chat format and engine on AMD and works with a `--parallel` config (#549 @noonghunna, #420
+  @oscarlius, #509 @knoodrake); Linux setups warn when systemd-oomd could end the session during a large load (#497,
+  @HansStrupat); the CPU expert kernel builds with an assembler without AVX512-VNNI (#535, @biochem-fan); a Windows
+  AMD build with only Visual Studio 2026's Build Tools says what to install (#544, @wonder-sound).
+- **README:** a shorter front page - quick start, one "pick your model" table with each quant under its own model
+  (#554, @AutisticPancake), quality, and every user speed report back in a closed section per model; each model's
+  files and options in [docs/MODELS.md](docs/MODELS.md).
+
+## v1.1.33 - 2026-10-27
+
+A quick fix for setting up MiniMax-M3.1-Flash from our GGUFs.
+
+- **Fix: a new MiniMax GGUF setup finishes again** (#555, @GoKu-Gear6): the setup's pack step now finds the
+  `-maya-indexers.bin` file beside the shards. Since v1.1.31 it stopped with "the sparse-attention indexer of layers
+  0, 1, 2 is not in the set". A MiniMax already set up was not affected.
+
+## v1.1.32 - 2026-10-27
+
+A quick fix for the new web UI.
+
+- **Fix: the "Saved" popover is whole again** (#553, @needmorevram): the glass sidebar sits above the main column,
+  so the popover at the bottom of the sidebar is no longer cut off at its edge.
+
 ## v1.1.31 - 2026-10-27
 
 MiniMax answers faster, DeepSeek reads copied text faster and keeps its pictures off the GPU, orcarouter's

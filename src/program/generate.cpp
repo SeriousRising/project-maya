@@ -196,6 +196,9 @@ struct Options {
     /// is reserved for a host thread that has nothing to do while the drain runs.
     bool no_host_worker = false;
     bool mmap_experts = false;    ///< R2.1: opt OUT of the resident arena, back to MapViewOfFile
+    /// v1.1.32: the experts straight from the model's GGUF - the hottest the GPUs leave in RAM as far as it goes, the
+    /// rest read when routed.  "auto" (default): when this PC's RAM cannot hold them all; "on" / "off".
+    std::string experts_from_gguf = "auto";
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
     /// R4: slots of VRAM-resident experts.  **0 = off, and off is the default.**
     /// **THE COMMENT THAT USED TO BE HERE WAS FALSE AND ROUND 328 MEASURED IT.**  It said "the cache has no
@@ -499,6 +502,10 @@ void usage() {
                  "  --pool-workers N     R2.2: CPU expert pool worker count.  Default 0 = every physical core\n"
                  "                       except the one the host loop spins on.  A sweep is how the pool's\n"
                  "                       deviation from `cpu_s2` is attributed.\n"
+                 "  --experts-from-gguf auto|on|off  a native pack without experts.bin: the experts straight from the\n"
+                 "                       model GGUF - those the GPUs do not hold kept in RAM, hottest first, as far as\n"
+                 "                       the free RAM goes (MAYA_EXPERT_RAM_GB caps it), the rest read when routed\n"
+                 "                       (auto, the default: when the RAM cannot hold every expert)\n"
                  "  --mmap-experts       R2.1: opt OUT of the resident expert arena, back to MapViewOfFile.\n"
                  "                       The A/B arm: the mmap's rate depends on the OS page cache holding\n"
                  "                       34 GB, and measured 71.97 vs 34.78 ms/token cold vs warm.\n"
@@ -4500,6 +4507,13 @@ int main(int argc, char** argv) {
             o.expert_profile_save_min = std::atof(next("--expert-profile-save-every"));
         else if (a == "--gpu-stages") o.gpu_stages = true;
         else if (a == "--mmap-experts") o.mmap_experts = true;
+        else if (a == "--experts-from-gguf") {
+            o.experts_from_gguf = next("--experts-from-gguf");
+            if (o.experts_from_gguf != "auto" && o.experts_from_gguf != "on" && o.experts_from_gguf != "off") {
+                std::fprintf(stderr, "maya generate: --experts-from-gguf takes auto, on or off\n");
+                return 2;
+            }
+        }
         else if (a == "--resident-cpu-experts") o.resident_cpu_experts = true;
         else if (a == "--stats") o.stats = true;
         else if (a == "--shared-late") o.shared_late = true;
@@ -5256,8 +5270,26 @@ int main(int argc, char** argv) {
     // note in `pinned.cu`.
     strata::core::FileExpertSource src;
     strata::core::ArenaExpertSource arena_src;
+    strata::core::GgufExpertSource gguf_src;
     strata::core::ExpertSource* srcp = nullptr;
-    if (o.mmap_experts) {
+    // v1.1.32: a native pack without experts.bin whose experts this PC's RAM cannot hold (CYBER-FROST-3.8's 78 GB
+    // on a 64 GB PC) reads them straight from the model's GGUF - VRAM, then RAM, then the SSD
+    const bool gguf_capable = native_pack && !o.mmap_experts && !o.native_preset.empty() &&
+                              !std::filesystem::exists(std::filesystem::path(o.pack) / "experts.bin") &&
+                              !strata::kernels::cpu::expert_layout().gguf_off.empty();
+    const bool from_gguf = gguf_capable &&
+        (o.experts_from_gguf == "on" ||
+         (o.experts_from_gguf == "auto" &&
+          strata::core::expert_ram_room() < strata::kernels::cpu::expert_layout().total + (2ull << 30)));
+    if (from_gguf) {
+        if (!gguf_src.open(o.native_preset, g.n_layers, g.n_expert, (int64_t) strata::kernels::cpu::MAXT * K, err)) {
+            std::fprintf(stderr, "maya generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "maya generate: %s (the RAM tier is chosen once the GPUs hold theirs)\n",
+                     gguf_src.note().c_str());
+        srcp = &gguf_src;
+    } else if (o.mmap_experts) {
         // FileExpertSource maps the pack's experts.bin: a canonical pack has it; a native (IQ) pack has it when
         // built with `tools/iq_pack.py --experts-bin` (the per-layer blob sizes of its layout, PR #121).  The low-RAM
         // mode: the experts come from the file through the OS cache instead of a pinned copy in RAM, for a PC whose
@@ -5808,6 +5840,39 @@ int main(int argc, char** argv) {
                                  "results return through pinned host rows\n", remote_dev[r],
                          (long long) remote_experts[(size_t) r].resident(), remote_experts[(size_t) r].gib());
         }
+    }
+
+    if (from_gguf) {
+        // v1.1.32: the RAM tier - the experts no GPU holds, the profile's hottest first, then the rest
+        std::vector<uint8_t> seen((size_t) g.n_layers * (size_t) g.n_expert, 0);
+        std::vector<std::pair<int32_t, int32_t>> order, drop;
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            for (int64_t e = 0; e < g.n_expert; ++e) {
+                bool held = xcache.valid() && xcache.slot_of(l, e) != strata::core::kNotResident;
+                for (auto& st : stages) held = held || st->cache.slot_of(l, e) != strata::core::kNotResident;
+                const int64_t i = l * g.n_expert + e;
+                for (int r = 0; r < 3; ++r)
+                    held = held || (o.expert_cache_remote[(size_t) r] > 0 && remote_experts[(size_t) r].owns(i));
+                if (held) { seen[(size_t) i] = 1; drop.emplace_back((int32_t) l, (int32_t) e); }
+            }
+        for (const auto& pr : profile) {
+            if (pr.first < 0 || pr.first >= g.n_layers || pr.second < 0 || pr.second >= g.n_expert) continue;
+            const size_t i = (size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second;
+            if (seen[i]) continue;
+            seen[i] = 1;
+            order.push_back(pr);
+        }
+        for (int64_t e = 0; e < g.n_expert; ++e)   // the unprofiled tail spread over the layers
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                if (!seen[(size_t) (l * g.n_expert + e)]) order.emplace_back((int32_t) l, (int32_t) e);
+        const uint64_t pin_limit = (o.expert_cache_remote[0] > 0 || multi_gpu) ? (8ull << 30) : 0;
+        if (!gguf_src.make_resident(order, 0, pin_limit, /*threads=*/6, drop, err)) {
+            std::fprintf(stderr, "maya generate: %s\n", err.c_str());
+            return 1;
+        }
+        mem_mark("the experts' RAM tier");
+        std::fprintf(stderr, "maya generate: experts: %s; read in %.1f s\n", gguf_src.note().c_str(),
+                     gguf_src.load_seconds());
     }
 
     Drive drive;
@@ -6418,6 +6483,7 @@ int main(int argc, char** argv) {
         thits.scratch = drive.d.hit_scratch;
         thits.hit_out = drive.d.hit_out;
         drive.d.host_res = host_res.data();
+        if (from_gguf) gguf_src.set_gpu_residency(host_res.data());   // (its stagers skip what the GPU computes)
         std::fprintf(stderr, "maya generate: token graph hit path: %lld resident experts, decided on the device\n",
                      (long long) resident);
     }
@@ -6884,11 +6950,20 @@ int main(int argc, char** argv) {
                 const int stn = multi_gpu ? stage_of(s.layer) : 0;   // the swap stays in the layer's own cache
                 GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
                 const strata::core::OnDevice on(gs ? gs->dev : -1);
-                if (slot < 0 || b == nullptr ||
-                    cudaMemcpyAsync(gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), b,
-                                    (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
-                                    cudaMemcpyHostToDevice, gs ? gs->adapt_stream : adapt_stream) != cudaSuccess)
+                if (slot < 0 || b == nullptr) return false;
+                const int64_t nbytes = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer);
+                if (!srcp->stable(s.layer, s.in)) {
+                    // an expert staged from the model file: its ring slot is reused, and a queued copy may read it
+                    // later than it was written (Windows HIP submits queued copies at the next host wait) - copied
+                    // and waited for here
+                    std::string ferr;
+                    if (!(gs ? gs->cache.fill_slot_blocking(slot, b, ferr, nbytes)
+                             : xcache.fill_slot_blocking(slot, b, ferr, nbytes))) return false;
+                } else if (cudaMemcpyAsync(gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), b,
+                                           (size_t) nbytes, cudaMemcpyHostToDevice,
+                                           gs ? gs->adapt_stream : adapt_stream) != cudaSuccess) {
                     return false;
+                }
                 if (gs) gs->adapt_live = true;
                 else main_live = true;
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
@@ -6995,8 +7070,19 @@ int main(int argc, char** argv) {
                                          ? ss.qsa_states[0].n_slots * 4 : 0),
                         (long long) xcache.slots(), (long long) (xcache.bytes() >> 20), o.spec, o.mtp_max_t,
                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
-                        (long long) (strata::kernels::cpu::expert_layout().total >> 20), pool.workers(), o.pcie_frac,
+                        // (the RAM the experts take: with them read from the GGUF, the RAM tier's - sized to fit)
+                        (long long) ((from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total)
+                                     >> 20), pool.workers(), o.pcie_frac,
                         o.spec_min_p);
+            // (v1.1.32) the expert tiers, as the GLM engine's INFO names them: the Monitor's "where the experts live"
+            const int64_t all_experts = (int64_t) g.n_layers * g.n_expert;
+            const int64_t ram_experts = from_gguf ? gguf_src.resident_blobs() : all_experts;
+            std::printf("INFO engine_kind=qwen experts=%lld vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d\n",
+                        (long long) all_experts, (long long) xcache.slots(), (double) xcache.bytes() / 1073741824.0,
+                        (long long) ram_experts,
+                        (double) (from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total) /
+                            1073741824.0,
+                        o.mtp.empty() ? 0 : 1);
         }
         start_serve_watchdog(60);   // one step (a prompt layer, a verify window) takes seconds
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
@@ -7043,6 +7129,9 @@ int main(int argc, char** argv) {
             unsigned long long req_seed = 0;
             float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
             int req_penalty_last_n = 0;
+            // (v1.1.32) the thinking budget, as the GLM engine takes it: think_budget=N think_end=ID - after N thinking
+            // tokens the answer starts (the next token is ID, the template's </think>)
+            int64_t req_think_budget = 0, req_think_end = -1;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
@@ -7071,6 +7160,8 @@ int main(int argc, char** argv) {
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "think_budget") req_think_budget = std::max(0LL, std::atoll(tok.c_str() + eq + 1));
+                    else if (key == "think_end") req_think_end = std::atoll(tok.c_str() + eq + 1);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -7354,8 +7445,10 @@ int main(int argc, char** argv) {
                 for (const auto& [i, slot] : lent_now) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
                     const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
                     const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
-                    if (b == nullptr || !(refill_blocking() ? xcache.fill_slot_blocking(slot, b, e, nb)
-                                                            : xcache.fill_slot_queued(slot, b, e, nb)))
+                    // (an expert staged from the model file: its ring slot is reused - copied and waited for)
+                    const bool blocking = refill_blocking() || !srcp->stable(i / g.n_expert, i % g.n_expert);
+                    if (b == nullptr || !(blocking ? xcache.fill_slot_blocking(slot, b, e, nb)
+                                                   : xcache.fill_slot_queued(slot, b, e, nb)))
                         return false;
                     host_res[(size_t) i] = slot;
                 }
@@ -7576,6 +7669,13 @@ int main(int argc, char** argv) {
             int64_t dec_windows = 0, dec_T = 0;
             const int64_t decode_hits0 = drive.d.cache_hits;
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
+            const int64_t staged0 = from_gguf ? gguf_src.staged() : 0;
+            const Clock::time_point stat_t0 = Clock::now();
+            int64_t stat_next = 8;
+            // the thinking budget: tokens of thinking left (0: not thinking, or no budget); force_end: the budget ran out
+            // at the last emitted token, so the next window reads it alone and its output is replaced by think_end
+            int64_t think_left = req_think_budget > 0 && req_think_end >= 0 ? req_think_budget : 0;
+            bool force_end = false;
             bool window_failed = false;   // a window failed: the request ends here, the engine lives
             if (cancelled) finish = "cancel";
             while (!cancelled && produced_n < max_new) {
@@ -7584,12 +7684,12 @@ int main(int argc, char** argv) {
                     T = 1;
                     while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                 }
-                if (first_window) T = 1;
+                if (first_window || force_end) T = 1;
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
                 bool from_sfx = false;
                 int sfx_match = 0;
-                if (o.suffix_draft > 0 && !first_window) {
+                if (o.suffix_draft > 0 && !first_window && !force_end) {
                     const int k = sfx.propose(S - 1, sbuf.data());
                     sfx_match = sfx.last_match();
                     if (k > 0 && sbuf[0] == drafts[0]) {
@@ -7633,6 +7733,16 @@ int main(int argc, char** argv) {
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                if (force_end) {                       // (the budget: the answer starts here, whatever came out)
+                    outv[0] = (int32_t) req_think_end;
+                    force_end = false;
+                    think_left = 0;
+                } else if (think_left > 0) {           // (the window's tokens count against the budget, in order)
+                    for (int i = 0; i <= a; ++i) {
+                        if (outv[(size_t) i] == (int32_t) req_think_end) { think_left = 0; break; }
+                        if (--think_left == 0) { a = i; force_end = true; break; }   // (kept up to here)
+                    }
+                }
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
@@ -7660,6 +7770,27 @@ int main(int argc, char** argv) {
                     ++produced_n;
                     if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+                }
+                // (v1.1.32) live expert-tier counters for the server's Monitor, as the GLM engine's STAT lines, every 8
+                // tokens: the VRAM share of the experts looked up, those the CPU computed from RAM and those read from
+                // the model file (the page cache or the SSD) a token
+                if (produced_n >= stat_next) {
+                    stat_next = produced_n + 8;
+                    const double el = std::chrono::duration<double>(Clock::now() - stat_t0).count();
+                    const double nt = (double) produced_n;
+                    const int64_t h = drive.d.cache_hits - decode_hits0;
+                    const int64_t look = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused - decode_look0;
+                    const int64_t staged = from_gguf ? gguf_src.staged() - staged0 : 0;
+                    std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f ram_fetch=%.3f disk=%.3f promo=0 "
+                                "vram_used=%lld vram_slots=%lld ram_used=%lld ram_gb=%.1f vram_gb=%.1f\n",
+                                nt / std::max(1e-9, el), 1000.0 * el / nt, (double) h / (double) std::max<int64_t>(1, look),
+                                (double) std::max<int64_t>(0, look - h - staged) / nt, (double) staged / nt,
+                                (long long) xcache.resident(), (long long) xcache.slots(),
+                                (long long) (from_gguf ? gguf_src.resident_blobs()
+                                                       : (int64_t) g.n_layers * g.n_expert - xcache.resident()),
+                                (double) (from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total) /
+                                    1073741824.0,
+                                (double) xcache.bytes() / 1073741824.0);
                 }
                 std::fflush(stdout);
                 ++rounds;
@@ -7933,8 +8064,9 @@ int main(int argc, char** argv) {
             for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
                 const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
                 const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
-                if (b == nullptr || !(refill_blocking() ? xcache.fill_slot_blocking(slot, b, err, nb)
-                                                        : xcache.fill_slot_queued(slot, b, err, nb))) {
+                const bool blocking = refill_blocking() || !srcp->stable(i / g.n_expert, i % g.n_expert);
+                if (b == nullptr || !(blocking ? xcache.fill_slot_blocking(slot, b, err, nb)
+                                               : xcache.fill_slot_queued(slot, b, err, nb))) {
                     std::fprintf(stderr, "maya generate: refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }

@@ -58,6 +58,9 @@ struct Options {
     std::string ablate;
     int ablate_layer = 0;
     float ablate_scale = 0.0f;
+    // --parallel: conversations held at once (1-8), each its own state - its position, tokens, checkpoints, window rings,
+    // the compressors' partial groups, the compressed KV and the index keys (a full context's each); 1: as before
+    int seqs = 1;
 };
 
 /// A picture in the prompt: its span's rows (every position of the span carries the image token), BF16 [span][dim]
@@ -187,6 +190,21 @@ public:
     int dim() const;
     const std::vector<int32_t>& tokens() const;   // what the state has consumed, in order
 
+    /// --parallel's conversations (Options::seqs): each its own state.  seq_bind(s): every call of this class acts on
+    /// conversation s from here - feed, step, draft / verify, sample, checkpoints, slots, reset, tokens (0 at load).
+    int seq_count() const;
+    void seq_bind(int s);
+    int seq_bound() const;
+    int64_t seq_pos(int s) const;
+    const std::vector<int32_t>& seq_tokens(int s) const;
+    /// One token into each of n conversations (distinct, n <= 16, each at its own next position) through the model
+    /// together: the dense weights and the experts the rows share read once for all of them, each row's attention on
+    /// its own conversation's rings and KV.  Row i's logits stay for sample_multi(i, ...), with the penalties
+    /// set_penalties() set over row i's conversation's tokens.  No drafts; each conversation's drafter rings are
+    /// seeded as its own step would seed them, so it drafts on alone later.  The bound conversation stays bound.
+    bool step_multi(const int* seqs, const int* tokens, int n, std::string& err);
+    int sample_multi(int row, float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter);
+
     void reset();
     /// Keep the state at the current position in checkpoint slot 0 or 1 (the end of a prompt, the position before it);
     /// restore(limit) goes back to the latest one at or before limit (-1: none).
@@ -239,6 +257,9 @@ public:
     std::string describe() const;
     /// INFO / VRAM lines for the server's Monitor.
     std::vector<std::string> info_lines() const;
+    /// Where the main thread and each device's thread of a run of chunks are (any thread may ask; the serve watchdog's
+    /// report of a request that stopped moving).
+    std::string where() const;
     /// Where the routed experts live (the drafter's apart), for the Monitor's tiers: in VRAM; in RAM - copied there, or
     /// read ahead into the page cache (in place); the rest read from the SSD when routed.  cpu_blob: a CPU-lane expert's
     /// bytes on average (the SSD's reads a token -> experts a token)
@@ -257,12 +278,10 @@ public:
     /// pipe_ready() says whether this load may pipeline (its reason when not).  pipe_issue() enqueues the
     /// bound sequence's one-token step and its pick (nothing waited for; the token at pos(), not fed yet, as
     /// step()'s), pipe_take(s) waits for sequence s's issued token and returns it.  Prompts, checkpoints and
-    /// the speculative rounds run bound and drained, as before, one sequence at a time.
-    int seq_count() const;
+    /// the speculative rounds run bound and drained, as before, one sequence at a time.  The sequences are
+    /// --parallel's API above (seq_count / seq_bind / seq_bound / seq_pos / seq_tokens): a load makes either the
+    /// pipe's two or --parallel's n, never both (--parallel wins, MAYA_DS4_PIPE then says it is ignored).
     bool pipe_ready(std::string& why) const;
-    void seq_bind(int s);
-    int seq_bound() const;
-    const std::vector<int32_t>& seq_tokens(int s) const;
     /// How much of `ids` sequence s could reuse without being bound (review S1): its length when `ids`
     /// continues it whole, else the best checkpoint position at or below min(common prefix, ids - 1) -
     /// what a bound prefill's restorable() would find.  0: nothing usable.

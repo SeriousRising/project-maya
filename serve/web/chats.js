@@ -2,7 +2,7 @@
 // streamed (and taken back up from the server after a reload or a dropped connection), stopping, editing, regenerating,
 // attachments, the context meter and the Markdown export.
 import {SPRITE, api, coarse, ctxfmt, db, download, fmt, headers, store, uid} from "./lib.js";
-import {P, S, THINKING, confirmDialog, defaultSystem, emit, promptDialog, toast} from "./state.js";
+import {P, PENALTIES, S, confirmDialog, defaultSystem, emit, levelFor, modelId, promptDialog, toast} from "./state.js";
 import {mcpOn} from "./server.js";
 
 // ------------------------------------------------------------------ the chats' list
@@ -15,14 +15,23 @@ export const titleOf = (msgs) => {
 };
 export const chatTitle = (c) => c.title || (c.messages.length ? titleOf(c.messages) : "New chat");
 export function newChatObj() {
-  return {id: uid(), title: "", created: Date.now(), updated: Date.now(), messages: [], system: defaultSystem(), thinking: P.thinking};
+  return {id: uid(), title: "", created: Date.now(), updated: Date.now(), messages: [], system: defaultSystem(), thinking: P.thinking,
+          thinkingFor: modelId()};
 }
 // the thinking level this chat asks for: its own (the box's speedometer), else the Settings default
 // (a level the running model does not have - a chat from MiniMax's "Auto" on GLM - is the default's)
-export const thinkingOf = (c = S.current) => (c && THINKING.includes(c.thinking) && c.thinking) || P.thinking;
+// the chat's own level - set under another model (a switch since), this model's default instead: a level does not
+// carry over; a chat from before levels were tied to a model takes the nearest this one has
+export const thinkingOf = (c = S.current) => {
+  if (!c || !c.thinking) return P.thinking;
+  const f = c.thinkingFor;
+  if (f && !f.startsWith("|") && S.health.model && f !== modelId()) return P.thinking;
+  return levelFor(c.thinking) || P.thinking;
+};
 export function setThinking(level) {
   const c = S.current;
   c.thinking = level;
+  c.thinkingFor = modelId();
   if (c.messages.length) persist(c);
   emit();
   updateCtxMeter();
@@ -296,12 +305,12 @@ export function ctxMeter() {
 
 // ------------------------------------------------------------------ the view's hooks (the message list registers them)
 export const painters = new Map();     // a message -> repaint its answer (while it streams)
-export const chatView = {el: null, follow: true, lastTop: 0, onJump: null};
+export const chatView = {el: null, follow: true, held: false, lastTop: 0, onJump: null};
 export function scrollDown(force) {
   const s = chatView.el;
-  if (force) chatView.follow = true;
+  if (force) { chatView.follow = true; chatView.held = false; }
   if (!s) return;
-  if (chatView.follow) { s.scrollTop = s.scrollHeight; chatView.lastTop = s.scrollTop; }
+  if (chatView.follow && !chatView.held) { s.scrollTop = s.scrollHeight; chatView.lastTop = s.scrollTop; }
   if (chatView.onJump) chatView.onJump();
 }
 export const focusInput = () => setTimeout(() => { const t = document.getElementById("composer-input"); if (t && !coarse()) t.focus(); }, 0);
@@ -366,12 +375,15 @@ export async function answer(resumeJob = null) {
   if (!resumeJob) {
     body = {model: S.health.model, messages: apiMessages(chat, messages.slice(0, -1)), stream: true, reasoning_effort: thinkingOf(chat)};
     if (P.temperature > 0) {
-      Object.assign(body, {temperature: +P.temperature, top_p: +P.top_p});
-      if (+P.top_k > 0) body.top_k = +P.top_k;   // 0: no top-k cut
-      if (+P.min_p > 0) body.min_p = +P.min_p;
+      // (top-k and min-p go even when off - 0: no top-k cut, no min-p - else the run config's or the shared ones applied
+      //  while the page said "off")
+      Object.assign(body, {temperature: +P.temperature, top_p: +P.top_p, top_k: Math.max(0, +P.top_k || 0),
+                           min_p: Math.max(0, +P.min_p || 0)});
     } else {
       body.temperature = 0;
     }
+    // the penalties the user set (blank: none sent - no model has any as a standard)
+    for (const k of PENALTIES) if (P[k] !== "" && P[k] != null && Number.isFinite(+P[k])) body[k] = +P[k];
     if (P.seed) body.seed = +P.seed;
     if (P.max) body.max_tokens = +P.max;
     if (mcpOn()) body.strata_mcp = true;           // this server may run MCP tools for it

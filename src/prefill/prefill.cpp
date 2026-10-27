@@ -130,7 +130,9 @@ struct Stager {
     // D-5: the pinned ring's depth (STRATA_STAGER_RING, default 16) - how far the host copies can run ahead of the
     // DMAs of the unpinned experts' blobs
     int kRing = 16;
-    struct Job { const uint8_t* src; size_t bytes; };
+    // v1.1.32: `src` null = an expert a staging source assembles on demand (GgufExpertSource): copied by `from`
+    struct Job { const uint8_t* src; size_t bytes; int32_t l = -1, e = -1; };
+    core::ExpertSource* from = nullptr;
     std::vector<uint8_t*> buf;
     std::vector<char> pinned;
     std::vector<std::vector<uint8_t>> pageable;   // the fallback when no more RAM can be pinned
@@ -197,7 +199,9 @@ struct Stager {
                     while (issued.load(std::memory_order_acquire) <= j - kRing) std::this_thread::yield();
                     cudaEventSynchronize(dma_done[b]);
                 }
-                std::memcpy(buf[b], jobs[(size_t) j].src, jobs[(size_t) j].bytes);
+                const Job& jb = jobs[(size_t) j];
+                if (jb.src != nullptr) std::memcpy(buf[b], jb.src, jb.bytes);
+                else if (from == nullptr || !from->copy_blob(jb.l, jb.e, buf[b])) std::memset(buf[b], 0, jb.bytes);
                 ready[(size_t) j].store(1, std::memory_order_release);
                 active.fetch_sub(1, std::memory_order_acq_rel);
             }
@@ -537,6 +541,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     if (!m.stager) {
         m.stager = std::make_unique<Stager>();
+        m.stager->from = src;
         const int hw = (int) std::thread::hardware_concurrency();
         const char* stv = std::getenv("STRATA_STAGER_THREADS");   // D-5: the host copy threads of unpinned blobs
         if (!m.stager->init((size_t) MAXBLOB(), stv ? std::clamp(std::atoi(stv), 1, 32) : std::max(2, std::min(4, hw / 4))))
@@ -1136,12 +1141,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 seq_start[(size_t) l] = seq.size();
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
-                    const uint8_t* b = m.src->blob(l, e);
-                    if (!b) { err = "prefill: expert source has no blob"; return false; }
+                    // (an expert a staging source assembles on demand has no lasting pointer: the stager copies it)
+                    const bool lasting = m.src->stable(l, e);
+                    const uint8_t* b = lasting ? m.src->blob(l, e) : nullptr;
+                    if (lasting && !b) { err = "prefill: expert source has no blob"; return false; }
                     int job = -1;
-                    if (!m.src->pinned(l, e)) {
+                    if (!lasting || !m.src->pinned(l, e)) {
                         job = (int) js.size();
-                        js.push_back({b, (size_t) lay0.blob_bytes(l)});
+                        js.push_back({b, (size_t) lay0.blob_bytes(l), (int32_t) l, e});
                     }
                     seq.push_back({(int32_t) l, e, b, job});
                 }
@@ -1628,10 +1635,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             const int32_t e = order[j];
                             if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                             if (m.src->pinned(l, e)) continue;
-                            const uint8_t* b = m.src->blob(l, e);
-                            if (!b) { err = "prefill: expert source has no blob"; return false; }
+                            const bool lasting = m.src->stable(l, e);
+                            const uint8_t* b = lasting ? m.src->blob(l, e) : nullptr;
+                            if (lasting && !b) { err = "prefill: expert source has no blob"; return false; }
                             job_of[j] = (int) js.size();
-                            js.push_back({b, (size_t) lay.blob_bytes(l)});
+                            js.push_back({b, (size_t) lay.blob_bytes(l), (int32_t) l, e});
                         }
                         m.stager->start(std::move(js));
                     }
@@ -1643,9 +1651,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         const int sl = stage_next;
                         stage_next = (stage_next + 1) % STAGE;
                         const auto th = Clock::now();
-                        const uint8_t* b = m.src->blob(l, e);
-                        if (!b) { err = "prefill: expert source has no blob"; return false; }
-                        if (m.src->pinned(l, e)) {
+                        const bool direct = m.src->pinned(l, e);   // (only a pinned blob is read here)
+                        const uint8_t* b = direct ? m.src->blob(l, e) : nullptr;
+                        if (direct && !b) { err = "prefill: expert source has no blob"; return false; }
+                        if (direct) {
                             // DMA straight from the page-locked arena: the copy stream only waits for the slot
                             if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
                             cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);

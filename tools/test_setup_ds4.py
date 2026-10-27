@@ -259,8 +259,10 @@ class Config(unittest.TestCase):
         self.assertEqual(a[a.index("--prefill-chunk") + 1], "4096")
         self.assertEqual(a[a.index("--reserve-mib") + 1], "900")
         self.assertEqual(a[a.index("--vision") + 1], "off")
+        # (the model's own sampling and level every setup - the owner, 2026-10-27: no exceptions; a user's own are the
+        #  page's, per browser)
         self.assertEqual((c["reasoning_effort"], c["sampling"], c["host"], c["api_key"]),
-                         ("max", {"temperature": 0.6}, "0.0.0.0", "k"))
+                         (maya.DS4_EFFORT, maya.DS4_SAMPLING, "0.0.0.0", "k"))
         self.assertEqual(c["env"], {"DS4_RING_MB": "800", "DS4_CHUNK_MIN": "256"})
 
     def tuned(self, tp=8, threads=33):
@@ -400,6 +402,31 @@ class Calibrate(unittest.TestCase):
 
 
 class Gguf(unittest.TestCase):
+    def test_q4_is_chosen_by_hand_not_listed(self):
+        """v1.1.34: unsloth's UD-Q4_K_XL is not in the setup's list (maya.DS4_BY_HAND); --ds4-quant gguf-q4 takes it as
+        before, and a PC that has it set up lists it as its default (a setup again, --yes included, keeps the model)."""
+        self.assertEqual(maya.DS4_BY_HAND, ("gguf-q4",))
+        self.assertIn("gguf-q4", maya.DS4_QUANTS)
+        rows = []
+
+        def pick(title, intro, opts, default, yes, *x):
+            rows.extend(o[0] for o in opts)
+            return default
+        with patch.object(maya.S, "gpus", return_value=[{"arch": 86}]), patch.object(maya, "choose", pick), \
+                patch.object(maya.S, "UI", None):
+            self.assertNotEqual(maya.choose_ds4_quant(args(), {}), "gguf-q4")
+            self.assertTrue(any(r.startswith("DeepSeek V4.1 · UD-Q8_K_XL (508 GB)") for r in rows), rows)
+            self.assertFalse(any("UD-Q4_K_XL" in r for r in rows), rows)
+            self.assertEqual(maya.DS4_DEFAULT_QUANT, "gguf-q8")                  # (the default stays a listed one)
+            rows.clear()
+            self.assertEqual(maya.choose_ds4_quant(args(), {"installer": {"ds4_quant": "gguf-q4"}}), "gguf-q4")
+            self.assertTrue(any(r.startswith("DeepSeek V4.1 · UD-Q4_K_XL (501 GB)") for r in rows), rows)
+            rows.clear()
+            self.assertEqual(maya.choose_ds4_quant(args(ds4_quant="gguf-q4"), {}), "gguf-q4")   # (by hand: no menu)
+            self.assertEqual(rows, [])
+        m = maya.ds4_gguf_model("gguf-q4")
+        self.assertEqual((m["format"], m["folder"]), ("ds4-gguf", "UD-Q4_K_XL"))   # (it downloads and packs as before)
+
     def test_manifest_and_urls(self):
         rev = re.compile(r"/resolve/[0-9a-f]{40}/")
         for q, gb in (("gguf-q8", 508.4), ("gguf-q4", 500.7)):

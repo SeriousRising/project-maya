@@ -510,10 +510,14 @@ inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& wa
         {"qwen4exp.attention.head_count", want.head_count},
         {"qwen4exp.attention.head_count_kv", want.head_count_kv},
     };
+    // (a GGUF that ships its MTP block counts it into block_count - nextn_predict_layers more; the runner serves the
+    //  trunk, the packer leaves the MTP block out)
+    const MetaValue* nextn = g.get("qwen4exp.nextn_predict_layers");
+    const uint64_t extra = nextn ? nextn->u : 0;
     for (const auto& r : reqs) {
         const MetaValue* v = g.get(r.key);
         if (!v) return std::string("missing ") + r.key;
-        if (r.want && v->u != r.want)
+        if (r.want && v->u != r.want && !(r.key == reqs[0].key && extra > 0 && v->u == r.want + extra))
             return std::string(r.key) + " = " + std::to_string(v->u) + ", expected " + std::to_string(r.want);
     }
     return {}; // empty == ok

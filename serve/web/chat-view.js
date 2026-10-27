@@ -31,7 +31,7 @@ function ModelMenu({open, close, anchor}) {
   const go = (s) => () => { close(); openSettings(s); };
   return html`<${Menu} open=${open} onClose=${close} anchor=${anchor} label="Model" align="left" cls="model-menu" width=${340}>
     <div class="model-menu__card"><${ModelLogo} model=${h.model} size=${36}/>
-      <span><b>${modelName(h.model)}</b><span>${h.model_label || h.model} · on this machine${h.version ? ` · v${h.version}` : ""}</span></span></div>
+      <span><b>${modelName(h.model, !!h.model_label)}</b><span>${h.model_label || h.model} · on this machine${h.version ? ` · v${h.version}` : ""}</span></span></div>
     <${MenuSep}/>
     ${c && isPhone() ? html`<div class="model-menu__meter"><${MeterRing} c=${c}/><span>${c.why}: ${c.approx ? "≈" : ""}${fmt(c.tokens)} of ${fmt(c.max)} tokens</span></div>` : null}
     <button type="button" role="menuitem" class="menu__item" onClick=${go("model")}><span class="menu__label">Context size</span>
@@ -48,7 +48,7 @@ function ModelMenu({open, close, anchor}) {
 function Header() {
   const [model, setModel] = useState(false), [opts, setOpts] = useState(false);
   const mBtn = useRef(null), oBtn = useRef(null);
-  const name = modelName(S.health.model);
+  const name = modelName(S.health.model, true);   // (the short form here: "Qwen-3.8-Flash-Next"; the menu's line below it has the full one)
   if (isPhone()) {
     return html`<header class="chat-head chat-head--float">
       <button type="button" class="glass-btn" aria-label="Chats" onClick=${() => { S.drawer = true; emit(); }}><${Icon} name="menu"/></button>
@@ -396,15 +396,45 @@ export function ChatPage() {
   useEffect(() => {
     const s = scroller.current;
     chatView.el = s;
-    chatView.onJump = () => setJump(!!s && s.scrollHeight - s.scrollTop - s.clientHeight >= 120 && S.current.messages.length > 0);
+    // (the arrow: whenever the chat does not follow and the end is out of sight)
+    chatView.onJump = () => setJump(!!s && S.current.messages.length > 0
+      && s.scrollHeight - s.scrollTop - s.clientHeight > (chatView.follow && !chatView.held ? 120 : 8));
     return () => { if (chatView.el === s) chatView.el = null; };
   });
   useEffect(() => { scrollDown(true); }, [S.current]);
-  // the chat follows a streaming answer down until its reader scrolls up - by any amount - and again once they are back
+  // the chat follows a streaming answer down until its reader takes over - a wheel or a swipe up, or a finger (or the
+  // mouse button) held on it - and again once they are back at the end or press the arrow.  (Only the reader's own
+  // input stops it: a smooth scroll's first small steps used to count as "still at the end" and pulled it back down.)
+  useEffect(() => {
+    const s = scroller.current, gap = () => s.scrollHeight - s.scrollTop - s.clientHeight;
+    const jump = () => { if (chatView.onJump) chatView.onJump(); };
+    let downAt = 0, downTop = 0;
+    const hold = () => { chatView.held = true; downAt = performance.now(); downTop = s.scrollTop; jump(); };
+    const release = () => {
+      if (!chatView.held) return;
+      chatView.held = false;
+      const tap = performance.now() - downAt < 350 && Math.abs(s.scrollTop - downTop) < 4;   // (a tap on a button)
+      if (gap() < 8 || (tap && chatView.follow)) scrollDown(true);
+      else { chatView.follow = false; jump(); }
+    };
+    const wheel = (e) => { if (e.deltaY < 0) { chatView.follow = false; jump(); } };
+    const opts = {passive: true}, ends = ["touchend", "touchcancel", "mouseup"];
+    s.addEventListener("wheel", wheel, opts);
+    s.addEventListener("touchstart", hold, opts);
+    s.addEventListener("mousedown", hold, opts);
+    for (const t of ends) addEventListener(t, release, opts);
+    return () => {
+      s.removeEventListener("wheel", wheel, opts);
+      s.removeEventListener("touchstart", hold, opts);
+      s.removeEventListener("mousedown", hold, opts);
+      for (const t of ends) removeEventListener(t, release, opts);
+      chatView.held = false;
+    };
+  }, []);
   const onScroll = () => {
-    const s = scroller.current;
-    if (s.scrollTop < chatView.lastTop - 2) chatView.follow = false;
-    if (s.scrollHeight - s.scrollTop - s.clientHeight < 32) chatView.follow = true;
+    const s = scroller.current, gap = s.scrollHeight - s.scrollTop - s.clientHeight;
+    if (s.scrollTop < chatView.lastTop - 2 && gap >= 8) chatView.follow = false;             // moved up: keys, scrollbar
+    else if (s.scrollTop > chatView.lastTop && gap < 8 && !chatView.held) chatView.follow = true;   // back down at the end
     chatView.lastTop = s.scrollTop;
     chatView.onJump();
   };

@@ -273,6 +273,10 @@ struct TpEngine::Impl {
         k::KvHost kvh;   // (--kv-streaming: the caches above a ring, every position in host memory too)
         uint8_t* res_base = nullptr;
         float* gate = nullptr;   // (member 0: the router, F32 [n_exp][dim])
+        // (#556) this member's own slices of more experts outside the group's VRAM set (place_extra): expert -> its
+        // slot in xres_base (-1: none; empty: none at all)
+        uint8_t* xres_base = nullptr;
+        std::vector<int> xres_slot;
     };
     struct Layer {
         int group = 0;
@@ -286,6 +290,11 @@ struct TpEngine::Impl {
         std::vector<const uint8_t*> host;         // expert -> its tp slices in the pinned pool (blob apart)
         std::vector<int> slot_of;                 // expert -> its slot in the group's cache (-1: none)
     };
+    // member j's own slice of expert x of layer l (Slice::xres): its slot, or -1
+    static int xres_of(const Layer& l, int j, int x) {
+        const std::vector<int>& v = l.sl[(size_t) j].xres_slot;
+        return v.empty() ? -1 : v[(size_t) x];
+    }
 
     std::vector<Member> M;
     std::vector<Group> G;
@@ -456,6 +465,86 @@ struct TpEngine::Impl {
             const Ex3& x = l.ex[(size_t) e][(size_t) r];
             cut(x, r < 2 ? 'n' : 'k', f0, f1, dst + l.lay.trellis[r], dst + l.lay.suh[r], dst + l.lay.svh[r]);
         }
+    }
+
+    // (load, #556) each member of a group of two or more: its free memory less the reserve, filled with its slices of
+    // the group's experts outside VRAM, the most routed first (the profile's; without one expert 0 of every layer, then
+    // 1, ... - as the residents), copied from the pinned pool.  In decode the member computes its slice of such an
+    // expert itself, the CPU lane only the other members' slices (a prompt stages the expert whole, as before).  A
+    // member's allocations are made only from what it has free now, after everything else of the load; one that fails
+    // is left out (its experts stay as they were)
+    void place_extra() {
+        const size_t reserve = (size_t) ((o.reserve_gb < 0 ? 0.3 : o.reserve_gb) * (1u << 30));
+        constexpr size_t kAllocSlack = (size_t) 2 << 20;   // (cudaMalloc's granularity, a layer's allocation)
+        const int saved = acat;
+        acat = kAPool;
+        for (const Group& gr : G) {
+            const int tm = (int) gr.mem.size();
+            if (tm < 2) continue;
+            struct C {
+                uint32_t n;
+                int li, e;
+            };
+            std::vector<C> c;
+            for (int li = gr.l0; li < gr.l1; ++li) {
+                const Layer& l = L[(size_t) li];
+                if (!l.moe || l.host.empty() || l.res_slot.empty()) continue;
+                for (int e = 0; e < g.n_exp; ++e)
+                    if (l.res_slot[(size_t) e] < 0 && l.host[(size_t) e] != nullptr)
+                        c.push_back({prof.empty() ? 0u : prof[(size_t) li * g.n_exp + e], li, e});
+            }
+            std::stable_sort(c.begin(), c.end(), [](const C& a, const C& b) { return a.e < b.e; });
+            std::stable_sort(c.begin(), c.end(), [](const C& a, const C& b) { return a.n > b.n; });
+            if (c.empty()) continue;
+            for (int j = 0; j < tm; ++j) {
+                const Member& m = M[(size_t) gr.mem[(size_t) j]];
+                cudaSetDevice(m.id);
+                size_t fr = 0, tot = 0;
+                if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) {
+                    cudaGetLastError();
+                    continue;
+                }
+                size_t room = fr > reserve ? fr - reserve : 0;
+                std::map<int, std::vector<int>> take;   // layer -> the experts this member takes, in the candidates' order
+                for (const C& x : c) {
+                    const size_t b = L[(size_t) x.li].blob + (take.count(x.li) ? 0 : kAllocSlack);
+                    if (room < b) continue;   // (a smaller layer's may still fit)
+                    room -= b;
+                    take[x.li].push_back(x.e);
+                }
+                long n = 0;
+                size_t bytes = 0;
+                for (auto& [li, v] : take) {
+                    Layer& l = L[(size_t) li];
+                    Slice& S = l.sl[(size_t) j];
+                    std::string e2;
+                    if (!dalloc(m.id, S.xres_base, v.size() * l.blob, e2)) {
+                        cudaGetLastError();
+                        S.xres_base = nullptr;
+                        continue;
+                    }
+                    bool ok = true;
+                    for (size_t s = 0; s < v.size() && ok; ++s)
+                        ok = cudaMemcpy(S.xres_base + s * l.blob, l.host[(size_t) v[s]] + (size_t) j * l.blob, l.blob,
+                                        cudaMemcpyHostToDevice) == cudaSuccess;
+                    if (!ok) {   // (never a slot whose copy did not land)
+                        cudaGetLastError();
+                        continue;
+                    }
+                    S.xres_slot.assign((size_t) g.n_exp, -1);
+                    for (size_t s = 0; s < v.size(); ++s) S.xres_slot[(size_t) v[s]] = (int) s;
+                    n += (long) v.size();
+                    bytes += v.size() * l.blob;
+                }
+                if (n == 0) continue;
+                st.vram_gb += (double) bytes / (1u << 30);
+                info.push_back("CUDA" + std::to_string(m.id) + ": its slices of " + std::to_string(n) +
+                               " more experts of layers " + std::to_string(gr.l0) + "-" + std::to_string(gr.l1 - 1) +
+                               " (" + std::to_string(bytes >> 20) + " MB), in room the group's shared expert budget "
+                               "left unused here - the CPU lane computes only the other GPUs' slices of them");
+            }
+        }
+        acat = saved;
     }
 
     bool load(const Options& o_, std::string& err) {
@@ -1102,6 +1191,16 @@ struct TpEngine::Impl {
                 st.pinned_gb = (double) total / (1u << 30);
                 st.pooled = (long) todo.size();
             }
+        }
+        // (#556) each member's own room for its slices of more experts: a group's members hold the same experts in VRAM
+        // - as many as its tightest member's room takes - so what one member holds alone (the head member: the output
+        // head, the DSpark draft and its taps) left as many bytes idle on the others (4x RTX 3090 at --tp 2: 3.2 GB on
+        // GPU 1 beside the drafter on GPU 0).  That room, less the reserve every member keeps, now holds the member's
+        // slices of the next most routed experts outside VRAM (place_extra).  Not with --resident-cap;
+        // MAYA_MM3_TP_EXTRA=0: as before
+        if (pool != nullptr && o.resident_cap < 0) {
+            const char* xv = ::mm3::env("MM3_TP_EXTRA");
+            if (xv == nullptr || std::atoi(xv) != 0) place_extra();
         }
         // the CPU lane: sub-experts of a group's width (a member's slice; whole experts in a group of one GPU)
         {
@@ -2520,6 +2619,8 @@ struct TpEngine::Impl {
                                     gr.slot_used[(size_t) c] = fwd;
                                     score((long long) li * 1024 + x, true);   // (a cached expert's use keeps it)
                                 }
+                            } else if (const int xs = xres_of(l, j, x); xs >= 0) {   // (#556: this member's own slice)
+                                pp[e] = (unsigned long long) (l.sl[(size_t) j].xres_base + (size_t) xs * l.blob);
                             } else {
                                 continue;
                             }
@@ -2540,21 +2641,27 @@ struct TpEngine::Impl {
                     gs[by_ptr.size()] = ne;
                     *ng = (int) by_ptr.size();
                 }
-                // the CPU lane's experts: each as tm sub-experts (the members' slices), summed token by token in slot
-                // order, sub-expert by sub-expert
+                // the CPU lane's experts: each as tm sub-experts (the members' slices) - but a member's own slice of it
+                // (#556: place_extra), which that member computes - summed token by token in slot order, sub-expert by
+                // sub-expert
                 std::vector<CpuExpert> cpu;
                 std::vector<std::vector<std::pair<int, float>>> users;
                 std::vector<std::pair<int, int>> order;
-                std::vector<int> cpu_of((size_t) g.n_exp, -1);
+                std::vector<int> cpu_of((size_t) g.n_exp * tm, -1);   // (expert, member) -> its sub-expert
+                std::vector<char> seen((size_t) g.n_exp, 0);
                 for (int t = 0; t < T; ++t)
                     for (int i = 0; i < K; ++i) {
                         const int x = top[(size_t) t * K + i];
                         if (l.res_slot[(size_t) x] >= 0 || l.slot_of[(size_t) x] >= 0) continue;
                         const float wt = w[(size_t) t * K + i] * g.scale;
-                        if (cpu_of[(size_t) x] < 0) {
-                            consider(gr, li, x);
-                            cpu_of[(size_t) x] = (int) cpu.size();
+                        if (!seen[(size_t) x]) {
+                            seen[(size_t) x] = 1;
+                            bool on_cpu = false;
+                            for (int j = 0; j < tm; ++j) on_cpu = on_cpu || xres_of(l, j, x) < 0;
+                            if (on_cpu) consider(gr, li, x);
                             for (int j = 0; j < tm; ++j) {
+                                if (xres_of(l, j, x) >= 0) continue;
+                                cpu_of[(size_t) x * tm + j] = (int) cpu.size();
                                 const uint8_t* b = l.host[(size_t) x] + (size_t) j * l.blob;
                                 CpuExpert c;
                                 for (int r = 0; r < 3; ++r) {
@@ -2571,7 +2678,8 @@ struct TpEngine::Impl {
                             }
                         }
                         for (int j = 0; j < tm; ++j) {
-                            const int ci = cpu_of[(size_t) x] + j;
+                            const int ci = cpu_of[(size_t) x * tm + j];
+                            if (ci < 0) continue;   // (that member's own slice)
                             users[(size_t) ci].push_back({t, wt});
                             order.push_back({ci, (int) users[(size_t) ci].size() - 1});
                         }

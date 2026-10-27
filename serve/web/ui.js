@@ -188,4 +188,6 @@ export const Toasts = () => html`<div class="toasts" aria-live="polite">${S.toas
     <${Icon} name=${TOAST_ICON[t.kind] || "info"}/>
     <div class="toast__text"><b>${t.title}</b>${t.text ? html`<span>${t.text}</span>` : null}</div>
     ${t.action ? html`<button type="button" class="btn btn--secondary btn--sm" onClick=${() => { t.action.run(); dismissToast(t.id); }}>${t.action.label}</button>` : null}
+    <button type="button" class="icon-btn icon-btn--sm toast__x" aria-label="Dismiss" title="Dismiss"
+      onClick=${() => dismissToast(t.id)}><${Icon} name="close" sm/></button>
   </div>`)}</div>`;

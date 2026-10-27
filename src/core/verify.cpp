@@ -957,6 +957,22 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[0].max_cells) { err = "verify: the window runs past the context"; return false; }
+    // (v1.1.32) Windows' HIP runtime submits queued GPU work only at a host wait (#133's lesson): a window that does
+    // not continue the last committed one - the first after a prompt was read, a conversation taken back - waits for
+    // the device first, so it reads what the prompt path and the expert-cache refills wrote.  MAYA_QWEN_SYNC: 0 off,
+    // 1 that (the default on Windows + HIP), 2 before every window (a diagnosis arm)
+    static const int sync_mode = [] {
+        if (const char* v = std::getenv("MAYA_QWEN_SYNC")) return std::atoi(v);
+#if defined(_WIN32) && defined(STRATA_USE_HIP)
+        return 1;
+#else
+        return 0;
+#endif
+    }();
+    if (sync_mode >= 2 || (sync_mode == 1 && pos0 != next_pos_)) {
+        const cudaError_t se = cudaDeviceSynchronize();
+        if (se != cudaSuccess) { err = std::string("verify: device sync: ") + cudaGetErrorString(se); return false; }
+    }
     if (!capture(T, err) || !capture_commit(err)) return false;
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();
@@ -1184,6 +1200,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
     if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+    next_pos_ = last_pos0_ + n_keep;
     if (ple_stage())   // stages that share one session must advance it once
         for (int t = 0; t < n_keep; ++t) {
             ss_->ple_prev[0] = ss_->ple_prev[1];

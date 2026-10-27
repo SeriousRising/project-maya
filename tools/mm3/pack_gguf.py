@@ -217,6 +217,8 @@ def find_shards(model: pathlib.Path, names: list[str] | None, indexers: str | No
     if not paths or missing:
         raise SystemExit("%s: no .gguf files" % model if not paths else "%s: not there" % missing[0])
     side = [p for p in paths if p.name.endswith(SIDE_NAMES)]
+    if names and not side:  # --shards names the .gguf set only: the .bin side file sits beside it
+        side = sorted(model.glob("*" + SIDE_BIN))
     main = [p for p in paths if p not in side]
     if indexers:
         side = [pathlib.Path(indexers).expanduser().resolve()]

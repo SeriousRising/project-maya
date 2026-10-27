@@ -180,6 +180,9 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME ds4_pcie_test COMMAND ds4_pcie_test)
   add_executable(ds4_ram_slice_test tests/ds4_ram_slice_test.cpp)
   add_test(NAME ds4_ram_slice_test COMMAND ds4_ram_slice_test)
+  # maya-ds4 --serve's watchdog: it fires on a request that stopped moving, never on a long one still moving (#539)
+  add_executable(ds4_watchdog_test tests/ds4_watchdog_test.cpp)
+  add_test(NAME ds4_watchdog_test COMMAND ds4_watchdog_test)
   # the reader refuses a duplicate tensor name at open, naming it (a synthetic GGUF: no model, no GPU)
   add_executable(gguf_reader_test src/artifact/gguf_reader_test.cpp)
   target_link_libraries(gguf_reader_test PRIVATE strata_artifact)
@@ -630,6 +633,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         target_include_directories(mm3_sampler_test PRIVATE include src/mm3)
         add_test(NAME mm3_sampler_test COMMAND mm3_sampler_test)
         set_tests_properties(mm3_sampler_test PROPERTIES TIMEOUT 300)
+        # the CPU lane's arithmetic (mm3_lane_plan.hpp): default workers with / without SMT, decode's re-timing
+        add_executable(mm3_lane_plan_test tests/mm3_lane_plan_test.cpp)
+        target_include_directories(mm3_lane_plan_test PRIVATE src/mm3)
+        add_test(NAME mm3_lane_plan_test COMMAND mm3_lane_plan_test)
       endif()
     endif()
     if(_mm3_filter)
@@ -1050,8 +1057,31 @@ if(STRATA_CPU_X86 AND MSVC)
   set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
 elseif(STRATA_CPU_X86)
   # GCC/Clang spell it differently, and `-mavx512vnni` alone is not enough: VBMI is a separate feature bit.
-  set_source_files_properties(src/kernels/cpu/expert.cpp
-                              PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
+  # A toolchain whose assembler has no VNNI (#535: Rocky Linux 9's GCC 11 + binutils 2.35, "unsupported instruction
+  # `vpdpbusd'") builds the kernel with AVX512-BW's u8 x s8 dot products instead - the same sums (expert.cpp) - and
+  # MAYA_CPU_VNNI_EMULATE=ON chooses that on any toolchain (tests)
+  option(MAYA_CPU_VNNI_EMULATE "CPU expert kernel: AVX512-BW in place of VNNI's dot products" OFF)
+  include(CheckCXXSourceCompiles)
+  set(CMAKE_REQUIRED_FLAGS "-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512vnni -mavx512vbmi -mf16c -mfma")
+  check_cxx_source_compiles([=[
+#include <immintrin.h>
+__m256i f(__m256i a, __m256i b, __m256i c) { return _mm256_dpbusd_epi32(a, b, c); }
+__m512i g(__m512i a, __m512i b, __m512i c) { return _mm512_dpbusd_epi32(a, b, c); }
+int main() { return 0; }
+]=] MAYA_CPU_VNNI_ASM)
+  unset(CMAKE_REQUIRED_FLAGS)
+  if(MAYA_CPU_VNNI_ASM AND NOT MAYA_CPU_VNNI_EMULATE)
+    set_source_files_properties(src/kernels/cpu/expert.cpp
+                                PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
+  else()
+    if(NOT MAYA_CPU_VNNI_EMULATE)
+      message(STATUS "Maya: the compiler or its assembler has no AVX512-VNNI - the CPU expert kernel uses AVX512-BW's "
+                     "dot products (the same sums)")
+    endif()
+    set_source_files_properties(src/kernels/cpu/expert.cpp
+                                PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vbmi;-mf16c;-mfma"
+                                           COMPILE_DEFINITIONS "STRATA_CPU_DPBUSD_BW=1")
+  endif()
   set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
 endif()
 find_package(Threads REQUIRED)

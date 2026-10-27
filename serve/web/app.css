@@ -7,8 +7,11 @@
 
 /* ---------------------------------------------------------------- the sidebar */
 /* glass, as DeepSeek Harness's sidebar: the sidebar's own color a little see-through, blurred, a sheen at the top and a light
-   edge instead of a border; the main column keeps the hairline (on the glass an alpha border would read as a seam) */
-.side { flex: none; width: var(--maya-side); height: 100%; display: flex; flex-direction: column; gap: 2px; padding: 10px 10px 12px;
+   edge instead of a border; the main column keeps the hairline (on the glass an alpha border would read as a seam).
+   The blur makes the sidebar its own stacking layer, so its popups' z-index counts only inside it: it sits above the
+   main column (z-index 1), else the column after it paints over Saved's popover and the menus where they reach past it */
+.side { position: relative; z-index: 1;
+        flex: none; width: var(--maya-side); height: 100%; display: flex; flex-direction: column; gap: 2px; padding: 10px 10px 12px;
         background: linear-gradient(to bottom, var(--st-glass-sheen), transparent 35%), var(--st-side-glass);
         -webkit-backdrop-filter: blur(30px) saturate(170%); backdrop-filter: blur(30px) saturate(170%);
         box-shadow: inset -1px 0 0 var(--st-glass-edge); }
@@ -62,7 +65,7 @@
 .status-card:hover { background: var(--st-surface-2); }
 .status-card__text { display: flex; flex-direction: column; min-width: 0; line-height: 1.3; }
 /* (a long model name wraps onto more lines - all of it shown - rather than ending in "…") */
-.status-card__text b { font-size: var(--st-fs-md); font-weight: 600; overflow-wrap: anywhere; }
+.status-card__text b { font-size: var(--st-fs-md); font-weight: 600; overflow-wrap: anywhere; text-wrap: balance; }   /* (balanced: "Qwen-3.8-Flash-Next / (CYBER-FROST) · Q5_K_M", not a break inside CYBER-FROST) */
 
 /* Saved: what the model's own API would have charged (the line above the status card, and its breakdown) */
 .saved__line { display: flex; align-items: center; gap: 10px; width: 100%; height: 36px; padding: 0 10px; border: 0; border-radius: var(--st-r-row);
@@ -121,8 +124,8 @@
 .model-menu { padding: 8px; border-radius: var(--st-r-lg); }
 .model-menu__card { display: flex; align-items: center; gap: 12px; padding: 8px 10px 12px; }
 .model-menu__card > span:last-child { display: flex; flex-direction: column; min-width: 0; line-height: 1.3; }
-.model-menu__card b { font-size: var(--st-fs-base); font-weight: 600; }
-.model-menu__card span span { font-size: var(--st-fs-xs); color: var(--st-ink-muted); overflow-wrap: anywhere; }
+.model-menu__card b { font-size: var(--st-fs-base); font-weight: 600; text-wrap: balance; }
+.model-menu__card span span { font-size: var(--st-fs-xs); color: var(--st-ink-muted); overflow-wrap: anywhere; text-wrap: balance; }
 .model-menu .menu__item { min-height: 40px; border-radius: var(--st-r-row); }
 .model-menu__meter { display: flex; align-items: center; gap: 10px; padding: 8px 10px; font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
 

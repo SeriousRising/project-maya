@@ -200,7 +200,7 @@ def tiers(m: dict, width: int):
     for color, what, k, extra in parts:
         legend.add_row(Text("■", color), Text(what, MUTED), Text(fmt(k), f"bold {INK}"), Text("experts" + extra, MUTED))
     rows = Table.grid(padding=(0, 2))
-    mm3 = eng.get("engine_kind") == "mm3"
+    mm3 = eng.get("engine_kind") in ("mm3", "qwen")   # (CYBER-FROST's Qwen path too: the CPU computes the others)
     for key, name, color, unit in TIERS_DS4 if ds4 else TIERS_MM3 if mm3 else TIERS:
         rows.add_row(Text(name, MUTED), Text.assemble((fmt(n.get(key), 2), f"bold {INK}"), (unit, MUTED)),
                      spark(h.get(key), max(8, width - 32), color=color))

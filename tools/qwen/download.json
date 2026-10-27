@@ -1,0 +1,12 @@
+{
+ "_": "CYBER-FROST-3.8-PS: Blackfrost-AI/CYBER-FROST-3.8-BF16 (a fine-tune of Qwen/Qwen3.8-Flash-Next, architecture qwen4exp) in peasantsmith's GGUF - one file, routed experts Q5_K gate/up and IQ4_NL down, the n-gram table IQ4_NL, its MTP (NextN) block inside. The `maya` engine runs it from the file in place (tools/iq_pack.py indexes it; tools/mtp_from_gguf.py builds the drafter from its NextN block). \"revision\" is the commit the file was uploaded at and the file has its sha256: the setup checks it against it. Text only (no vision tower in the repo).",
+ "name": "CYBER-FROST-3.8-PS",
+ "repo": "peasantsmith/CYBER-FROST-3.8-PS-GUFF",
+ "revision": "32867bb9e228afac427c136dd657b34b7c3f0e86",
+ "license": "Qwen Community License 1.0 (LICENSE.qwen-community-1.0)",
+ "about": "Q5_K experts (gate/up) and IQ4_NL (down), 180B parameters, 10 of 512 experts a token",
+ "memory_gb": 84,
+ "files": {
+  "CYBER-FROST-3.8-PS-GUFF-Q5_K_M.gguf": [112534603328, "1c03787fc8f5b53481213f92689e33f8ad124151e834362295458d6a89dca9c5"]
+ }
+}

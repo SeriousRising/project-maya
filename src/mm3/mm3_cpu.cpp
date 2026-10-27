@@ -23,6 +23,11 @@
 
 #include "mm3_os.hpp"
 #include "mm3_env.hpp"
+#include "mm3_lane_plan.hpp"
+
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
 #include "strata/kernels/cpu/pool.hpp"
 
@@ -136,10 +141,24 @@ CpuLane::CpuLane(int threads, int dim, int ff, float alpha, float limit, int max
     p->accd.resize((size_t) E * p->DQ * dim);
     p->yd.resize((size_t) E * dim);
     p->cores = kc::physical_cores(true);
+    // (at most one worker a core: the caller's left out, a worker more than the cores shared one with another - two
+    //  spinning workers on one CPU held every call up, 3.4 ms an expert instead of ~0.45: #552's --cpu-threads 32)
+    if (!p->cores.empty()) threads = std::min(threads, (int) p->cores.size());
     for (int i = 0; i < threads; ++i) p->th.emplace_back([this, i] { p->worker(i); });
 }
 
-int CpuLane::auto_workers() { return (int) kc::physical_cores(true).size(); }
+int CpuLane::auto_workers() {
+    const int w = (int) kc::physical_cores(true).size();
+    int logical = 0;   // (the logical CPUs this process may run on)
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof set, &set) == 0) logical = CPU_COUNT(&set);
+#endif
+    if (logical <= 0) logical = (int) std::thread::hardware_concurrency();
+    const char* v = ::mm3::env("MM3_LANE_FREE");   // (MAYA_MM3_LANE_FREE: the cores left free, 0: as before #552)
+    return lane_default_workers(w, logical, v != nullptr ? std::max(0, std::atoi(v)) : 2);
+}
 
 CpuLane::~CpuLane() {
     if (p->prof && p->calls)

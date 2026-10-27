@@ -4611,7 +4611,8 @@ int cuda_numa_node(int dev) {   // (-1: unknown)
     std::fclose(f);
     return node;
 }
-// pinned host memory on NUMA node `node` (-1: anywhere), mapped for every device (Windows: anywhere)
+// pinned host memory on NUMA node `node` (-1: anywhere; preferred, as os::anon_alloc: a full node lends the rest from
+// the others, #507), mapped for every device (Windows: anywhere)
 void* numa_pinned(size_t bytes, int node) {
 #if defined(_WIN32)
     (void) node;
@@ -4625,7 +4626,7 @@ void* numa_pinned(size_t bytes, int node) {
     if (node >= 0) {
         unsigned long mask[4] = {0, 0, 0, 0};
         mask[node / 64] = 1ul << (node % 64);
-        syscall(SYS_mbind, p, bytes, 2 /* MPOL_BIND */, mask, 256, 0);
+        syscall(SYS_mbind, p, bytes, 1 /* MPOL_PREFERRED */, mask, 256, 0);
     }
     std::memset(p, 0, bytes);
     if (cudaHostRegister(p, bytes, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {

@@ -79,10 +79,11 @@ READ = {1: 950.0, 2: 908.0, 4: 760.0, 8: 607.0, 9: 500.0}
 class Candidates(unittest.TestCase):
     def test_tp(self):
         self.assertEqual(C4.tp_candidates(NINE), [2, 4, 8, 9])
-        self.assertEqual(C4.tp_candidates([16.0, 16.0]), [2])
+        self.assertEqual(C4.tp_candidates([16.0, 16.0]), [2, 1])   # (#502: the layer split measured too, last)
         self.assertEqual(C4.tp_candidates([24.0]), [])
         self.assertEqual(C4.tp_candidates([24.0, 16.0]), [1, 2])   # (no two alike: each alone, or one group)
-        self.assertEqual(C4.tp_candidates([16.0] * 3), [2, 3])
+        self.assertEqual(C4.tp_candidates([16.0] * 3), [2, 3, 1])
+        self.assertEqual(C4.tp_candidates([24.0] * 4), [2, 4, 1])
         self.assertEqual(C4.tp_candidates([16.0] * 6), [2, 4, 6])
         self.assertEqual(C4.tp_candidates([24.0, 24.0] + [16.0] * 4), [2, 4, 6])
 
