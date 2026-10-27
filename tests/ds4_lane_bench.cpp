@@ -7,10 +7,11 @@
 // picks in RAM, how many it streams) - for a PC whose GPU cannot run the engine, what its CPU side would give.
 // --check instead: each low-bit format's expert on the CPU lane against a double reference (no GPU needed).
 //
-//   ds4_lane_bench [--threads N] [--formats mxfp4,iq2_xxs,iq2_s] (also iq3_xxs, iq3_s, iq1_s, iq1_m) [--experts 24] [--link 12] [--gpu-ms 0.03]
+//   ds4_lane_bench [--threads N] [--formats mxfp4,iq2_xxs,iq2_s] (also iq3_xxs, iq3_s, iq1_s, iq1_m, iq2_xs) [--experts 24] [--link 12] [--gpu-ms 0.03]
 #include "../src/ds4/ds4_gguf_cpu.hpp"
 #include "../src/ds4/ds4_pcie.hpp"
 #include "../src/ds4/ds4_pool.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"   // (--check: whether the exact rows passed their ggml check)
 
 #include "ggml.h"   // (--check: ggml's dequantize_row_* for the reference)
 
@@ -198,6 +199,10 @@ bool check_fmt(Lane& ln, const Experts& X, const float* x) {
     std::printf("check %s (%s / %s): CPU lane vs the double reference: gate/up %.2e, down %.2e of the largest  %s\n",
                 X.f.name.c_str(), ggml_type_name((ggml_type) X.f.tg), ggml_type_name((ggml_type) X.f.td), he, ye,
                 ok ? "ok" : "FAIL");
+    namespace kc = strata::kernels::cpu;   // (bit for bit vs ggml-cpu's dot: rows_match_ggml, else ggml's dot is used)
+    std::printf("check %s: own rows bit-identical to ggml's dot: one token %s, several tokens %s\n", X.f.name.c_str(),
+                kc::native_rows1_exact(X.f.tg) ? "yes" : "no (ggml's dot)",
+                kc::native_multi_rows_exact(X.f.tg) ? "yes" : "no (ggml's dot)");
     return ok;
 }
 
@@ -265,9 +270,9 @@ int main(int argc, char** argv) {
             X.f.dr = (size_t) FF / 32 * 17;
         } else {
             const int tg = fn == "iq2_xxs" ? 16 : fn == "iq2_s" ? 22 : fn == "iq3_xxs" ? 18 : fn == "iq3_s" ? 21
-                           : fn == "iq1_s" ? 19 : fn == "iq1_m" ? 29 : -1;
+                           : fn == "iq1_s" ? 19 : fn == "iq1_m" ? 29 : fn == "iq2_xs" ? 17 : -1;
             const int td = fn == "iq2_xxs" ? 18 : fn == "iq2_s" ? 21 : fn == "iq3_xxs" ? 21 : fn == "iq3_s" ? 21
-                           : fn == "iq1_s" ? 29 : fn == "iq1_m" ? 29 : -1;   // (IQ1: an IQ1_M down)
+                           : fn == "iq1_s" ? 29 : fn == "iq1_m" ? 29 : fn == "iq2_xs" ? 17 : -1;   // (IQ1: an IQ1_M down)
             std::string err;
             if (tg < 0 || !gg::iq_cpu_fmt(tg, td, E, FF, X.f.iq, err)) {
                 std::printf("%s: not run (%s)\n", fn.c_str(), tg < 0 ? "unknown format" : err.c_str());
