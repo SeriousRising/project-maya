@@ -147,6 +147,49 @@ void check_iq1m_tiny_activations() {
     if (bad != 0) ++failures;
 }
 
+// The int16 bound of iq_avx2's folded IQ1_M sums (8 maddubs lanes of 2 x 15 x 127 a block = +-30480, of 32767): every
+// 3-bit scale 7, grid entry 2047 (all +1), every delta bit, every activation -127.  Random codes never come near it.
+void check_iq1m_worst_case() {
+    const auto dot = ggml_get_type_traits_cpu(GGML_TYPE_IQ1_M)->vec_dot;
+    const auto* q8k = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    const size_t bb = ggml_type_size(GGML_TYPE_IQ1_M);
+    const int nt = 11;
+    int bad = 0, total = 0;
+    for (int n : {256, 5120}) {
+        const size_t rb = ggml_row_size(GGML_TYPE_IQ1_M, n), ab = ggml_row_size(GGML_TYPE_Q8_K, n);
+        std::vector<uint8_t> w(rb, 0xff);   // qs, qh and the scale fields all ones
+        for (size_t o = 0; o < rb; o += bb)   // the FP16 block scale 1.0 (0x3c00) in the scale words' high nibbles
+            for (int j = 0; j < 4; ++j) w[o + 49 + 2 * j] = (uint8_t) (0x0f | ((0x3c00 >> (4 * j)) & 15) << 4);
+        // all-equal x quantizes to -127 everywhere: the grid lanes reach -30480, the delta lanes (-1 x -127) +30480
+        const std::vector<float> xs(n, 1.0f);
+        std::vector<uint8_t> a(ab * nt);
+        std::vector<const void*> ap(nt);
+        std::vector<float> got(nt), ref(nt);
+        std::vector<float*> op(nt);
+        for (int t = 0; t < nt; ++t) {
+            q8k->from_float(xs.data(), a.data() + ab * t, n);
+            ap[t] = a.data() + ab * t;
+            op[t] = got.data() + t;
+            dot(n, &ref[t], 0, w.data(), 0, ap[t], 0, 1);
+        }
+        // 15 x 256 x (1 - 1/8) a block: proves the inputs hit the bound (not some smaller sum)
+        const float want = 3360.0f * (float) (n / 256);
+        if (std::fabs(ref[0] - want) > 1e-3f * want) {
+            std::printf("  IQ1_M worst case: ggml %.9g, not %.0f - the test's block is wrong\n", ref[0], want);
+            ++bad;
+        }
+        for (RowsFn fn : {cpu::iq256_rows, cpu::iq256_rows1})
+            for (int k : {1, 2, 5, 11}) {
+                std::fill(got.begin(), got.end(), 0.0f);
+                fn(GGML_TYPE_IQ1_M, w.data(), rb, n, ap.data(), k, op.data(), 0, 1);
+                bad += std::memcmp(got.data(), ref.data(), k * sizeof(float)) != 0;
+                ++total;
+            }
+    }
+    std::printf("  IQ1_M int16 worst case: %d runs, %d differ from ggml\n", total, bad);
+    if (bad != 0) ++failures;
+}
+
 // Padded source strides and partial/empty output ranges must not touch adjacent rows.
 void check_iq1m_row_bounds(std::mt19937& rng) {
     constexpr int rows = 7;
@@ -236,6 +279,7 @@ int main() {
     }
     if (avx2) {
         check_iq1m_tiny_activations();
+        check_iq1m_worst_case();
         check_iq1m_row_bounds(rng);
     }
     for (int t : types) check_split(t, rng);
