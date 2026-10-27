@@ -73,6 +73,10 @@ const char* mx_tier_name(int t);
 /// Whether the rows of `type` are ds4's own here (IQ3_XXS / IQ3_S on AVX2 / AVX-512 VBMI: ggml-cpu's numbers bit for
 /// bit, checked against its dot on first use; DS4_IQ_OWN=0 turns them off) rather than ggml's / the GLM lane's.
 bool iq_cpu_own_rows(int type);
+/// (DS4_RW_FLOW_CPU_CHECK) out[t][r - r0] = row_r . x[t] in F32 (double sums) for rows [r0, r1): the weights widened by
+/// ggmls to_float, the activations not rounded - the reference the CPU lanes Q8_K activations are measured against.
+void iq_cpu_rows_f32(int type, const uint8_t* w, size_t rb, int k, const float* const* x, int nt, float* const* out,
+                     int r0, int r1);
 /// IQ1_S's own multi-token rows (the same bits as ggml-cpu's dot): allowed by default; the engine turns them off where
 /// the one-GPU decode path is off (Model::Impl::one_gpu_path), so those setups keep ggml's rows as before.
 void iq_cpu_iq1s_rows(bool on);

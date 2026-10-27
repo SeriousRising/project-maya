@@ -960,6 +960,19 @@ void iq_cpu_rows(int type, const uint8_t* w, size_t rb, int k, const void* const
 }
 
 bool iq_cpu_own_rows(int type) { return own(type); }
+void iq_cpu_rows_f32(int type, const uint8_t* w, size_t rb, int k, const float* const* x, int nt, float* const* out,
+                     int r0, int r1) {
+    const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) type);
+    std::vector<float> row((size_t) k);
+    for (int r = r0; r < r1; ++r) {
+        tt->to_float(w + (size_t) r * rb, row.data(), k);
+        for (int t = 0; t < nt; ++t) {
+            double s = 0;
+            for (int i = 0; i < k; ++i) s += (double) row[(size_t) i] * x[t][i];
+            out[t][r - r0] = (float) s;
+        }
+    }
+}
 void iq_cpu_iq1s_rows(bool on) { g_iq1_on.store(on, std::memory_order_relaxed); }
 #else
 bool iq_cpu_fmt(int, int, int, int, IqCpu&, std::string& err) {
@@ -973,6 +986,7 @@ void iq_cpu_down(const IqCpu&, const uint8_t*, const void* const*, int, float* c
 int iq_cpu_act_type(int) { return -1; }
 void iq_cpu_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {}
 bool iq_cpu_own_rows(int) { return false; }
+void iq_cpu_rows_f32(int, const uint8_t*, size_t, int, const float* const*, int, float* const*, int, int) {}
 void iq_cpu_iq1s_rows(bool) {}
 #endif
 

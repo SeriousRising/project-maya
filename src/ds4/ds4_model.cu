@@ -724,6 +724,7 @@ struct Chunk {
     std::vector<uint8_t> cpu_take;           // expert -> taken by the CPU this layer
     cudaEvent_t cpu_ev = nullptr;            // the gather into cpu_x16 done
     std::vector<CpuItem> cpu_items;
+    std::vector<int> cpu_tok;                // (DS4_RW_FLOW_CPU_CHECK) each packed row's token
     std::future<void> cpu_job;
     uint64_t it_cpu = 0, cpu_rows = 0;
     double cpu_ms = 0;
@@ -1321,6 +1322,9 @@ struct Model::Impl {
     bool rw_down_wait = std::getenv("DS4_RW_DOWN_WAIT") != nullptr && std::atoi(std::getenv("DS4_RW_DOWN_WAIT")) != 0;
     // DS4_RW_FLOW_CPU=1: every flow device hands some streamed experts to the CPU lane; =2: only the slowest link's
     int rw_flow_cpu = std::getenv("DS4_RW_FLOW_CPU") ? std::atoi(std::getenv("DS4_RW_FLOW_CPU")) : 0;
+    // DS4_RW_FLOW_CPU_CHECK=1: each CPU-taken expert again in F32 (flow_cpu_check), its distance printed a layer; =2: and
+    // the F32 rows used in its place (the rest of the path then carries no CPU-lane rounding)
+    int rw_flow_cpu_check = std::getenv("DS4_RW_FLOW_CPU_CHECK") ? std::atoi(std::getenv("DS4_RW_FLOW_CPU_CHECK")) : 0;
     // shortcut: a layer's CPU rows capped (the buffers' size); the link-time balance stops far below it on this rig
     static constexpr int kFlowCpuRows = 2048;
     std::vector<double> flow_cpu_dma;        // bytes/s, measured on each device (DS4_RW_FLOW_CPU)
@@ -4284,6 +4288,13 @@ struct Model::Impl {
             gg::iq::gather_f16(c.x16, D, c.row_tok + it.a, it.n, D, c.cpu_x16 + (size_t) it.off * D, d.st);
         CK(cudaEventRecord(c.cpu_ev, d.st));
         kick(d.st);
+        if (rw_flow_cpu_check) {   // (a debug run: the rows' tokens fetched now)
+            const Chunk::CpuItem& last = c.cpu_items.back();
+            c.cpu_tok.assign((size_t) (last.off + last.n), -1);
+            CK(cudaStreamSynchronize(d.st));
+            for (const Chunk::CpuItem& it : c.cpu_items)
+                CK(cudaMemcpy(c.cpu_tok.data() + it.off, c.row_tok + it.a, (size_t) it.n * 4, cudaMemcpyDeviceToHost));
+        }
         c.cpu_job = std::async(std::launch::async, [this, &c, &l, D] {
             cudaEventSynchronize(c.cpu_ev);
             const double t0 = now_ms();
@@ -4316,9 +4327,73 @@ struct Model::Impl {
                     nr += en.n;
                 }
             flush();
+            if (rw_flow_cpu_check) flow_cpu_check(c, l);
             c.cpu_ms += now_ms() - t0;
         });
         return true;
+    }
+    // DS4_RW_FLOW_CPU_CHECK: the CPU lane's rows of the layer's taken experts (Q8_K activations) against the same expert
+    // in F32 on the same FP16-exact inputs (gg::iq_cpu_rows_f32, the lane's clamped swiglu): max |diff|, its RMS over the
+    // F32 output's, and the worst rows of tokens 0-3 (the first tokens' large activations); =2 keeps the F32 rows
+    void flow_cpu_check(Chunk& c, const Layer& l) {
+        const int E = g.dim, FF = g.ff;
+        gg::IqCpu fm;
+        std::string ferr;
+        if (NH != 1 || gg::mx_experts(l.lay) ||
+            !gg::iq_cpu_fmt(gg::expert_type(l.lay, 0), gg::expert_type(l.lay, 2), E, FF, fm, ferr)) {
+            std::fprintf(stderr, "ds4: flow CPU check: layer %d not checked (one NUMA part, low-bit experts only)\n", l.il);
+            return;
+        }
+        std::vector<float> gt((size_t) FF), ut((size_t) FF), ref((size_t) E);
+        double d_max = 0, d_ss = 0, r_ss = 0, d_early = 0, r_early = 0, w_ref = 0;
+        int w_e = -1, w_tok = -1, rows = 0;
+        for (const Chunk::CpuItem& it : c.cpu_items)
+            for (int i = 0; i < it.n; ++i) {
+                const size_t r = (size_t) (it.off + i);
+                const float* x = c.cpu_x.data() + r * E;
+                float* gp = gt.data();
+                float* up = ut.data();
+                float* rp = ref.data();
+                gg::iq_cpu_rows_f32(fm.tg, mx_part_ptr(l, it.e, 0, 0), fm.gu_row, E, &x, 1, &gp, 0, FF);
+                gg::iq_cpu_rows_f32(fm.tg, mx_part_ptr(l, it.e, 1, 0), fm.gu_row, E, &x, 1, &up, 0, FF);
+                for (int j = 0; j < FF; ++j) {
+                    float gv = gt[(size_t) j], uv = ut[(size_t) j];
+                    if (g.lim > 0.0f) {
+                        gv = std::min(gv, g.lim);
+                        uv = std::min(std::max(uv, -g.lim), g.lim);
+                    }
+                    gt[(size_t) j] = gv / (1.0f + std::exp(-gv)) * uv;
+                }
+                const float* hp = gt.data();
+                gg::iq_cpu_rows_f32(fm.td, mx_part_ptr(l, it.e, 2, 0), fm.d_row, FF, &hp, 1, &rp, 0, E);
+                float* y = c.cpu_y + r * E;
+                const int tok = c.cpu_tok[r];
+                double rm = 0, dm = 0;
+                for (int j = 0; j < E; ++j) {
+                    const double df = std::fabs((double) y[j] - (double) ref[(size_t) j]);
+                    dm = std::max(dm, df);
+                    rm = std::max(rm, (double) std::fabs(ref[(size_t) j]));
+                    d_ss += df * df;
+                    r_ss += (double) ref[(size_t) j] * ref[(size_t) j];
+                }
+                if (dm > d_max) {
+                    d_max = dm;
+                    w_e = it.e;
+                    w_tok = tok;
+                    w_ref = rm;
+                }
+                if (tok >= 0 && tok < 4 && dm > d_early) {
+                    d_early = dm;
+                    r_early = rm;
+                }
+                if (rw_flow_cpu_check == 2) std::memcpy(y, ref.data(), (size_t) E * 4);
+                ++rows;
+            }
+        std::fprintf(stderr, "ds4: flow CPU check: CUDA%d layer %d: %zu experts, %d rows: lane vs F32 max |diff| %.4g "
+                             "(expert %d, token %d, its max |F32| %.4g), RMS %.4g of the F32 output; tokens 0-3: max "
+                             "|diff| %.4g of max |F32| %.4g\n",
+                     devs[(size_t) c.dev].id, l.il, c.cpu_items.size(), rows, d_max, w_e, w_tok, w_ref,
+                     r_ss > 0 ? std::sqrt(d_ss / r_ss) : 0.0, d_early, r_early);
     }
     bool flow_cpu_finish(Dev& d, Chunk& c, const Layer& l, int T, std::string& err) {
         if (c.cpu_items.empty()) return true;
