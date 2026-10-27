@@ -707,6 +707,7 @@ struct Chunk {
     std::vector<cudaEvent_t> stage_ev, ring_fill, ring_free;   // a staging slot's DMA out; a ring slot's DMA in, its use
     int spec_k = -1, spec_il = -1, n_spec = 0;   // the likely items queued last: (chunk, layer), how many, from where
     size_t spec_begin = 0;
+    std::vector<int> spec_vs;                // their virtual slots (including CPU-computed ones, which have no flow item)
     std::vector<int> fl_layers, fl_T;        // the device's trunk layers in order; the run's chunk sizes
     int fl_yoco = -1, fl_cut_k = 0, fl_cut_r = 0;   // Run::yoco / cut_k / cut_r: what a layer's chunk streams for
     int bc_n = 0, bc_w = 0;                  // a batch's compacted bounds: bc_n regions of bc_w, by batch count
@@ -714,6 +715,15 @@ struct Chunk {
     uint64_t n_batch = 0;
     double wait_ms = 0;                      // the compute waiting for a read
     uint64_t it_file = 0, it_ram = 0, it_spec = 0, it_spec_unused = 0;
+    // DS4_RW_FLOW_CPU: the current layer's CPU-computed experts.  cpu_y packs their sorted output rows; the task runs
+    // beside this device's streamed and VRAM experts and is collected before the layer's residual is finished.
+    struct CpuItem { int e = 0, v = 0, a = 0, n = 0, off = 0; };
+    float *cpu_x = nullptr, *cpu_y = nullptr;
+    int* cpu_tok = nullptr;
+    std::vector<CpuItem> cpu_items;
+    std::future<void> cpu_job;
+    uint64_t it_cpu = 0, cpu_rows = 0;
+    double cpu_ms = 0;
     uint64_t io_d0 = 0, io_b0 = 0;           // io's unbuffered / buffered bytes when the run started
     bool buffered = false;                   // the run's reads all through the page cache (a short run: run_dev_chunks)
     // layer-major (a run of several chunks, every layer on this device): the layers one after another, each through
@@ -1173,6 +1183,7 @@ struct Model::Impl {
     std::atomic<int64_t> eg_rows_n{0}, eg_hits_n{0}, eg_reads_n{0}, eg_wait_ns{0}, eg_io_ns{0};
     uint16_t* h_emb = nullptr;        // the window's embedding rows
     std::vector<float> c_xh, c_xsb, c_acc, c_xhd, c_xsd, c_accd, c_yd;
+    std::mutex cpu_mu;                       // the lane's shared scratch and pools: one cpu_experts call at a time
     // the state
     int64_t pos = 0;
     std::vector<int32_t> toks, ctoks;
@@ -1305,6 +1316,9 @@ struct Model::Impl {
     // DS4_RW_DOWN_WAIT=1: a window of one waits for the CPU lane after its down rows, before the combine (as
     // win_experts does) - the down rows run while the CPU lane computes (the same bits)
     bool rw_down_wait = std::getenv("DS4_RW_DOWN_WAIT") != nullptr && std::atoi(std::getenv("DS4_RW_DOWN_WAIT")) != 0;
+    bool rw_flow_cpu = std::getenv("DS4_RW_FLOW_CPU") != nullptr && std::atoi(std::getenv("DS4_RW_FLOW_CPU")) != 0;
+    std::vector<double> flow_cpu_dma;        // bytes/s, measured on each device (DS4_RW_FLOW_CPU)
+    std::map<std::string, std::pair<double, double>> flow_cpu_cost;   // format -> (fixed ms, ms / prompt row)
     int async_max_t = std::getenv("DS4_ASYNC_T") ? std::atoi(std::getenv("DS4_ASYNC_T")) : 8;   // windows up to this
     // a layer on one GPU with every expert in its VRAM leaves the host out of its decode: no CPU lane part to wait
     // for, so no mailbox seq and no wait - each wait is a round trip through the host (on Windows HIP, ~1 ms a
@@ -3525,6 +3539,7 @@ struct Model::Impl {
             }
         tune_lane();   // (before calibrate_paths: its CPU-lane speed is the chosen pools')
         calibrate_paths();
+        calibrate_flow_cpu();
         lane_setup();
         one_gpu_plan();   // (#496: the one-GPU path kept only where something streams)
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
@@ -3664,6 +3679,9 @@ struct Model::Impl {
         // =0: its own room, as before)
         const bool borrow_on = file_experts && one_gpu_or("DS4_BORROW") &&
                                (std::getenv("DS4_FLOW") == nullptr || std::atoi(std::getenv("DS4_FLOW")) != 0);
+        int cpu_k = 1;
+        for (const Layer& l : L)
+            if (!l.mtp && l.nm == 1) cpu_k = std::max(cpu_k, l.k_exp);
         for (size_t di = 0; di < devs.size(); ++di) {
             Dev& d = devs[di];
             cudaSetDevice(d.id);
@@ -3721,6 +3739,10 @@ struct Model::Impl {
                 CK(cudaEventCreateWithFlags(&c.eg_ev[sl], cudaEventDisableTiming));
             }
             if (hands && !hmap(c.hand_ack, (size_t) 2 * 8 * 32, err)) return false;
+            if (c.flow && rw_flow_cpu &&
+                (!halloc(c.cpu_x, C * D, err) || !halloc(c.cpu_y, C * (size_t) cpu_k * D, err) ||
+                 !halloc(c.cpu_tok, C * (size_t) cpu_k, err)))
+                return false;
             CK(cudaStreamCreateWithFlags(&c.ar_aux.s2, cudaStreamNonBlocking));
             for (cudaEvent_t& e : c.ar_aux.ev) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
             CK(cudaStreamCreateWithFlags(&c.ar_s, cudaStreamNonBlocking));
@@ -4198,6 +4220,81 @@ struct Model::Impl {
         it.left.store(in_ram && copy_mode ? 3 * NH : 3, std::memory_order_relaxed);
         ++(in_ram ? c.it_ram : hit ? c.it_lc : c.it_file);
     }
+    bool flow_cpu_take(const Chunk& c, const Layer& l, int e, int T) const {
+        if (!rw_flow_cpu || c.lm || c.cpu_x == nullptr || l.nm != 1 || l.ram.empty() || l.ram[(size_t) e] < 0 ||
+            c.dev < 0 || (size_t) c.dev >= flow_cpu_dma.size() || !(flow_cpu_dma[(size_t) c.dev] > 0))
+            return false;
+        const auto mc = flow_cpu_cost.find(lane_fmt(l));
+        if (mc == flow_cpu_cost.end()) return false;
+        const uint32_t* pr = (o.expert_cache ? prof : prof_load).data() + (size_t) l.il * g.n_exp;
+        double sum = 0;
+        for (int q = 0; q < l.n_exp; ++q) sum += pr[q];
+        const double chance = sum > 0 ? pr[e] / sum : 1.0 / std::max(1, l.n_exp);
+        const double rows = std::max(1.0, std::min((double) T, (double) l.k_exp * T * chance));
+        const double dma = flow_cpu_dma[(size_t) c.dev];
+        const double stream_ms = 1000.0 * (double) l.blob / dma;
+        const double out_ms = 1000.0 * rows * g.dim * 4.0 / dma;
+        const double in_ms = 1000.0 * T * g.dim * 4.0 / (dma * std::max<size_t>(1, l.host_list.size()));
+        const double cpu_ms = mc->second.first + mc->second.second * rows + out_ms + in_ms;
+        return cpu_ms < stream_ms;
+    }
+    bool flow_cpu_start(Dev& d, Chunk& c, const Layer& l, int T, const std::vector<int>& b, std::string& err) {
+        if (c.cpu_job.valid()) c.cpu_job.get();
+        c.cpu_items.clear();
+        if (!rw_flow_cpu || c.lm || l.nm != 1) return true;
+        const int* vs = l.vs_pin;
+        for (int e : l.host_list) {
+            const int v = vs[e], a = b[(size_t) v], n = b[(size_t) v + 1] - a;
+            if (n > 0 && flow_cpu_take(c, l, e, T)) c.cpu_items.push_back({e, v, a, n, 0});
+        }
+        std::sort(c.cpu_items.begin(), c.cpu_items.end(), [](const Chunk::CpuItem& a, const Chunk::CpuItem& b) {
+            return a.v < b.v;
+        });
+        int rows = 0;
+        for (Chunk::CpuItem& it : c.cpu_items) {
+            it.off = rows;
+            rows += it.n;
+        }
+        if (c.cpu_items.empty()) return true;
+        CK(cudaMemcpyAsync(c.cpu_x, c.x, (size_t) T * g.dim * 4, cudaMemcpyDeviceToHost, d.st));
+        CK(cudaMemcpyAsync(c.cpu_tok, c.row_tok, (size_t) T * l.k_exp * 4, cudaMemcpyDeviceToHost, d.st));
+        CK(cudaStreamSynchronize(d.st));
+        c.cpu_job = std::async(std::launch::async, [this, &c, &l] {
+            const double t0 = now_ms();
+            std::vector<Ent> ents(1);
+            for (const Chunk::CpuItem& it : c.cpu_items) {
+                for (int p = 0; p < it.n; p += kc::kExl3CpuMaxN) {
+                    Ent& en = ents[0];
+                    en.e = it.e;
+                    en.slot0 = 0;
+                    en.n = std::min((int) kc::kExl3CpuMaxN, it.n - p);
+                    for (int i = 0; i < en.n; ++i) en.tok[i] = c.cpu_tok[it.a + p + i];
+                    std::lock_guard<std::mutex> lk(cpu_mu);
+                    cpu_experts_unlocked(l, c.cpu_x, ents, (size_t) g.dim, nullptr);
+                    std::memcpy(c.cpu_y + (size_t) (it.off + p) * g.dim, c_yd.data(),
+                                (size_t) en.n * g.dim * 4);
+                }
+            }
+            c.cpu_ms += now_ms() - t0;
+        });
+        return true;
+    }
+    bool flow_cpu_finish(Dev& d, Chunk& c, const Layer& l, int T, std::string& err) {
+        if (c.cpu_items.empty()) return true;
+        c.cpu_job.get();
+        for (const Chunk::CpuItem& it : c.cpu_items) {
+            CK(cudaMemcpyAsync(c.y, c.cpu_y + (size_t) it.off * g.dim, (size_t) it.n * g.dim * 4,
+                               cudaMemcpyHostToDevice, d.st));
+            moe_combine(c.acc, c.y, c.pos, c.rw, T, l.k_exp, it.a, it.a + it.n, g.dim, d.st);
+            c.it_cpu += 1;
+            c.cpu_rows += (uint64_t) it.n;
+            st.cpu_experts += it.n;
+        }
+        c.cpu_items.clear();
+        kick(d.st);
+        return true;
+    }
+
     // the likely experts of (chunk k, layer il) for T tokens, first in its stream: the CPU lane's experts whose chance
     // to be picked at least once, 1 - (1 - share)^(picks), is at least DS4_SPEC_Q (0.9: the reads are what takes the
     // time, an unpicked one costs a whole read, and the routing is known a few ms after the layer before is done -
@@ -4215,6 +4312,7 @@ struct Model::Impl {
         c.spec_k = k;
         c.spec_il = il;
         c.spec_begin = c.base + c.items.size();
+        c.spec_vs.clear();
         // (the likely ones lead the layer's virtual slots, and the experts' outputs are summed in that order: with
         //  --no-expert-cache from the profile as loaded, not the hits this process added since)
         const uint32_t* pr = (o.expert_cache ? prof : prof_load).data() + (size_t) il * g.n_exp;
@@ -4247,7 +4345,10 @@ struct Model::Impl {
         }
         for (int e : l.host_list)
             if (!is[(size_t) e]) vs[e] = l.pv_n + j++;
-        for (const auto& x : cand) flow_push(c, l, mi, k, x.second, vs[x.second]);
+        for (const auto& x : cand) {
+            c.spec_vs.push_back(vs[x.second]);
+            if (!flow_cpu_take(c, l, x.second, T)) flow_push(c, l, mi, k, x.second, vs[x.second]);
+        }
         c.n_spec = (int) cand.size();
         c.it_spec += cand.size();
     }
@@ -4255,14 +4356,14 @@ struct Model::Impl {
     void flow_rest(Chunk& c, int k, int il, const std::vector<int>& b) {
         const Layer& l = L[(size_t) il];
         const int mi = flow_mi(c, l);
+        const int T = fl_rows(c, k, il);
         const int* vs = member(l, mi).vs_pin;
-        for (size_t i = c.spec_begin; i < c.spec_begin + (size_t) c.n_spec; ++i) {
-            const int v = fit(c, i).v;
+        for (int v : c.spec_vs)
             if (b[(size_t) v + 1] == b[(size_t) v]) ++c.it_spec_unused;
-        }
         for (int e : l.host_list) {   // (index order: their virtual slots ascending)
             const int v = vs[e];
-            if (v >= l.pv_n + c.n_spec && b[(size_t) v + 1] > b[(size_t) v]) flow_push(c, l, mi, k, e, v);
+            if (v >= l.pv_n + c.n_spec && b[(size_t) v + 1] > b[(size_t) v] && !flow_cpu_take(c, l, e, T))
+                flow_push(c, l, mi, k, e, v);
         }
     }
     // the next (chunk, layer) of the device after (k, il) in the run's order that streams experts (false: none) - a
@@ -4427,6 +4528,7 @@ struct Model::Impl {
         const size_t lb = c.spec_begin, le = c.base + c.items.size(), n_lay = le - lb;
         int k2 = 0, il2 = 0;
         if (flow_next(c, k, L0.il, k2, il2)) flow_spec(c, k2, il2, fl_rows(c, k2, il2));
+        if (!flow_cpu_start(d, c, L0, T, b, err)) return false;
         const size_t R = (size_t) c.ring_n, bmax = std::max<size_t>(1, R / 2);
         int v_done = 0;
         while (c.n_comp < le) {
@@ -4468,6 +4570,7 @@ struct Model::Impl {
             v_done = v_to;
         }
         if (!run_vram(d, c, L0, vx, vx, b.data(), v_done, L0.pv_n, T, err)) return false;
+        if (!flow_cpu_finish(d, c, L0, T, err)) return false;
         while (c.base < c.n_comp && c.items.size() > 4096) {   // (done with: read, copied and used)
             c.items.pop_front();
             ++c.base;
@@ -7604,6 +7707,11 @@ struct Model::Impl {
     std::atomic<uint64_t> cpu_job_ns[4] = {}, cpu_job_n[4] = {};
     void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx = 0,
                      const int* ord = nullptr) {
+        std::lock_guard<std::mutex> lk(cpu_mu);
+        cpu_experts_unlocked(l, x, ents, ldx, ord);
+    }
+    void cpu_experts_unlocked(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx,
+                              const int* ord) {
         if (ldx == 0) ldx = (size_t) g.dim;
         static const bool stats = std::getenv("DS4_CPU_STATS") != nullptr;
         double tph = stats ? now_ms() : 0.0;
@@ -11665,12 +11773,31 @@ struct Model::Impl {
 
     // a chunk's hand-off between groups: h | pre | topk | cand of a chunk of T rows
     Xfer chunk_xfer(uint8_t* host, Chunk& c, int T, bool put) const {
+        static const bool bf16 = std::getenv("DS4_RW_HANDOFF_BF16") != nullptr &&
+                                 std::atoi(std::getenv("DS4_RW_HANDOFF_BF16")) != 0;
         const size_t nh = (size_t) T * g.hc * g.dim * 4, np = (size_t) T * 8 * 4, nk = (size_t) T * topk_stride() * 4,
                      nc = (size_t) T * cand_stride() * 4;
+        Xfer x;
+        if (bf16 && !c.lm) {
+            const size_t hb = nh / 2;
+            void* dv[3] = {c.pre, c.topk, c.cand};
+            uint8_t* hv[3] = {host + hb, host + hb + np, host + hb + np + nk};
+            const size_t nb[3] = {np, nk, nc};
+            x.n = 3;
+            for (int i = 0; i < 3; ++i) {
+                x.src[i] = put ? (const void*) dv[i] : (const void*) hv[i];
+                x.dst[i] = put ? (void*) hv[i] : dv[i];
+                x.bytes[i] = nb[i];
+            }
+            x.bf16_src = c.h;
+            x.bf16_dst = c.h;
+            x.bf16_host = (uint16_t*) host;
+            x.bf16_n = nh / 4;
+            return x;
+        }
         void* dv[4] = {c.h, c.pre, c.topk, c.cand};
         uint8_t* hv[4] = {host, host + nh, host + nh + np, host + nh + np + nk};
         const size_t nb[4] = {nh, np, nk, nc};
-        Xfer x;
         x.n = 4;
         for (int i = 0; i < 4; ++i) {
             x.src[i] = put ? (const void*) dv[i] : (const void*) hv[i];
@@ -11843,6 +11970,10 @@ struct Model::Impl {
     bool run_dev_chunks(int di, const Run& run, std::string& err) {
         Dev& d = devs[(size_t) di];
         Chunk& c = *chunks[(size_t) di];
+        struct CpuJoin {
+            Chunk& c;
+            ~CpuJoin() { if (c.cpu_job.valid()) c.cpu_job.get(); }
+        } cpu_join{c};
         cudaSetDevice(d.id);
         cudaStream_t s = d.st;
         const int D = g.dim, H = g.hc, nk = (int) run.T.size();
@@ -11866,6 +11997,8 @@ struct Model::Impl {
             c.fl_cut_r = run.cut_r;
             c.spec_k = c.spec_il = -1;
             c.wait_ms = 0;
+            c.cpu_ms = 0;
+            c.it_cpu = c.cpu_rows = 0;
             c.it_file = c.it_ram = c.it_spec = c.it_spec_unused = c.it_lc = 0;
             c.lc_il = -1;
             c.lc_used = 0;
@@ -12071,6 +12204,79 @@ struct Model::Impl {
         }
         S.report_prefill(d.id, std::accumulate(run.T.begin(), run.T.end(), 0), chunk, c.stream_bytes - stream_start);
         return true;
+    }
+
+    // DS4_RW_FLOW_CPU: measure every flow device's own link and the CPU lane at prompt-shaped (eight-row) entries.
+    // The selection uses these costs, not the first device's one-token calibration used by pick_path.
+    void calibrate_flow_cpu() {
+        flow_cpu_dma.assign(devs.size(), 0.0);
+        if (!rw_flow_cpu) return;
+        for (size_t di = 0; di < chunks.size(); ++di) {
+            if (chunks[di] == nullptr || !chunks[di]->flow) continue;
+            Chunk& c = *chunks[di];
+            Dev& d = devs[di];
+            cudaSetDevice(d.id);
+            const size_t nb = std::min({(size_t) 64 << 20, (size_t) c.S * c.stage_stride,
+                                       (size_t) c.ring_n * c.ring_stride});
+            if (nb == 0) continue;
+            double best = 1e30;
+            for (int rep = 0; rep < 3; ++rep) {
+                const double a = now_ms();
+                if (cudaMemcpyAsync(c.ring, c.stage, nb, cudaMemcpyHostToDevice, c.cs) != cudaSuccess ||
+                    cudaStreamSynchronize(c.cs) != cudaSuccess) {
+                    cudaGetLastError();
+                    break;
+                }
+                if (rep > 0) best = std::min(best, now_ms() - a);
+            }
+            if (best < 1e29) flow_cpu_dma[di] = (double) nb / std::max(1e-3, best / 1000.0);
+        }
+        std::map<std::string, const Layer*> repr;
+        for (const Layer& l : L) {
+            if (l.mtp || l.nm != 1 || l.lay.fmt != gg::kFmtMXFP4) continue;
+            int nr = 0;
+            for (int e : l.host_list)
+                if (!l.ram.empty() && l.ram[(size_t) e] >= 0) ++nr;
+            if (nr >= 4 && repr.find(lane_fmt(l)) == repr.end()) repr[lane_fmt(l)] = &l;
+        }
+        for (const auto& kv : repr) {
+            const Layer& l = *kv.second;
+            std::vector<int> ex;
+            for (int e : l.host_list)
+                if (!l.ram.empty() && l.ram[(size_t) e] >= 0 && ex.size() < 4) ex.push_back(e);
+            std::vector<float> x((size_t) 8 * g.dim);
+            for (size_t i = 0; i < x.size(); ++i) x[i] = 0.02f * std::sin(0.37f * (float) i);
+            auto timed = [&](int rows) {
+                std::vector<Ent> ents;
+                for (size_t i = 0; i < ex.size(); ++i) {
+                    Ent en;
+                    en.e = ex[i];
+                    en.n = rows;
+                    en.slot0 = (int) i * rows;
+                    for (int j = 0; j < rows; ++j) en.tok[j] = j;
+                    ents.push_back(en);
+                }
+                cpu_experts(l, x.data(), ents, (size_t) g.dim);
+                double best = 1e30;
+                for (int rep = 0; rep < 2; ++rep) {
+                    const double a = now_ms();
+                    cpu_experts(l, x.data(), ents, (size_t) g.dim);
+                    best = std::min(best, now_ms() - a);
+                }
+                return best / (double) ex.size();
+            };
+            const double t1 = timed(1), t8 = timed(8);
+            const double slope = std::max(0.0, (t8 - t1) / 7.0), fixed = std::max(0.0, t1 - slope);
+            flow_cpu_cost[kv.first] = {fixed, slope};
+            if (o.verbose)
+                std::fprintf(stderr, "ds4: rw-09 prompt CPU %s: %.3f + %.3f ms/row (one row %.3f, eight %.3f ms)\n",
+                             kv.first.c_str(), fixed, slope, t1, t8);
+        }
+        if (o.verbose)
+            for (size_t di = 0; di < chunks.size(); ++di)
+                if (chunks[di] != nullptr && chunks[di]->flow)
+                    std::fprintf(stderr, "ds4: rw-09 prompt CPU on CUDA%d: link %.2f GB/s\n", devs[di].id,
+                                 flow_cpu_dma[di] / 1e9);
     }
 
     // ---- a prompt's path: the flow or windows of 16
@@ -12885,11 +13091,12 @@ struct Model::Impl {
                              "ds4 prompt stream, CUDA%d: %d tokens in %.0f ms; %llu experts streamed: %llu from the files "
                              "(%.1f GB, %.2f GB/s: %.1f GB from the disk unbuffered, %.1f GB through the page cache), %llu "
                              "from RAM (%.1f GB)%s; %llu likely ones queued early, %llu of them unpicked; the compute waited "
-                             "%.0f ms for reads\n",
+                             "%.0f ms for reads; %llu experts on the CPU (%llu rows, %.0f ms)\n",
                              devs[di].id, n, ms, (unsigned long long) (c.it_file + c.it_ram + c.it_lc),
                              (unsigned long long) c.it_file, fb, fb / std::max(1e-3, ms / 1000.0), db, bb,
                              (unsigned long long) c.it_ram, rb, lcs, (unsigned long long) c.it_spec,
-                             (unsigned long long) c.it_spec_unused, c.wait_ms);
+                             (unsigned long long) c.it_spec_unused, c.wait_ms, (unsigned long long) c.it_cpu,
+                             (unsigned long long) c.cpu_rows, c.cpu_ms);
             }
         }
         if (pm.on && run.T.size() == 1) {   // (the picks' spread for pick_path: the CPU-lane experts this run picked)
