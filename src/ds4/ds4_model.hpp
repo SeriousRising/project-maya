@@ -85,6 +85,9 @@ struct Stats {
     int64_t ahead_cold = 0, ahead_cold_hit = 0, ahead_pf = 0;
     int64_t ahead_rank_n[16] = {}, ahead_rank_hit[16] = {};   // the next-layer guesses by rank, and how many were picked
     int64_t drafts_offered = 0, drafts_accepted = 0, drafts_rounds = 0;
+    int64_t verify_rounds = 0;   // the verification windows (a drafter pass without one: every draft cut)
+    int64_t draft_p1_skips = 0;   // drafter passes left out: the trunk's last pick unsure (DS4_RW_DRAFT_P1)
+    int64_t draft_head_rows = 0;   // rows of the drafter's block through the head (DS4_RW_DRAFT_LAZY: only those the cut needs)
     // per draft position (the 1st .. 8th of a round): verified with all the drafts before it accepted, and accepted
     int64_t draft_reached[8] = {}, draft_kept[8] = {};
     double draft_ms = 0.0, verify_ms = 0.0;   // the drafter's time, the verification windows' time
@@ -122,8 +125,15 @@ public:
     /// DeepSeek's reference does.  verify() keeps a draft d with probability min(1, p(d) / q(d)) over the request's
     /// chain - the speculative-sampling rule, so every token is still distributed as the model's own draw.
     int draft_block() const;
+    /// DS4_RW_DRAFT_P1=θ: true (counted) when the trunk's last pick had a top probability under θ - the round does
+    /// without the drafter.  Always false without the switch.
+    bool draft_unsure();
+    /// max_n / conf_min / cum_min: the caller's cut (at most max_n drafts - 0: any -, kept while each confidence is
+    /// at least conf_min and their running product at least cum_min); the drafts past the first one it cuts may be
+    /// left out (fewer returned), those before it are the same.
     bool draft(int y, std::vector<int>& drafts, std::vector<float>& conf, std::string& err, float temperature = 0.0f,
-               float top_p = 1.0f, int top_k = 0, float min_p = 0.0f, uint64_t seed = 0, uint64_t counter = 0);
+               float top_p = 1.0f, int top_k = 0, float min_p = 0.0f, uint64_t seed = 0, uint64_t counter = 0,
+               int max_n = 0, float conf_min = 0.0f, float cum_min = 0.0f);
     bool verify(int y, const std::vector<int>& drafts, float temperature, float top_p, int top_k, float min_p,
                 uint64_t seed, uint64_t counter, int& accepted, int& next, std::string& err);
 

@@ -316,6 +316,8 @@ void markov_pick(const unsigned* slots, int nm, unsigned seq, int* tok, const ui
 /// The DSpark confidence: out[t] = sigmoid(w . [x[t] | E[tok[t]]]) (x rows dim floats, w F32 [dim + R]).
 void confidence(const float* x, const uint16_t* E, const int* tok, const float* w, int T, int dim, int R, float* out,
                 cudaStream_t s);
+/// out[t] = the softmax's largest probability of logits row t (T rows of V).
+void top1_prob(const float* logits, int T, int V, float* out, cudaStream_t s);
 
 /// The pipeline's hand-offs and tensor parallelism, through host-mapped memory (these cards copy peer to peer only
 /// through the driver's staging).  xfer_put copies up to 4 segments (any size and alignment: each in 16-byte units
