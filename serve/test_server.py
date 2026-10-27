@@ -765,7 +765,7 @@ class SseBursts(unittest.TestCase):
                         (self.SPECIALS[t - 256].encode() if t >= 256 else bytes([t]))
                 return raw.decode("utf-8", errors=errors)
 
-        script = "burst through the real engine queue. " * 6
+        script = " ".join(f"burst{i}" for i in range(40)) + " "   # (no repeats: the loop guard would end a loop)
         ids = list(script.encode())
         engine = StrataEngine(str(ROOT / "serve/fake_multi_engine.py"), ["1"],
                               env={**os.environ, "FAKE_MULTI_BURST": "16"})

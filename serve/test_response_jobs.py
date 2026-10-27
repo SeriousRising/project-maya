@@ -251,7 +251,7 @@ class BackgroundResponses(ResponseCase):
         self.assertLessEqual(self.svc.response_jobs.stats()["event_bytes"], 4096)
         self.script(" ".join(f"word{i}" for i in range(800)))   # (5000+ bytes and no loop: the loop guard ends one)
         _, initial = self.post(background=True, store=True)
-        out = self.wait(initial["id"])
+        out = self.wait(initial["id"], timeout=60)   # (ByteTokenizer re-decodes every id per token: ~5 s for these 6K)
         self.assertEqual(out["status"], "failed")
         self.assertIn("limit", out["error"]["message"])
 
