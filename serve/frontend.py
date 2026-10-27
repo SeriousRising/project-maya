@@ -460,6 +460,14 @@ def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], l
         for message in messages:
             if message.get("role") == "developer":
                 message["role"] = "system"
+            rc = message.get("reasoning_content")
+            if rc == " ":
+                # rw-13: exactly Hermes's " " pad (its must-echo tier sends it for a history turn with no
+                # reasoning text), not reasoning the model produced - the model can write whitespace of
+                # its own (a "<think>\n\n</think>" turn), and that must re-render as sent.  The pad,
+                # rendered literally, puts a space where the engine holds an empty think block, breaking
+                # prompt-prefix reuse there.
+                message.pop("reasoning_content", None)
             if _has_media(message.get("content")):
                 message["content"] = _parts_of(message["content"])
             for call in message.get("tool_calls") or []:
@@ -481,7 +489,10 @@ def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], l
         # Unlike the legacy adapter, preserve tool IDs, namespaces, content_blocks,
         # mid-system roles, latest_reminder and task fields for the reference encoder.
         declared = copy.deepcopy(req.get("tools") or [])
-        tools = tools_from_openai_format(declared) if declared else None
+        # rw-13: same stabilization as the legacy branch - the encoder renders tools at the prompt's head,
+        # so a client's registration-order swap would otherwise break the engine's prompt-prefix reuse.
+        # tools_from_openai_format already returns flat dicts keyed by the namespace-qualified name.
+        tools = stable_tool_order(tools_from_openai_format(declared)) if declared else None
         if req.get("tool_choice") == "none":
             tools = None
             for message in messages:
@@ -591,8 +602,7 @@ def anthropic_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict]
             messages.append(out)
     tools = [{"name": t["name"], "description": t.get("description", ""),
               "parameters": t.get("input_schema", {})} for t in req.get("tools") or []] or None
-    if not deepseek:
-        tools = stable_tool_order(tools)
+    tools = stable_tool_order(tools)   # rw-13: DeepSeek renders tools at the prompt's head too
     if isinstance(req.get("tool_choice"), dict) and req["tool_choice"].get("type") == "none":
         tools = None
     kwargs = {}
@@ -1025,6 +1035,7 @@ class OutputParser:
         # both send JSON values, so the parser takes them without the tools' schemas
         self.dsml = DsmlRewriter() if dsml else MinimaxRewriter(tools) if minimax else None
         self.buf = ""
+        self._call_resume = 0        # rw-13: where the CALL_END search in call state resumes (see _feed)
         self.lead = False
         self.schemas = {} if dsml or minimax else {t.get("name"): t for t in tools or []}
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
@@ -1307,8 +1318,14 @@ class OutputParser:
                     out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
                 self.buf = self.buf[i + len(CALL_START):]
                 self.state = "call"
+                self._call_resume = 0
             else:
-                i = self.buf.find(CALL_END)
+                # rw-13: the body accumulates in buf until the call closes, so searching from 0 every
+                # delta is O(body) per token.  In call state buf only grows, and a failed search over
+                # L chars rules out every start position up to L - len(CALL_END): resume there.
+                i = self.buf.find(CALL_END, self._call_resume)
+                if i < 0:
+                    self._call_resume = max(0, len(self.buf) - len(CALL_END) + 1)
                 complete = True
                 if self.stream_tools:
                     if i >= 0:

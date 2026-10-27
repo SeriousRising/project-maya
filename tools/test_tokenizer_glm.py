@@ -142,6 +142,42 @@ class PlainSpans(unittest.TestCase):
         self.assertEqual(self.tk.encode(text, parse_special=True, plain=[]), self.tk.encode(text, parse_special=True))
 
 
+class SegmentCacheTest(unittest.TestCase):
+    """rw-13: the segment cache must see normal-sized messages.  Most spans between special tokens in an
+    agent conversation (short user turns, tool calls, small tool results) are well under the old 2048-char
+    floor, so they were re-tokenized from scratch on every re-sent turn."""
+
+    def setUp(self):
+        tokens, merges = tiny_vocab()
+        self.tk = Tokenizer(tokens, merges, pre="glm5")
+        self.segment = ("The quick brown fox jumps over the lazy dog. " * 14)[:600]
+        assert 256 <= len(self.segment) < 2048
+
+    def test_medium_segment_is_cached_and_identical(self):
+        plain = self.tk._encode_plain(self.segment)
+        first = self.tk._encode_segment(self.segment)
+        self.assertEqual(first, plain)
+        cache = self.tk.__dict__.get("_seg_cache") or {}
+        self.assertIn(self.segment, cache)
+        self.assertEqual(list(cache[self.segment]), plain)
+        calls = []
+        orig = self.tk._encode_plain
+        self.tk._encode_plain = lambda t: (calls.append(t), orig(t))[1]
+        try:
+            second = self.tk._encode_segment(self.segment)
+        finally:
+            self.tk._encode_plain = orig
+        self.assertEqual(second, plain)
+        self.assertEqual(calls, [])          # served from the cache, not re-encoded
+        second.append(-1)                    # a hit hands back a copy: mutating it must not poison the cache
+        self.assertEqual(list(cache[self.segment]), plain)
+
+    def test_tiny_segment_stays_uncached(self):
+        tiny = "short one"
+        self.assertEqual(self.tk._encode_segment(tiny), self.tk._encode_plain(tiny))
+        self.assertNotIn(tiny, self.tk.__dict__.get("_seg_cache") or {})
+
+
 class PreSchemeGuard(unittest.TestCase):
     def test_unknown_scheme_refused(self):
         with self.assertRaises(ValueError):
