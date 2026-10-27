@@ -255,12 +255,16 @@ function modelDisplayName(id) {
     return lw.charAt(0).toUpperCase() + lw.slice(1);
   }).join(" ");
 }
+// the model with its files when the setup wrote the config ("MiniMax M3.1 · Maya-XS": the model first, never a bare
+// tier - the server's model_label), else its id as people write it; the API's model id on hover
 function renderModelLine() {
   const ctx = health.max_context ? `${ctxfmt(health.max_context)} context` : "";
   const ver = health.version ? `v${health.version}` : "";
+  const name = health.model_label || modelDisplayName(health.model);
   $("side-model").innerHTML = `${modelLogo(health.model)}<span class="side__model-text" title="${esc(health.model)}">` +
-                              `<b>${esc(modelDisplayName(health.model))}</b>${esc([ctx, ver].filter(Boolean).join(" · "))}</span>`;
-  $("chat-empty-model").textContent = [health.model, ctx, ver ? `Project Maya ${ver}` : ""].filter(Boolean).join(" · ");
+                              `<b>${esc(name)}</b>${esc([ctx, ver].filter(Boolean).join(" · "))}</span>`;
+  $("chat-empty-model").textContent = [health.model_label || health.model, ctx, ver ? `Project Maya ${ver}` : ""]
+    .filter(Boolean).join(" · ");
 }
 
 // ------------------------------------------------------------------ Monitor
@@ -663,7 +667,8 @@ function render(m) {
   if (tab === "monitor") {
     renderBanners(m);
     const gpuEach = renderGpuMap(m.gpu_map, m);
-    renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, gpuEach);
+    renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals && {...m.totals, loop_guard: m.loop_guard},
+                  m.requests_kept, gpuEach);
     renderTiers(m.tiers, eng);
     renderHero(live, h, last, eng, m.tiers, m.totals);
   }
@@ -693,9 +698,11 @@ function renderBanners(m) {
 // the Monitor's hero: the speed (now, else the last request), its sparkline and four headline numbers
 function renderHero(live, h, last, eng, tiers, totals) {
   const gen = live.state === "generating";
-  const speed = gen ? live.tok_s : last ? last.decode_tok_s : null;
+  const many = live.active > 1;                  // several running: their total, the graph's newest point
+  const speed = many ? (h.tok_s || []).at(-1) : gen ? live.tok_s : last ? last.decode_tok_s : null;
   $("hero-speed").textContent = speed == null ? "–" : fmt(speed, 1);
-  $("hero-speed-sub").textContent = "decode · " + (gen ? "writing now" : live.state === "reading" ? "reading the prompt"
+  $("hero-speed-sub").textContent = "decode · " + (many ? `${live.writing} writing` : gen ? "writing now"
+                                    : live.state === "reading" ? "reading the prompt"
                                     : last ? "last request" : "waiting for a request");
   // prefill: the engine's rate over the tokens it read (not the reused prefix), live while a request runs
   const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
@@ -729,8 +736,12 @@ function renderTotals(t) {
   const read = t.prompt_tokens - t.reused;
   const pSpeed = t.prompt_ms > 0 && read > 0 ? ` at ${fmt(read / (t.prompt_ms / 1000))} tok/s` : "";
   const oSpeed = t.decode_ms > 0 && t.output_tokens > 0 ? ` at ${fmt(t.output_tokens / (t.decode_ms / 1000), 1)} tok/s` : "";
+  // the loop guard: how many loops it broke (the request rows say where and how), or that it is off
+  const lg = t.loop_guard || {};
+  const loops = lg.detected ? ` · loop guard: ${fmt(lg.detected)} loop${lg.detected === 1 ? "" : "s"} broken`
+              : lg.on === false ? " · loop guard off" : "";
   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
-         `${fmt(t.output_tokens)} written${oSpeed}`;
+         `${fmt(t.output_tokens)} written${oSpeed}${loops}`;
 }
 const API_NAMES = {web: "Chat", openai: "OpenAI", anthropic: "Anthropic"};
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, gpuEach) {
@@ -824,10 +835,12 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, gpuEa
       const [cls, text] = badges[r.finish] || ["", r.finish || "–"];
       const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
       const api = r.api ? ` <span class="chip chip--xs">${esc(API_NAMES[r.api] || r.api)}</span>` : "";
+      const loop = r.loop_guard && r.loop_guard.length   // (what the loop guard did in this answer: on hover)
+        ? ` <span class="chip chip--xs" title="${esc(r.loop_guard.join("\n"))}">Loop guard</span>` : "";
       const hit = r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%`;
       const pre = r.prefill_tok_s != null ? r.prefill_tok_s
                 : r.prompt_ms > 0 && r.prompt_tokens > (r.reused || 0) ? (r.prompt_tokens - (r.reused || 0)) / (r.prompt_ms / 1000) : null;
-      return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${api}</td><td class="num">${fmt(r.prompt_tokens)}</td>
+      return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${api}${loop}</td><td class="num">${fmt(r.prompt_tokens)}</td>
         <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(pre)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
         <td class="num">${hit}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
     }).join("");
