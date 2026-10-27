@@ -1,4 +1,5 @@
-"""Reject GLM-only concurrency options before changing another model's config; no GPU needed."""
+"""--parallel: GLM-5.3-Flash and DeepSeek take it, MiniMax is rejected before its config changes, and DeepSeek before
+a calibration; no GPU needed."""
 import json
 import os
 from pathlib import Path
@@ -42,30 +43,28 @@ class ParallelOptionTests(unittest.TestCase):
         self.path.write_text(json.dumps(cfg), encoding="utf-8")
         return cfg
 
-    def test_start_rejects_parallel_before_mutating_non_glm_config(self):
-        for family in ("deepseek", "minimax"):
-            for parallel in (1, 4):
-                with self.subTest(family=family, parallel=parallel):
-                    self.config(family)
-                    self.args.parallel = parallel
-                    before = self.path.read_bytes()
-                    with patch.object(maya, "rename_programs") as rename, \
-                            self.assertRaises(SystemExit):
-                        maya.server_command(self.path, self.args)
-                    rename.assert_not_called()
-                    self.assertEqual(self.path.read_bytes(), before)
-                    self.mocks["refresh_engine"].assert_not_called()
+    def test_start_rejects_parallel_before_mutating_minimax_config(self):
+        for parallel in (1, 4):
+            with self.subTest(parallel=parallel):
+                self.config("minimax")
+                self.args.parallel = parallel
+                before = self.path.read_bytes()
+                with patch.object(maya, "rename_programs") as rename, \
+                        self.assertRaises(SystemExit):
+                    maya.server_command(self.path, self.args)
+                rename.assert_not_called()
+                self.assertEqual(self.path.read_bytes(), before)
+                self.mocks["refresh_engine"].assert_not_called()
 
-    def test_legacy_deepseek_config_is_rejected_without_rewriting_it(self):
-        cfg = self.config("deepseek")
-        cfg.pop("installer")
-        cfg["exe"] = str(self.root / "strata-ds4")
-        self.path.write_text(json.dumps(cfg), encoding="utf-8")
-        before = self.path.read_bytes()
-        with patch.object(maya, "rename_programs") as rename, self.assertRaises(SystemExit):
-            maya.server_command(self.path, self.args)
-        rename.assert_not_called()
-        self.assertEqual(self.path.read_bytes(), before)
+    def test_deepseek_start_saves_parallel_once(self):
+        self.config("deepseek")
+        for parallel in (4, 2):
+            self.args.parallel = parallel
+            with patch.object(maya, "rename_programs"):
+                maya.server_command(self.path, self.args)
+            args = maya.read_json(self.path)["args"]
+            self.assertEqual(args.count("--parallel"), 1)
+            self.assertEqual(args[args.index("--parallel") + 1], str(parallel))
 
     def test_non_glm_start_without_parallel_is_unchanged(self):
         self.args.parallel = None
@@ -87,14 +86,18 @@ class ParallelOptionTests(unittest.TestCase):
             self.assertEqual(args.count("--parallel"), 1)
             self.assertEqual(args[args.index("--parallel") + 1], str(parallel))
 
-    def test_setup_rejects_parallel_before_non_glm_setup(self):
-        for family, setup_name in (("deepseek", "set_up_ds4"), ("minimax", "set_up_mm3")):
-            with self.subTest(family=family), \
-                    patch.object(maya, "choose_family", return_value=family), \
-                    patch.object(maya, setup_name, return_value=None) as setup, \
-                    self.assertRaises(SystemExit):
-                maya.set_up(self.args, {"installer": {"family": family}})
-            setup.assert_not_called()
+    def test_setup_rejects_parallel_before_minimax_setup(self):
+        with patch.object(maya, "choose_family", return_value="minimax"), \
+                patch.object(maya, "set_up_mm3", return_value=None) as setup, \
+                self.assertRaises(SystemExit):
+            maya.set_up(self.args, {"installer": {"family": "minimax"}})
+        setup.assert_not_called()
+
+    def test_setup_takes_parallel_for_deepseek(self):
+        with patch.object(maya, "choose_family", return_value="deepseek"), \
+                patch.object(maya, "set_up_ds4", return_value=None) as setup:
+            maya.set_up(self.args, {"installer": {"family": "deepseek"}})
+        setup.assert_called_once()
 
     def test_cli_rejects_parallel_before_calibration(self):
         for family in ("deepseek", "minimax"):

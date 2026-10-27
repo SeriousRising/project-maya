@@ -67,6 +67,9 @@ struct Finish {
 /// a packed FP4 row's bytes (Finish::pdst): len / 2 of codes, a scale byte a group (quant 2: 16 values, quant 3: 32)
 constexpr size_t fp4_row_bytes(int len, int quant) { return (size_t) len / 2 + (size_t) len / (quant == 2 ? 16 : 32); }
 void finish(float* x, int n_vec, int len, long long stride, const Finish& f, cudaStream_t s);
+/// The same with a position a row: v belongs to row v / vpp, at pos_row[row]; pos_row null: as finish
+/// (pos + (v / vpp) * pos_step).  A row group's q (vpp = heads), iq (vpp = ix_heads), kv (vpp = 1), o (vpp = heads).
+void finish_rows(float* x, int n_vec, int len, long long stride, const Finish& f, const int* pos_row, cudaStream_t s);
 
 /// Hyper-Connections, row t of each [T][..] array: mixes[t][m] = (h_flat . fn[m]) * rsqrt(mean(h_flat^2) + eps), then
 /// pre / post / comb as hc_split_sinkhorn (comb[t][j * hc + k], j the source stream, k the destination).  Strides: mixes
@@ -207,9 +210,13 @@ void cand_blocks(const float* score, long long stride, int T, const Rows& r, int
 /// a scratch, heads_per_block 0; or -1, any T) decoded once a query into scr's BF16 rows for the BF16 rows' kernel;
 /// else a kernel that decodes each staged row once for heads_per_block heads of a query (1, 2, 4, 8; 0: as many as
 /// keep two blocks a multiprocessor).
+constexpr int kAttnSplitKMax = 8;   // split-K chunks at most (decode scratch path)
+constexpr int kAttnSplitVals = 514;  // floats an entry: m, den, o[512] (values, not rows)
 struct AttnScratch {
     uint16_t* rows = nullptr;   // [max_t * cap][512] BF16
     int max_t = 0, cap = 0;     // queries, rows a query (at least the sel_stride)
+    float* part = nullptr;      // [max_t][max_h][max_s][kAttnSplitVals] floats: entry index = ((t*max_h + h)*max_s + s)
+    int max_h = 0, max_s = 0;   // heads, split-K chunks an entry covers
 };
 constexpr int kAttnScratchT = 7;   // (the staged kernel wins from 8 queries: V100, Sun)
 // heads_per_block kAttnWmma (a prompt chunk's queries): on RDNA 3/4 (gfx11/gfx12), 16 heads a block on matrix cores - the
@@ -228,6 +235,15 @@ struct AttnRows {
 void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                  const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
                  int ckv_fmt = kKvFp4, int heads_per_block = 0, const AttnScratch* scr = nullptr);
+/// The same for T rows of different sequences at once (a row group's decode).  Row t's window starts at win + t *
+/// win_stride, where win_stride is in VALUES (elements): its ext segment's stride, ext_stride rows * d.  Its compressed
+/// rows are ckv[t] (null is allowed when its nsel[t] is 0), its selection rows are sel + t * sel_stride, and its own
+/// AttnRows fields are a.win0[t] / a.nwin[t] / a.nsel[t] (a.gen = 0 for decode rows).  One unpack launch and one
+/// attention launch; per-row sparse_attn calls when the scratch limits are exceeded (see the wrapper's checks).
+void sparse_attn_rows(const float* q, const uint16_t* win, long long win_stride, const void* const* ckv,
+                      const int* sel, int sel_stride, const AttnRows& a, const float* sink, int heads, int d, int T,
+                      float scale, float* out, cudaStream_t s, int ckv_fmt = kKvFp4, int heads_per_block = 0,
+                      const AttnScratch* scr = nullptr);
 /// The window buffer: ext[r] = ring[(p0 - n + r) % n] for the n rows before p0 (zeros before position 0); afterwards
 /// ring[(p0 + t) % n] = ext[n + t] for t < T.  The ring's rows kKvFp8 (each group of 32 at the smallest power-of-two
 /// scale its BF16 values fit under: exact for values on the FP8 grid, the window's), the window buffer's BF16 (p0 = n:
@@ -235,6 +251,13 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
 void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, cudaStream_t s);
 void ext_to_ring(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int T, int d, cudaStream_t s,
                  uint8_t* backup = nullptr);
+/// The same for T rows at once, each its own ring and position, and its own ext segment of ext_stride rows:
+/// ext[t * ext_stride + r] = ring[t][(p0[t] - n + r) % n] for r < n (zeros before position 0).
+void ring_to_ext_rows(uint8_t* const* ring, uint16_t* ext, int ext_stride, const int64_t* p0, int n, int T, int d,
+                      cudaStream_t s);
+/// A decode row's one token back to its ring: ring[t][p0[t] % n] = ext[t * ext_stride + n].
+void ext_to_ring_rows(const uint16_t* ext, uint8_t* const* ring, int ext_stride, const int64_t* p0, int n, int T, int d,
+                      cudaStream_t s);
 /// A speculative window's rollback: ring[(p0 + t) % n] = backup[t] for keep <= t < T (the rows ext_to_ring replaced).
 void ring_restore(uint8_t* ring, const uint8_t* backup, int64_t p0, int n, int keep, int T, int d, cudaStream_t s);
 /// The same for up to kMaxRingBatch layers' rings at once (one launch).

@@ -328,9 +328,9 @@ with `"loop_guard": false` (or `true`) beside its sampling fields (Chat Completi
 
 ## Several requests at once
 
-This is a **GLM-5.3-Flash** setting. DeepSeek and MiniMax currently serve one request at a time; the launcher rejects
-`--parallel` for them before changing a config or starting setup/calibration. DeepSeek's saved conversation slots
-reuse earlier state, but do not decode multiple requests at once.
+This is a **GLM-5.3-Flash** setting, and a **DeepSeek-V4.1-Flash** one on two GPUs split by layers (see
+[DeepSeek: several conversations at once](#deepseek-several-conversations-at-once)). MiniMax serves one request at a
+time; the launcher rejects `--parallel` for it before changing a config or starting setup/calibration.
 
 `--parallel N` (1-8, default 1). `./maya.sh --parallel 4` (Windows:
 `START-MAYA.bat --parallel 4`) keeps it in the config's `"args"`. Maya then answers up to N requests at the same time,
@@ -1016,6 +1016,46 @@ The engine's log says what happened (`ds4 slots: saved/took back/wrote ...`; the
 `[maya] sessions: ...`). A slot's identity is the engine's version, the model's geometry and files and whether the
 DSpark blocks are loaded, so a slot from another model, another pack or an engine that changed the state's layout is
 refused rather than read.
+
+## DeepSeek: several conversations at once
+
+`--parallel N` (2-8) on a **two-GPU layer split** (`--tp 1`; each GPU its half of the layers) with no DSpark
+(`--dspark none`) and no pictures (`--vision off`). Each conversation gets its own sequence state - the position,
+every layer's 128-token window ring, the compressors' partial groups, the KV sources' compressed KV and index keys,
+its Engram rows and its sampler history - and the decode loop pipelines them across the two GPUs: while one GPU runs
+a step's first half of the layers for some conversations, the other runs the second half for others. A request that
+arrives while every conversation is busy waits its turn instead of failing.
+
+- **Prefix reuse.** Each conversation keeps checkpoints of its state: every `MAYA_DS4_SEQ_CK_EVERY` prompt tokens,
+  where requests read together share a prefix, where the system message ends (the server marks it) and at each
+  prompt's end. A new request that agrees with a conversation's tokens goes back to its latest checkpoint at or before
+  the point where they differ and reads only the rest (the `DONE` line's reused tokens, the response's
+  `cached_tokens`). A continued conversation reuses its whole state.
+- **Prompts and decode together.** A prompt read gives each GPU up between its chunks (`--prefill-chunk`), and the
+  conversations that are writing get a step in each gap.
+- **Row groups** (`MAYA_DS4_ROWS_BATCH=1`). The writing conversations go through the two GPUs as two groups (half of
+  them each); a group's rows share the dense projections, the experts' reads and the head, and the attention's
+  per-row parts (RoPE, the window ring, the sparse attention) run in one launch over the rows. With three writing, they
+  go one by one (two groups of 2 + 1 or one of 3 left a GPU waiting).
+- **Split decode attention** (`DS4_ATTN_SPLITK=1`). A decoded token's sparse attention split over its selected rows
+  across more blocks, the parts combined with the sink once: the same math in another summation order.
+
+Each conversation's state is allocated at the start for `MAYA_DS4_SEQ_CTX` tokens (default: `--context`), taken from
+the experts' VRAM (a start that cannot fit them, or would leave a GPU less than `MAYA_DS4_SEQ_RESERVE_MIB` free, says so: a
+smaller `MAYA_DS4_SEQ_CTX`, or fewer experts in VRAM). With large contexts the second GPU, which also holds the output head, is
+the tighter one. Not with `--tp 2`, DSpark, prompt lookup (`--suffix-draft`) or pictures: the start says which.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_SEQ_CTX` | `--context` | each conversation's context (tokens); smaller leaves more VRAM to the experts |
+| `MAYA_DS4_SEQ_RESERVE_MIB` | 256 | the VRAM each GPU must still have free beside the conversations' states (buffers made at first use need it); a start with less says so |
+| `MAYA_DS4_SEQ_CK_EVERY` | 65536 | a checkpoint every this many prompt tokens (each costs the second half's work on its last rows) |
+| `MAYA_DS4_BATCH_MS` | 200 | how long a request waits for others that arrive with it (read together, their shared prefix once) |
+| `MAYA_DS4_ROWS_BATCH` | off | `1`: row groups, as above |
+| `MAYA_DS4_ROWS_GROUP` | half the writing conversations | a row group's size, fixed |
+| `MAYA_DS4_ROWS_WAIT_MS` | 12 | how long the first GPU waits for a group's other rows while they are still on the second (never holding the GPU) |
+| `DS4_ATTN_SPLITK` | off | `1`: the decode attention split over its selected rows, as above |
+| `DS4_PROF` | off | `1`: each stage's per-token profile (`ds4 multi prof:`), the turns (`ds4 multi turns:`), the rows a step (`ds4 multi rows:`) and the prompt reads' gate releases |
 
 ## DeepSeek: tensor parallel groups of 3 with a GGUF pack (experimental)
 

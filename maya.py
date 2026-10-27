@@ -1439,10 +1439,14 @@ def config_family(cfg: dict) -> str:
 
 
 def check_parallel(a, family: str) -> None:
-    if getattr(a, "parallel", None) is not None and family != "glm":
-        model = DS4 if family == "deepseek" else MM3
-        fail(f"--parallel is only supported by GLM-5.3-Flash; {model} serves one request at a time",
+    if getattr(a, "parallel", None) is None or family == "glm":
+        return
+    if family == "minimax":
+        fail(f"--parallel is only supported by GLM-5.3-Flash and {DS4}; {MM3} serves one request at a time",
              "remove --parallel; saved conversations do not enable simultaneous decoding")
+    if getattr(a, "calibrate", False) or getattr(a, "speed_calibration", False):   # (its tensor parallel groups, DSpark)
+        fail(f"{DS4}'s calibration measures one request at a time: not with --parallel",
+             "calibrate first, then start with --parallel (a two-GPU layer split: --tp 1, --dspark none)")
 
 
 def choose_family(a, prev: dict) -> str:
@@ -3610,21 +3614,26 @@ def bench(cfg_path: Path, version: str) -> int:
                              stdout=subprocess.PIPE, stderr=log, text=True, env=SV.child_env(cfg),
                              cwd=cfg.get("cwd") or str(ROOT), bufsize=1)
 
+        multi = 0   # (READY ... multi=<n>: n conversations at once - each request tagged, its lines too)
+
         def gen(ids, n_new):
-            p.stdin.write(f"GEN {n_new} temperature=0 " + ",".join(map(str, ids)) + "\n")
+            rid = " rid=1" if multi else ""
+            p.stdin.write(f"GEN {n_new} temperature=0{rid} " + ",".join(map(str, ids)) + "\n")
             p.stdin.flush()
             while True:
                 line = p.stdout.readline()
                 if not line:
                     fail("the engine stopped during the benchmark", f"its log: {log_path}")
                 if line.startswith("DONE") or line.startswith("ERR"):
-                    return line.split()
+                    f = line.split()
+                    return f[:1] + f[2:] if multi else f   # (multi: the request's id after the word)
 
         while True:
             line = p.stdout.readline()
             if not line:
                 fail("the engine stopped while loading", f"its log: {log_path}")
             if line.startswith("READY"):
+                multi = next((int(x[6:]) for x in line.split()[2:] if x.startswith("multi=") and x[6:].isdigit()), 0)
                 break
         ok(f"loaded in {time.time() - t0:.0f} s")
         if config_family(cfg) == "deepseek":   # (its own chat format, thinking off - issue #416: not GLM's markers)
@@ -3639,6 +3648,25 @@ def bench(cfg_path: Path, version: str) -> int:
             if f[0] == "DONE" and float(f[4]) > 0:
                 results.append(("decode", q, int(f[1]) / float(f[4]) * 1000.0))
                 say(f"  decode  {results[-1][2]:6.1f} tokens/s   {q[:60]}")
+        if multi > 1:   # n answers written at once: the tokens of all of them over the wall time
+            qs = [BENCH_TOPICS[i % len(BENCH_TOPICS)] for i in range(multi)]
+            t1 = time.time()
+            for i, q in enumerate(qs):
+                p.stdin.write(f"GEN 256 temperature=0 rid={i + 1} " + ",".join(map(str, chat(q))) + "\n")
+            p.stdin.flush()
+            done, made = 0, 0
+            while done < multi:
+                line = p.stdout.readline()
+                if not line:
+                    fail("the engine stopped during the benchmark", f"its log: {log_path}")
+                f = line.split()
+                if f and f[0] in ("DONE", "ERR"):
+                    done += 1
+                    made += int(f[2]) if f[0] == "DONE" and len(f) > 2 else 0
+            wall = time.time() - t1
+            if made > 0 and wall > 0:
+                results.append(("together", f"{multi} answers at once", made / wall))
+                say(f"  decode  {made / wall:6.1f} tokens/s in all, {multi} answers of 256 tokens at once")
         if lens:                                            # warm-up: the first prompt after a start is slower
             gen(doc[-lens[0]:], 1)                          # (cold caches, issue #8); its opening is not reused below
         for i, n in enumerate(lens):
@@ -3666,6 +3694,8 @@ def bench(cfg_path: Path, version: str) -> int:
              f"decode (writing the answer): mean {sum(dec) / max(1, len(dec)):.1f} tokens/s over {len(dec)} answers of "
              f"256 tokens (greedy, thinking off)"]
     lines += [f"  {r[2]:6.1f} tokens/s  {r[1]}" for r in results if r[0] == "decode"]
+    lines += [f"decode, {r[1]} (greedy, thinking off): {r[2]:.1f} tokens/s in all ({r[2] / multi:.1f} each)"
+              for r in results if r[0] == "together"]
     lines += [f"prefill (reading the prompt): {r[2]:.0f} tokens/s, {r[1]}" for r in results if r[0] == "prefill"]
     lines += ["", "engine lines:"] + [x.replace(str(Path.home()), "~") for x in stats[-40:]]
     out = ROOT / "maya-bench.txt"
@@ -5067,9 +5097,9 @@ def main() -> int:
                                    "0,1,2,3")
     ap.add_argument("--context", type=int, help=f"context length in tokens (default {DEFAULT_CONTEXT})")
     ap.add_argument("--parallel", type=int, choices=range(1, 9), metavar="N",
-                    help="GLM-5.3-Flash only: answer up to N requests at once (1-8, default 1), kept in the config: "
-                         "on one GPU they are "
-                         "decoded together, more tokens per second in all; each extra conversation keeps its own "
+                    help="GLM-5.3-Flash, and DeepSeek-V4.1-Flash on two GPUs split by layers (--tp 1, no DSpark, "
+                         "no pictures): answer up to N requests at once (1-8, default 1), kept in the config: they "
+                         "are decoded together, more tokens per second in all; each extra conversation keeps its own "
                          "context in VRAM, which the expert cache gives up")
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the expert pool leaves free on each GPU for the driver, the desktop and other "

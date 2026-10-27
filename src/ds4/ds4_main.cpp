@@ -39,6 +39,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <string>
 #include <thread>
 #include <vector>
@@ -54,7 +55,6 @@
 #endif
 
 namespace {
-
 double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -94,8 +94,8 @@ void usage() {
     std::fprintf(stderr,
                  "maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--reserve-mib N]\n"
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--no-expert-cache] [--verbose]\n"
-                 "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none] [--dspark-conf F]\n"
-                 "           [--suffix-draft N]\n"
+                 "           [--tp N] [--parallel N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none]\n"
+                 "           [--dspark-conf F] [--suffix-draft N]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto]\n"
                  "           [--ablate DIRECTION.gguf|ADAPTER.gguf [--ablate-layer N] [--ablate-scale F]]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
@@ -330,6 +330,8 @@ struct Req {
     // block still open after n tokens of the answer is closed - its next token is think_end - and the answer follows
     long long think_budget = 0;
     int think_end = -1;
+    int rid = -1;       // multi: this request's conversation id
+    std::vector<int64_t> marks;   // marks=a,b: prompt positions to checkpoint at (the server: where the system message ends)
     std::string file;   // GENI: the pictures
     std::vector<int> ids;
 };
@@ -446,11 +448,22 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "spec_min_p") r.conf = std::strtof(v.c_str(), nullptr);   // (the server's strata_tune names)
         else if (k == "suffix_draft") r.lookup = std::atoi(v.c_str()) != 0;
         else if (k == "penalty_last_n") r.pen_n = std::atoi(v.c_str());
+        else if (k == "marks") {
+            size_t a = 0;
+            while (a < v.size()) {
+                size_t b = v.find(',', a);
+                if (b == std::string::npos) b = v.size();
+                const long long x = std::atoll(v.substr(a, b - a).c_str());
+                if (x > 0) r.marks.push_back(x);
+                a = b + 1;
+            }
+        }
         else if (k == "penalty_repeat") r.pen_repeat = std::strtof(v.c_str(), nullptr);
         else if (k == "penalty_freq") r.pen_freq = std::strtof(v.c_str(), nullptr);
         else if (k == "penalty_present") r.pen_present = std::strtof(v.c_str(), nullptr);
         else if (k == "think_budget") r.think_budget = std::atoll(v.c_str());
         else if (k == "think_end") r.think_end = std::atoi(v.c_str());
+        else if (k == "rid") r.rid = std::atoi(v.c_str());
     }
     return !r.ids.empty() && (!geni || !r.file.empty());
 }
@@ -1334,6 +1347,591 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
 
 }  // namespace
 
+int serve_multi(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min, const std::string& pack,
+                int N) {
+    std::vector<int> eos = parse_ids(eos_list);
+    for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
+    std::printf("READY %lld stop multi=%d\n", (long long) m.max_context(), N);
+    std::fflush(stdout);
+    std::fprintf(stderr, "maya ds4 multi: GEN <max_new> [keys] rid=<id> <ids>; STOP <id>, QUIT\n");
+
+    std::mutex out_mu;
+    auto emit = [&](const std::string& s) {
+        std::lock_guard<std::mutex> lk(out_mu);
+        std::printf("%s\n", s.c_str());
+        std::fflush(stdout);
+    };
+
+    struct R {
+        int rid = -1, seq = -1;
+        long long max_new = 0, produced = 0;
+        int prompt_n = 0;
+        float temperature = 0.0f, top_p = 1.0f, min_p = 0.0f;
+        int top_k = 64;
+        unsigned long long seed = 0;
+        int pen_n = 0;
+        float pen_repeat = 1.0f, pen_freq = 0.0f, pen_present = 0.0f;
+        unsigned long long counter = 0;
+        bool done = false, cancel = false;
+        double start = 0, prompt_ms = 0, decode_start = 0;
+        long long reused = 0;   // prompt tokens the sequence already held (DONE's reused field)
+    };
+    std::vector<R> reqs((size_t) N);
+    std::vector<char> used((size_t) N, 0);
+    struct Item { int rid, seq; int64_t p0; };
+    // q1 carries what stage 0 ran: one step (one item), or a row group (MAYA_DS4_ROWS_BATCH: its items, the first the
+    // group's lead)
+    struct Step { std::vector<Item> it; bool group = false; };
+    std::deque<Item> q0;
+    std::deque<Step> q1;
+    const bool rows = m.rows_on();
+    const int rows_g = std::getenv("STRATA_DS4_ROWS_GROUP") ? std::atoi(std::getenv("STRATA_DS4_ROWS_GROUP")) : 0;
+    // how long stage 0 waits for a group's other rows while they are still in flight (a sequence that starts decoding
+    // arrives alone; once grouped, a group comes back whole)
+    const double rows_wait = std::getenv("STRATA_DS4_ROWS_WAIT_MS") ? std::atof(std::getenv("STRATA_DS4_ROWS_WAIT_MS")) : 12.0;
+    // the sequences in the decode loop (their prompt read, their request not over)
+    auto decoding = [&] {
+        int n = 0;
+        for (int s = 0; s < N; ++s) n += used[(size_t) s] && !reqs[(size_t) s].done && reqs[(size_t) s].decode_start > 0;
+        return n;
+    };
+    // two groups in flight (half the rows each, rounded up); three rows go one by one (groups of 2 + 1, or one group
+    // of 3, measured slower than three single steps in the pipeline)
+    auto group_size = [&](int dec) {
+        return std::max(1, std::min(16, rows_g > 0 ? rows_g : dec == 3 ? 1 : (dec + 1) / 2));
+    };
+    std::mutex qmu;
+    std::condition_variable cv0, cv1;
+    bool running = true;
+
+    auto add0 = [&](const Item& it) {
+        std::lock_guard<std::mutex> lk(qmu);
+        q0.push_back(it);
+        cv0.notify_one();
+    };
+    // a row group's next steps go in together, so stage 0 finds the whole group (one by one it may take a single)
+    auto add0n = [&](const std::vector<Item>& its) {
+        if (its.empty()) return;
+        std::lock_guard<std::mutex> lk(qmu);
+        for (const Item& it : its) q0.push_back(it);
+        cv0.notify_one();
+    };
+
+    // the decode threads: each takes its device's turn once per batch of queued steps (the steps queued when the
+    // turn begins), so a prompt read in between gives every decoding sequence a token per chunk gap
+    // (DS4_PROF) each decode thread's turns: how long it waited for its device, how many steps a turn took
+    const bool dprof = std::getenv("DS4_PROF") != nullptr;
+    struct TurnStat { double wait = 0, busy = 0; long turns = 0, items = 0; };
+    TurnStat ts[2];
+    auto turn_note = [&](int di, double wait, double busy, size_t items) {
+        if (!dprof) return;
+        TurnStat& t = ts[di];
+        t.wait += wait; t.busy += busy; ++t.turns; t.items += (long) items;
+        if (t.items >= 256) {
+            std::fprintf(stderr, "ds4 multi turns: stage %d, %ld turns, %.2f steps a turn, gate wait %.3f ms a turn, "
+                         "turn %.3f ms (%.3f ms a step)\n", di, t.turns, (double) t.items / t.turns, t.wait / t.turns,
+                         t.busy / t.turns, t.busy / t.items);
+            t = TurnStat{};
+        }
+    };
+    // (DS4_PROF) rows per stage-0 step: are the groups forming
+    long rs_steps = 0, rs_rows = 0;
+    auto rows_stat = [&](size_t n, int G) {
+        if (!dprof || n == 0) return;
+        rs_steps += (long) ((n + (size_t) G - 1) / (size_t) G);
+        rs_rows += (long) n;
+        if (rs_steps >= 256) {
+            std::fprintf(stderr, "ds4 multi rows: %.2f rows a stage-0 step (%ld steps)\n", (double) rs_rows / rs_steps,
+                         rs_steps);
+            rs_steps = rs_rows = 0;
+        }
+    };
+    std::thread t0([&] {
+        while (true) {
+            std::deque<Item> batch;
+            {
+                std::unique_lock<std::mutex> lk(qmu);
+                while (q0.empty() && running) cv0.wait(lk);
+                if (!running) break;
+                batch.swap(q0);
+                if (rows && rows_wait > 0) {   // gather whole groups (not holding the device: prompt reads go on)
+                    const int dec = decoding(), G = group_size(dec);
+                    auto want = [&] { return std::min(dec, ((int) batch.size() + G - 1) / G * G); };
+                    const auto until = std::chrono::steady_clock::now() +
+                                       std::chrono::microseconds((long long) (rows_wait * 1000));
+                    while ((int) batch.size() < want() && running &&
+                           cv0.wait_until(lk, until, [&] { return !q0.empty() || !running; })) {
+                        for (const Item& it : q0) batch.push_back(it);
+                        q0.clear();
+                    }
+                }
+            }
+            const double w0 = now_ms();
+            m.dev_lock(0);
+            const double w1 = now_ms();
+            struct Turn { strata::ds4::Model& m; int di; ~Turn() { m.dev_unlock(di); } } turn{m, 0};
+            struct Note { decltype(turn_note)& f; double w0, w1; size_t n; ~Note() { f(0, w1 - w0, now_ms() - w1, n); } }
+                note{turn_note, w0, w1, batch.size()};
+            std::vector<Item> ready;   // (the steps still wanted: done / replaced / cancelled ones end here)
+            for (const Item& it : batch) {
+                R& r = reqs[(size_t) it.seq];
+                if (r.done || r.rid != it.rid) continue;
+                if (r.cancel) {
+                    emit("DONE " + std::to_string(it.rid) + " " + std::to_string(r.produced) + " " +
+                         std::to_string(r.prompt_n) + " " + std::to_string(r.prompt_ms) + " " +
+                         std::to_string(now_ms() - r.decode_start) + " cancel 0 0 " + std::to_string(r.reused) + " 0 0");
+                    r.done = true;
+                    m.seq_touch(it.seq, now_ms());
+                    continue;
+                }
+                ready.push_back(it);
+            }
+            // row groups: as many rows as keep two groups in flight (one on each GPU) - half of the sequences
+            // decoding, rounded up (MAYA_DS4_ROWS_GROUP=n fixes it); a group of one is the single step
+            int G = 1;
+            if (rows && ready.size() >= 2) G = std::min(group_size(decoding()), (int) ready.size());
+            rows_stat(ready.size(), G);
+            for (size_t a = 0; a < ready.size(); a += (size_t) G) {
+                Step st;
+                st.it.assign(ready.begin() + (long) a, ready.begin() + (long) std::min(ready.size(), a + (size_t) G));
+                st.group = st.it.size() > 1;
+                std::string err;
+                bool ok;
+                if (st.group) {
+                    int ss[16];
+                    for (size_t i = 0; i < st.it.size(); ++i) ss[i] = st.it[i].seq;
+                    ok = m.decode_rows0(ss, (int) st.it.size(), err, true);
+                } else
+                    ok = m.decode_token0(st.it[0].seq, st.it[0].p0, err, true);
+                if (!ok) {
+                    for (const Item& it : st.it) {
+                        emit("ERR " + std::to_string(it.rid) + " " + err);
+                        reqs[(size_t) it.seq].done = true;
+                    }
+                    continue;
+                }
+                std::lock_guard<std::mutex> lk(qmu);
+                q1.push_back(std::move(st));
+                cv1.notify_one();
+            }
+        }
+    });
+
+    std::thread t1([&] {
+        while (true) {
+            std::deque<Step> batch;
+            {
+                std::unique_lock<std::mutex> lk(qmu);
+                while (q1.empty() && running) cv1.wait(lk);
+                if (!running) break;
+                batch.swap(q1);
+            }
+            const double w0 = now_ms();
+            m.dev_lock(1);
+            const double w1 = now_ms();
+            struct Turn { strata::ds4::Model& m; int di; ~Turn() { m.dev_unlock(di); } } turn{m, 1};
+            struct Note { decltype(turn_note)& f; double w0, w1; size_t n; ~Note() { f(1, w1 - w0, now_ms() - w1, n); } }
+                note{turn_note, w0, w1, batch.size()};
+            auto smp_of = [&](R& r) {
+                strata::ds4::Model::Sampling smp;
+                smp.temperature = r.temperature;
+                smp.top_p = r.top_p;
+                smp.min_p = r.min_p;
+                smp.top_k = r.top_k;
+                smp.seed = r.seed;
+                smp.counter = r.counter++;
+                smp.pen_n = r.pen_n;
+                smp.pen_repeat = r.pen_repeat;
+                smp.pen_freq = r.pen_freq;
+                smp.pen_present = r.pen_present;
+                return smp;
+            };
+            auto cancel_done = [&](const Item& it, R& r) {
+                emit("DONE " + std::to_string(it.rid) + " " + std::to_string(r.produced) + " " +
+                     std::to_string(r.prompt_n) + " " + std::to_string(r.prompt_ms) + " " +
+                     std::to_string(now_ms() - r.decode_start) + " cancel 0 0 " + std::to_string(r.reused) + " 0 0");
+                r.done = true;
+                m.seq_touch(it.seq, now_ms());
+            };
+            // a sampled token to its request: T, and DONE at its end, else its next step
+            auto deliver = [&](const Item& it, R& r, int tok, std::vector<Item>* next = nullptr) {
+                emit("T " + std::to_string(it.rid) + " " + std::to_string(tok));
+                ++r.produced;
+                bool end = false;
+                for (int e : eos) end = end || tok == e;
+                if (end || r.produced >= r.max_new || m.seq_pos(it.seq) >= m.max_context()) {
+                    const double now = now_ms();
+                    emit("DONE " + std::to_string(it.rid) + " " + std::to_string(r.produced) + " " +
+                         std::to_string(r.prompt_n) + " " + std::to_string(r.prompt_ms) + " " +
+                         std::to_string(now - r.decode_start) + " " + (end ? "stop" : "length") +
+                         " 0 0 " + std::to_string(r.reused) + " 0 0");
+                    r.done = true;
+                    m.seq_touch(it.seq, now);
+                    return;
+                }
+                const Item nx{it.rid, it.seq, m.seq_pos(it.seq)};
+                if (next) next->push_back(nx);
+                else add0(nx);
+            };
+            for (Step& st : batch) {
+                if (st.group) {   // (every row runs stage 1 - its stage 0 moved its state on; a cancelled one ends after)
+                    strata::ds4::Model::Sampling smps[16];
+                    int toks[16];
+                    for (size_t i = 0; i < st.it.size(); ++i) smps[i] = smp_of(reqs[(size_t) st.it[i].seq]);
+                    std::string err;
+                    if (!m.decode_rows1(st.it[0].seq, smps, toks, err, true)) {
+                        for (const Item& it : st.it) {
+                            emit("ERR " + std::to_string(it.rid) + " " + err);
+                            reqs[(size_t) it.seq].done = true;
+                        }
+                        continue;
+                    }
+                    std::vector<Item> next;
+                    for (size_t i = 0; i < st.it.size(); ++i) {
+                        const Item& it = st.it[i];
+                        R& r = reqs[(size_t) it.seq];
+                        if (r.done || r.rid != it.rid) continue;
+                        if (r.cancel) {
+                            cancel_done(it, r);
+                            continue;
+                        }
+                        if (toks[i] < 0) {
+                            emit("ERR " + std::to_string(it.rid) + " " + err);
+                            r.done = true;
+                            continue;
+                        }
+                        deliver(it, r, toks[i], &next);
+                    }
+                    add0n(next);
+                    continue;
+                }
+                const Item& it = st.it[0];
+                R& r = reqs[(size_t) it.seq];
+                if (r.done || r.rid != it.rid) continue;
+                // stage 0 moved this sequence on: stage 1 runs even for a cancelled request, so its kept state does
+                // not lack this position in the second half of the layers
+                const strata::ds4::Model::Sampling smp = smp_of(r);
+                std::string err;
+                const int tok = m.decode_token1(it.seq, it.p0, smp, err, true);
+                if (r.cancel) {
+                    cancel_done(it, r);
+                    continue;
+                }
+                if (tok < 0) {
+                    emit("ERR " + std::to_string(it.rid) + " " + err);
+                    r.done = true;
+                    continue;
+                }
+                deliver(it, r, tok);
+            }
+        }
+    });
+
+    Lines in;
+    in.start();
+
+    std::queue<std::string> cmds;
+    std::mutex cmd_mu;
+    std::condition_variable cmd_cv;
+    bool reader_done = false;
+    std::thread reader([&] {
+        std::string l;
+        while (in.next(l)) {
+            std::lock_guard<std::mutex> lk(cmd_mu);
+            cmds.push(l);
+            cmd_cv.notify_one();
+        }
+        std::lock_guard<std::mutex> lk(cmd_mu);
+        reader_done = true;
+        cmd_cv.notify_one();
+    });
+
+    // The scheduler: requests wait in `pend` (the main thread pushes, STOP removes), the flush thread takes a batch
+    // of them - as many as there are free sequences - once they have waited MAYA_DS4_BATCH_MS for siblings that
+    // arrive together (a burst of agents) or the batch is full, and feeds them one after the other WITHOUT holding
+    // batch_mu (a long prompt read must not block STOP or the arrivals behind it).  Every prompt looks for the
+    // sequence that already holds the longest prefix of it: a free one is continued or taken back to a checkpoint
+    // in place, a busy one (decoding, or a sibling fed just before) is copied and taken back; a batch's siblings'
+    // common prefixes are checkpointed on the way (marks), so each sibling reads only its own tail.
+    struct Pend { Req r; double arrived; double alive; };
+    std::vector<Pend> pend;
+    std::mutex batch_mu;
+    const double batch_ms = std::getenv("STRATA_DS4_BATCH_MS") ? std::atof(std::getenv("STRATA_DS4_BATCH_MS")) : 200.0;
+    auto is_free = [&](int s) { return !used[(size_t) s] || reqs[(size_t) s].done; };
+    auto n_free = [&] { int k = 0; for (int s = 0; s < N; ++s) k += is_free(s) ? 1 : 0; return k; };
+
+    auto done_line = [&](R& rr, const char* why) {
+        emit("DONE " + std::to_string(rr.rid) + " " + std::to_string(rr.produced) + " " +
+             std::to_string(rr.prompt_n) + " " + std::to_string(rr.prompt_ms) + " 0 " + why + " 0 0 " +
+             std::to_string(rr.reused) + " 0 0");
+        rr.done = true;
+        m.seq_touch(rr.seq, now_ms());
+    };
+
+    auto finish_first = [&](R& rr, const Req& r, int seq, int first) {
+        rr.prompt_ms = now_ms() - rr.start;
+        rr.decode_start = now_ms();
+        if (first < 0) {
+            emit("ERR " + std::to_string(r.rid) + " the prompt did not produce a first token");
+            rr.done = true;
+            m.seq_touch(seq, now_ms());
+            return;
+        }
+        emit("T " + std::to_string(r.rid) + " " + std::to_string(first));
+        rr.produced = 1;
+        bool end = false;
+        for (int e : eos) end = end || first == e;
+        if (end || rr.produced >= rr.max_new || m.seq_pos(seq) >= m.max_context())
+            done_line(rr, end ? "stop" : "length");
+        else
+            add0({r.rid, seq, m.seq_pos(seq)});
+    };
+
+    // keep-alives for the requests still waiting (the server ends a request that is silent for REQUEST_QUIET_S)
+    auto keepalive_pending = [&](double every_ms) {
+        std::lock_guard<std::mutex> bl(batch_mu);
+        const double now = now_ms();
+        for (Pend& w : pend)
+            if (now - w.alive >= every_ms) {
+                w.alive = now;
+                emit("PP " + std::to_string(w.r.rid) + " 0 " + std::to_string(w.r.ids.size()) + " " +
+                     std::to_string(now - w.arrived) + " 0 0");
+            }
+    };
+
+    // the prompt being read right now (its sequence and tokens): an arrival computes the prefix it shares with it
+    // and asks for a checkpoint there (Model::seq_mark) - it reads only its own tail afterwards
+    struct Cur { int seq = -1; const std::vector<int>* ids = nullptr; };
+    Cur cur;
+    std::mutex cur_mu;
+
+    auto feed_batch = [&](std::vector<Req>& batch) {
+        std::vector<double> sib_alive(batch.size(), 0.0);
+        for (size_t i = 0; i < batch.size(); ++i) {
+            Req& p = batch[i];
+            const int n = (int) p.ids.size();
+            if (n <= 0) {
+                emit("ERR " + std::to_string(p.rid) + " the prompt is empty");
+                continue;
+            }
+            const int lim = n - 1;   // (the last token is always read: it makes the first token's logits)
+            // the prefixes later siblings share with this prompt: checkpoints on the way for them
+            std::vector<int64_t> marks, sib_l(batch.size(), 0);
+            for (size_t k = i + 1; k < batch.size(); ++k) {
+                const int mk = std::min(lim, (int) batch[k].ids.size() - 1);
+                int c = 0;
+                while (c < mk && batch[k].ids[(size_t) c] == p.ids[(size_t) c]) ++c;
+                sib_l[k] = c;
+                if (c > 0) marks.push_back(c);
+            }
+            for (int64_t x : p.marks)   // the server's: where the system message ends
+                if (x > 0 && x < lim) marks.push_back(x);
+            // the sequence: the free one that keeps the most of this prompt, or a copy of a busy one that keeps more
+            int target = -1, src = -1;
+            int64_t best_free = -1, best_busy = -1, c_free = 0, c_busy = 0;
+            double lru = 0;
+            int lru_s = -1;
+            for (int s = 0; s < N; ++s) {
+                const int64_t c = m.seq_match(s, p.ids.data(), lim);
+                const int64_t from = m.seq_restorable(s, c);
+                if (is_free(s)) {
+                    const double t = m.seq_last_use(s);
+                    if (from > best_free || (from == best_free && t < lru)) { best_free = from; target = s; c_free = c; lru = t; }
+                    if (lru_s < 0 || t < m.seq_last_use(lru_s)) lru_s = s;
+                } else if (from > best_busy) { best_busy = from; src = s; c_busy = c; }
+            }
+            if (target < 0) {   // (no free sequence: the batch was cut to the free ones, so this is a late cancel)
+                std::lock_guard<std::mutex> bl(batch_mu);
+                pend.push_back({p, now_ms(), now_ms()});
+                continue;
+            }
+            int64_t from = 0;
+            if (best_busy > best_free) {
+                // the least valuable free sequence takes a copy of the busy one, then goes back to the shared prefix
+                int t2 = lru_s >= 0 ? lru_s : target;
+                m.copy_seq(t2, src);
+                target = t2;
+                from = m.seq_restore(target, c_busy);
+            } else {
+                from = m.seq_restore(target, c_free);
+            }
+            used[(size_t) target] = 1;
+            R& rr = reqs[(size_t) target];
+            rr = R{};
+            rr.rid = p.rid;
+            rr.seq = target;
+            rr.max_new = p.max_new;
+            rr.prompt_n = n;
+            rr.temperature = p.temperature;
+            rr.top_p = p.top_p;
+            rr.min_p = p.min_p;
+            rr.top_k = p.top_k;
+            rr.seed = p.seed;
+            rr.pen_n = p.pen_n < 0 ? INT_MAX : p.pen_n;
+            rr.pen_repeat = std::isfinite(p.pen_repeat) && p.pen_repeat > 0.0f ? p.pen_repeat : 1.0f;
+            rr.pen_freq = std::isfinite(p.pen_freq) ? p.pen_freq : 0.0f;
+            rr.pen_present = std::isfinite(p.pen_present) ? p.pen_present : 0.0f;
+            rr.reused = from;
+            rr.start = now_ms();
+            m.seq_touch(target, rr.start);
+            if (rr.cancel) { done_line(rr, "cancel"); continue; }
+            std::fprintf(stderr, "ds4 multi: rid %d -> seq %d: %lld of %d tokens kept%s\n", p.rid, target,
+                         (long long) from, n, best_busy > best_free ? " (copied)" : "");
+            auto prog = [&](int64_t done) {
+                const double now = now_ms(), ms = now - rr.start;
+                emit("PP " + std::to_string(p.rid) + " " + std::to_string(done) + " " + std::to_string(n) + " " +
+                     std::to_string(ms) + " " + std::to_string(done > from ? 1000.0 * (double) (done - from) / ms : 0.0) +
+                     " 0");
+                for (size_t k = i + 1; k < batch.size(); ++k)   // the siblings behind it: their shared part advances
+                    if (now - sib_alive[k] >= 2000.0) {
+                        sib_alive[k] = now;
+                        emit("PP " + std::to_string(batch[k].rid) + " " + std::to_string(std::min<int64_t>(sib_l[k], done)) +
+                             " " + std::to_string(batch[k].ids.size()) + " " + std::to_string(now - rr.start) + " 0 0");
+                    }
+                keepalive_pending(5000.0);
+            };
+            m.set_cancel([&rr] { return rr.cancel; });
+            { std::lock_guard<std::mutex> cl(cur_mu); cur.seq = target; cur.ids = &p.ids; }
+            std::string err;
+            strata::ds4::Model::Sampling smp;
+            smp.temperature = rr.temperature;
+            smp.top_p = rr.top_p;
+            smp.min_p = rr.min_p;
+            smp.top_k = rr.top_k;
+            smp.seed = rr.seed;
+            smp.counter = rr.counter++;
+            smp.pen_n = rr.pen_n;
+            smp.pen_repeat = rr.pen_repeat;
+            smp.pen_freq = rr.pen_freq;
+            smp.pen_present = rr.pen_present;
+            if (rr.max_new > 0) {
+                const int first = m.feed_prompt_first(target, p.ids.data() + from, n - (int) from, prog, smp, err, &marks);
+                m.set_cancel(nullptr);
+                { std::lock_guard<std::mutex> cl(cur_mu); cur = Cur{}; }
+                if (first < 0 && rr.cancel) { rr.prompt_ms = now_ms() - rr.start; done_line(rr, "cancel"); continue; }
+                if (first < 0 && !err.empty()) {
+                    emit("ERR " + std::to_string(p.rid) + " " + err);
+                    rr.done = true;
+                    m.seq_touch(target, now_ms());
+                    continue;
+                }
+                finish_first(rr, p, target, first);
+            } else {
+                const bool ok = m.feed_prompt_seq(target, p.ids.data() + from, n - (int) from, prog, err, &marks);
+                m.set_cancel(nullptr);
+                { std::lock_guard<std::mutex> cl(cur_mu); cur = Cur{}; }
+                rr.prompt_ms = now_ms() - rr.start;
+                rr.decode_start = now_ms();
+                if (!ok) {
+                    if (rr.cancel) { done_line(rr, "cancel"); continue; }
+                    emit("ERR " + std::to_string(p.rid) + " " + err);
+                    rr.done = true;
+                    m.seq_touch(target, now_ms());
+                    continue;
+                }
+                done_line(rr, "length");
+            }
+        }
+    };
+
+    std::thread flush([&] {
+        while (running) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            if (!running) break;
+            std::vector<Req> batch;
+            {
+                std::lock_guard<std::mutex> bl(batch_mu);
+                if (pend.empty()) continue;
+                const int nf = n_free();
+                if (nf == 0) {
+                    // (nothing to feed into: the waiting ones get a line now and then so the server keeps them)
+                }
+                double oldest = pend[0].arrived;
+                for (const Pend& w : pend) oldest = std::min(oldest, w.arrived);
+                const double now = now_ms();
+                if (nf > 0 && ((int) pend.size() >= nf || now - oldest >= batch_ms)) {
+                    const size_t take = std::min(pend.size(), (size_t) nf);
+                    for (size_t i = 0; i < take; ++i) batch.push_back(std::move(pend[i].r));
+                    pend.erase(pend.begin(), pend.begin() + (long) take);
+                }
+            }
+            if (batch.empty()) keepalive_pending(5000.0);
+            else feed_batch(batch);
+        }
+    });
+
+    while (true) {
+        std::string line;
+        {
+            std::unique_lock<std::mutex> lk(cmd_mu);
+            while (cmds.empty() && !reader_done) cmd_cv.wait(lk);
+            if (cmds.empty() && reader_done) break;
+            line = cmds.front();
+            cmds.pop();
+        }
+        if (line == "QUIT") break;
+        if (line.rfind("STOP ", 0) == 0) {
+            int rid = std::atoi(line.c_str() + 5);
+            bool waiting = false;
+            {
+                std::lock_guard<std::mutex> bl(batch_mu);
+                for (size_t i = 0; i < pend.size(); ++i)
+                    if (pend[i].r.rid == rid) {
+                        emit("DONE " + std::to_string(rid) + " 0 " + std::to_string(pend[i].r.ids.size()) +
+                             " 0 0 cancel 0 0 0 0 0");
+                        pend.erase(pend.begin() + (long) i);
+                        waiting = true;
+                        break;
+                    }
+            }
+            if (!waiting)
+                for (R& r : reqs)
+                    if (r.rid == rid && !r.done) r.cancel = true;
+            continue;
+        }
+        const bool geni = line.rfind("GENI ", 0) == 0;
+        if (!geni && line.rfind("GEN ", 0) != 0) {
+            emit("ERR 0 unsupported command");
+            continue;
+        }
+        if (geni) {
+            emit("ERR 0 pictures are not supported with --parallel");
+            continue;
+        }
+        Req r;
+        if (!parse_gen(line, r, false) || r.rid < 0) {
+            emit("ERR 0 expected GEN <max_new> rid=<id> <ids>");
+            continue;
+        }
+        {   // read right now: ask the feed for a checkpoint at the prefix the new prompt shares with it
+            std::lock_guard<std::mutex> cl(cur_mu);
+            if (cur.ids != nullptr && cur.seq >= 0) {
+                const size_t mk = std::min(r.ids.size(), cur.ids->size()) - 1;
+                size_t cc = 0;
+                while (cc < mk && r.ids[cc] == (*cur.ids)[cc]) ++cc;
+                if (cc > 0) m.seq_mark(cur.seq, (int64_t) cc);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> bl(batch_mu);
+            const double now = now_ms();
+            pend.push_back({std::move(r), now, now});
+        }
+    }
+
+    running = false;
+    for (R& r : reqs) r.cancel = true;   // (a prompt being read ends at its next chunk: the flush thread can join)
+    {
+        std::lock_guard<std::mutex> lk(qmu);
+        cv0.notify_all();
+        cv1.notify_all();
+    }
+    if (t0.joinable()) t0.join();
+    if (t1.joinable()) t1.join();
+    if (flush.joinable()) flush.join();
+    return 0;
+}
+
 int main(int argc, char** argv) {
     strata::platform::env_aliases();   // (MAYA_* settings under their older names too)
     // cuBLAS gives the same bits run after run only with one stream active or with its workspace pinned (its notes on
@@ -1405,6 +2003,7 @@ int main(int argc, char** argv) {
         } else if (a == "--dspark-conf") o.dspark_conf = (float) std::atof(val("--dspark-conf").c_str());
         else if (a == "--suffix-draft") suffix_draft = std::max(0, std::atoi(val("--suffix-draft").c_str()));
         else if (a == "--tp") o.tp = std::max(1, std::atoi(val("--tp").c_str()));
+        else if (a == "--parallel") o.parallel = std::max(1, std::atoi(val("--parallel").c_str()));
         else if (a == "--prefill-chunk") o.prefill_chunk = std::max(0, std::atoi(val("--prefill-chunk").c_str()));
         else if (a == "--threads") o.threads = val("--threads") != "off";
         else if (a == "--vision") o.vision = val("--vision") != "off";
@@ -1456,6 +2055,19 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
+    if (serve_mode && o.parallel > 1) {   // several conversations at once (a layer split; no drafting)
+        int64_t seq_ctx = o.max_context;   // (MAYA_DS4_SEQ_CTX: less a conversation, its states smaller)
+        if (const char* v = std::getenv("STRATA_DS4_SEQ_CTX")) {
+            const int64_t n = std::atoll(v);
+            if (n > 0) seq_ctx = std::min<int64_t>(o.max_context, n);
+        }
+        if (!m.init_multi(o.parallel, seq_ctx, err)) {
+            std::fprintf(stderr, "maya-ds4 multi: %s\n", err.c_str());
+            return 1;
+        }
+        if (std::getenv("DS4_ROWS_BENCH") != nullptr) m.rows_bench();
+        return serve_multi(m, eos, spec, o.dspark_conf, o.pack, o.parallel);
+    }
     std::unique_ptr<Lookup> lk;   // (prompt lookup beside DSpark, or alone: one policy over every request of this run)
     if (suffix_draft > 0)
         lk = std::make_unique<Lookup>(suffix_draft, m.verify_max(), (size_t) m.max_context() + 4096);

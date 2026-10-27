@@ -865,6 +865,9 @@ class StrataEngine:
             te >= 0 else ""
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune, tune_keys = sampling.get("strata_tune"), ""
+        mk = sampling.get("_marks")   # (DeepSeek --parallel) where the system message ends: a checkpoint there
+        marks_key = (" marks=" + ",".join(str(x) for x in mk)) if isinstance(mk, list) and mk and \
+            all(isinstance(x, int) and not isinstance(x, bool) and x > 0 for x in mk) else ""
         if isinstance(tune, dict):
             for k in ("pcie_frac", "spec_min_p", "spec_cum"):
                 v = tune.get(k)
@@ -899,7 +902,7 @@ class StrataEngine:
             # temperature 0 is greedy: the engine reads temperature=0 as that whatever else the line says, and no other
             # sampler key goes (with only a config's top_p the engine took its sampled path: not deterministic) - but
             # the penalties do: they change the logits greedy picks from (#273: a greedy answer's loops)
-            return (" temperature=0" + penalty_keys + think + tune_keys + StrataEngine.projection_key(sampling) +
+            return (" temperature=0" + penalty_keys + think + tune_keys + marks_key + StrataEngine.projection_key(sampling) +
                     bias_key)
         if isinstance(t, (int, float)) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
@@ -918,7 +921,7 @@ class StrataEngine:
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
         keys += think + tune_keys
-        return keys + StrataEngine.projection_key(sampling) + bias_key
+        return keys + marks_key + StrataEngine.projection_key(sampling) + bias_key
 
     @staticmethod
     def penalty_keys(sampling: dict) -> str:
@@ -2521,6 +2524,18 @@ class Service:
                 prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
         given["_prefill"] = prefill
         ids = self.render_ids(messages, tools, kwargs, prefill)
+        # (DeepSeek --parallel) several conversations at once: where the system message ends, for the engine's checkpoint
+        if getattr(self.engine, "multi", 0) and messages and (messages[0].get("role") == "system") and len(ids) > 2048:
+            try:
+                sys_ids = self.render_ids(messages[:1], tools, kwargs, "")
+                c, m = 0, min(len(sys_ids), len(ids) - 1)
+                while c < m and sys_ids[c] == ids[c]:
+                    c += 1
+                if c >= 1024:
+                    given["_marks"] = [c]
+                print(f"[maya] system message: {c} of {len(ids)} tokens (mark)", flush=True)
+            except Exception as e:
+                print(f"[maya] system mark failed: {e!r}", flush=True)
         self.embeddings.path = None
         media = media_of(messages)
         images = (deepseek_images(messages) if getattr(self.template, "deepseek", False)
@@ -4342,6 +4357,8 @@ def make_handler(svc: Service):
                 ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, cancel=cancel)
                 if kw.get("_prefill"):
                     sampling["_prefill"] = kw["_prefill"]
+                if kw.get("_marks"):   # (DeepSeek --parallel: the system message's end)
+                    sampling["_marks"] = kw["_marks"]
                 effective = {**svc.sampling_defaults, **svc.shared, **sampling}
                 config = {**req, **{k: effective[k] for k in ("temperature", "top_p") if k in effective}}
                 run = svc.run(ids, thinking, tools, max_new, sampling, cancel)
@@ -4375,6 +4392,8 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
+            if kw.get("_marks"):                               # (DeepSeek --parallel: the system message's end)
+                req = {**req, "_marks": kw["_marks"]}
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             if not (req.get("stream") and req.get("strata_resume") is True):   # (the web app's runs on, by design)
@@ -4468,6 +4487,8 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
+            if kw.get("_marks"):                               # (DeepSeek --parallel: the system message's end)
+                req = {**req, "_marks": kw["_marks"]}
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             watch_client(self, cancel)
