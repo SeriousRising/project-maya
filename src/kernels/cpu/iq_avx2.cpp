@@ -64,16 +64,17 @@ inline __m256i sc16(int a, int b) {
 inline __m256i sc32(int s) { return _mm256_set1_epi16(s); }
 
 // sc16_4[k] = sc16(2 (k & 15) + 1, 2 (k >> 4) + 1) (IQ2_XS's scale byte k), as a table: one load instead of sc16's
-// broadcasts and insert (all on port 5, Haswell / Broadwell's only shuffle port)
+// broadcasts and insert (all on port 5, Haswell / Broadwell's only shuffle port).  constexpr, as sc8_3: this TU is
+// built with -mavx2, so a run-time constructor would be vectorized and run before main, before cpu_avx2_ok().
 struct Sc16Tab {
-    alignas(32) int16_t v[256][16];
-    Sc16Tab() {
+    alignas(32) int16_t v[256][16]{};
+    constexpr Sc16Tab() {
         for (int k = 0; k < 256; ++k)
             for (int l = 0; l < 16; ++l) v[k][l] = (int16_t) (2 * ((l < 8 ? k : k >> 4) & 15) + 1);
     }
     __m256i operator[](unsigned k) const { return _mm256_load_si256((const __m256i*) v[k]); }
 };
-const Sc16Tab sc16_4;
+constexpr Sc16Tab sc16_4;
 
 // qwords t[a] t[b] t[c] t[d] without the shuffle port: broadcast loads put together by dword blends (p015), not
 // set_epi64x's inserts (ds4_iq_cpu.cpp's tab4)
@@ -393,7 +394,7 @@ inline void row_dot_k(const uint8_t* row, int nblocks, const block_q8_K* const* 
 // issues: the grid bytes are -1/0/+1, so ggml's |g| x sign(q8, g) is sign(q8, g) and the 2s+1 <= 15 scales go into
 // maddubs' unsigned operand (|lane| <= 2 x 15 x 128 = 3840, 8 of them a block <= 30720: int16 sums, one madd a block);
 // the delta signs come from a broadcast of the qh bytes (AND / CMPEQ / OR), the grid indices by pdep where it is fast
-// (iq1m_pdep), else in scalar registers into tab4.  The int32 lanes are ggml's exact integers, so the bits are too.
+// (iq1m_pdep()), else in scalar registers into tab4.  The int32 lanes are ggml's exact integers, so the bits are too.
 #if defined(_MSC_VER) && !defined(__clang__)
 inline uint64_t pdep64(uint64_t a, uint64_t m) { return _pdep_u64(a, m); }
 inline void cpuid0(unsigned leaf, unsigned r[4]) {
@@ -402,7 +403,7 @@ inline void cpuid0(unsigned leaf, unsigned r[4]) {
     for (int k = 0; k < 4; ++k) r[k] = (unsigned) x[k];
 }
 #else
-inline uint64_t pdep64(uint64_t a, uint64_t m) {   // (asm: this file is built without -mbmi2; run only if iq1m_pdep)
+inline uint64_t pdep64(uint64_t a, uint64_t m) {   // (asm: this file is built without -mbmi2; run only if iq1m_pdep())
     uint64_t r;
     __asm__("pdep %2, %1, %0" : "=r"(r) : "r"(a), "rm"(m));
     return r;
@@ -410,19 +411,23 @@ inline uint64_t pdep64(uint64_t a, uint64_t m) {   // (asm: this file is built w
 inline void cpuid0(unsigned leaf, unsigned r[4]) { __cpuid_count(leaf, 0, r[0], r[1], r[2], r[3]); }
 #endif
 // BMI2's pdep where it is fast: Intel since Haswell, AMD since Zen 3 (Zen 1/2 and Hygon run it in microcode).
-// DS4_RW_IQ1M_PDEP=0/1 picks the form on a BMI2 CPU (both exact; the start check tests the one in use).
-const bool iq1m_pdep = [] {
-    unsigned r[4];
-    cpuid0(0, r);
-    if (r[0] < 7) return false;
-    const bool amd = r[1] == 0x68747541u || r[1] == 0x6f677948u;   // "Auth"enticAMD, "Hygo"nGenuine
-    cpuid0(1, r);
-    const unsigned family = ((r[0] >> 8) & 15) + ((r[0] >> 20) & 255);
-    cpuid0(7, r);
-    if (((r[1] >> 8) & 1) == 0) return false;
-    if (const char* v = std::getenv("DS4_RW_IQ1M_PDEP")) return std::atoi(v) != 0;
-    return !amd || family >= 0x19;
-}();
+// DS4_RW_IQ1M_PDEP=0/1 picks the form on a BMI2 CPU (both exact; the start check tests the one in use).  Probed on
+// first use (a function-local static), only ever reached behind cpu_avx2_ok(): no code of this TU runs before main.
+bool iq1m_pdep() {
+    static const bool pd = [] {
+        unsigned r[4];
+        cpuid0(0, r);
+        if (r[0] < 7) return false;
+        const bool amd = r[1] == 0x68747541u || r[1] == 0x6f677948u;   // "Auth"enticAMD, "Hygo"nGenuine
+        cpuid0(1, r);
+        const unsigned family = ((r[0] >> 8) & 15) + ((r[0] >> 20) & 255);
+        cpuid0(7, r);
+        if (((r[1] >> 8) & 1) == 0) return false;
+        if (const char* v = std::getenv("DS4_RW_IQ1M_PDEP")) return std::atoi(v) != 0;
+        return !amd || family >= 0x19;
+    }();
+    return pd;
+}
 
 // a 32-value half's four grid entries (qs[0..3], the 3 high index bits in nibbles of qh[0..1])
 template <bool PD> inline __m256i iq1m_grid(const uint8_t* qs, const uint8_t* qh) {
@@ -441,14 +446,14 @@ template <bool PD> inline __m256i iq1m_grid(const uint8_t* qs, const uint8_t* qh
 
 // sc8_3[k]: bytes 0-15 2 (k & 7) + 1, bytes 16-31 2 (k >> 3 & 7) + 1 (a 32-value half's two scales, maddubs' u8 side)
 struct Sc8Tab {
-    alignas(32) int8_t v[64][32];
-    Sc8Tab() {
+    alignas(32) int8_t v[64][32]{};
+    constexpr Sc8Tab() {
         for (int k = 0; k < 64; ++k)
             for (int l = 0; l < 32; ++l) v[k][l] = (int8_t) (2 * ((l < 16 ? k : k >> 3) & 7) + 1);
     }
     __m256i operator[](unsigned k) const { return _mm256_load_si256((const __m256i*) v[k]); }
 };
-const Sc8Tab sc8_3;
+constexpr Sc8Tab sc8_3;
 
 template <int NT, bool PD>
 inline void row_dot_iq1m(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
@@ -499,7 +504,7 @@ inline void row_dot_iq1m(const uint8_t* row, int nblocks, const block_q8_K* cons
 template <int TY, int NT>
 inline void row_dot_any(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
     if constexpr (TY == 29) {
-        if (iq1m_pdep) row_dot_iq1m<NT, true>(row, nblocks, y, res);
+        if (iq1m_pdep()) row_dot_iq1m<NT, true>(row, nblocks, y, res);
         else row_dot_iq1m<NT, false>(row, nblocks, y, res);
     }
     else if constexpr (TY == 17) row_dot_iq2xs<NT>(row, nblocks, y, res);
