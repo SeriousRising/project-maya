@@ -288,12 +288,12 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
         std::vector<int> drafts;
         std::vector<float> conf;
         if (cum_min < 0) cum_min = dspark_cum_default();
-        // (the lookup's proposal first: with one, the drafter makes its rows past round()'s cut too - rw-08's lazy head
-        //  would skip them, and a cut first draft would leave none to weigh it against; without one, the lazy head)
+        // (the lookup's proposal first: with one, the drafter makes its first row even past round()'s cut - rw-08's lazy
+        //  head would skip it at a cut first draft, leaving none to weigh the lookup against; past it, the lazy cut)
         const bool lk_on = lk != nullptr;
         const int k = lk_on ? lk->sfx.propose(std::min(room, m.verify_max()) - 1, lk->buf.data()) : 0;
-        if (!m.draft(tok, drafts, conf, err, temperature, top_p, top_k, min_p, seed, counter, room - 1,
-                     k > 0 ? 0.0f : conf_min, k > 0 ? 0.0f : cum_min))
+        if (!m.draft(tok, drafts, conf, err, temperature, top_p, top_k, min_p, seed, counter, room - 1, conf_min, cum_min,
+                     k > 0 ? 1 : 0))
             return false;
         int keep = 0;
         float cum = 1.0f;
