@@ -1302,6 +1302,9 @@ struct Model::Impl {
     // a window of one through moe_gate_up / moe_down (DS4_MOE_TOKEN=0: win_experts, whose down rows run
     // before the wait for the CPU lane - the same bits, no faster)
     bool moe_token_path = std::getenv("DS4_MOE_TOKEN") == nullptr || std::atoi(std::getenv("DS4_MOE_TOKEN")) != 0;
+    // DS4_RW_DOWN_WAIT=1: a window of one waits for the CPU lane after its down rows, before the combine (as
+    // win_experts does) - the down rows run while the CPU lane computes (the same bits)
+    bool rw_down_wait = std::getenv("DS4_RW_DOWN_WAIT") != nullptr && std::atoi(std::getenv("DS4_RW_DOWN_WAIT")) != 0;
     int async_max_t = std::getenv("DS4_ASYNC_T") ? std::atoi(std::getenv("DS4_ASYNC_T")) : 8;   // windows up to this
     // a layer on one GPU with every expert in its VRAM leaves the host out of its decode: no CPU lane part to wait
     // for, so no mailbox seq and no wait - each wait is a round trip through the host (on Windows HIP, ~1 ms a
@@ -11043,6 +11046,16 @@ struct Model::Impl {
         return d_pen;
     }
 
+    // the token sample_tokens left in d.tok (-1 on a CUDA error, printed here: the callers reject it)
+    int tok_back(Dev& d) {
+        int t = -1;
+        cudaError_t e = cudaMemcpyAsync(&t, d.tok, 4, cudaMemcpyDeviceToHost, d.st);
+        if (e == cudaSuccess) e = cudaStreamSynchronize(d.st);
+        if (e == cudaSuccess) return t;
+        std::fprintf(stderr, "ds4 sample: %s\n", cudaGetErrorString(e));
+        return -1;
+    }
+
     // `hist_end`: the pick's penalty history ends there (toks[0 .. hist_end): the tokens up to its row's position)
     int sample_row(int row, float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter,
                    const float* bias, int64_t hist_end) {
@@ -11060,10 +11073,7 @@ struct Model::Impl {
         int h = 0;
         const int* hr = pen_rows(hist_end, 1, sp, h);
         strata::kernels::sample_tokens(d.logits + (size_t) row * g.vocab, 1, g.vocab, hr, h, sp, d.tok, d.st);
-        int t = -1;
-        cudaMemcpyAsync(&t, d.tok, 4, cudaMemcpyDeviceToHost, d.st);
-        cudaStreamSynchronize(d.st);
-        return t;
+        return tok_back(d);
     }
 
     // [y, drafts] at positions pos ..: the trunk's verdict, its next token, and the state back to what it kept.
@@ -11141,6 +11151,10 @@ struct Model::Impl {
             next = m < n ? h_idx[m]
                          : sample_row(n, temperature, top_p, top_k, min_p, seed, counter + (uint64_t) n, nullptr,
                                       p0 + 1 + n);
+            if (next < 0) {
+                err = "the verify sample failed";
+                return false;
+            }
         }
         drafts_q = false;
         if (d_p1 != nullptr) p1 = pv[m];   // (next's row)
@@ -12984,8 +12998,9 @@ struct Model::Impl {
         const size_t ld = mi == 0 ? (size_t) V : (size_t) vn;
         cudaSetDevice(d.id);
         // (an EXL3 head: as many activations at a time as its split-K partials fit the scratch - 8 for a shared head, 4
-        // for a whole one, each pass reading the whole share; a GGUF's: 4 at a time, as before)
-        const int per = d.head.fmt != 0 ? 4 : std::max(1, x3::mv_cols(d.head));
+        // for a whole one, each pass reading the whole share; a GGUF's: 8 at a time - a 5-row draft or a T <= 8 verify
+        // in one read of the head, each row's sums the same at any column count)
+        const int per = d.head.fmt != 0 ? 8 : std::max(1, x3::mv_cols(d.head));
         for (int c = r0; c < r0 + rows; c += per)
             if (!mv(d, {job(d.head, xn + (size_t) c * D, out + (size_t) c * ld, std::min(per, r0 + rows - c), D, ld)},
                     err))
@@ -13664,7 +13679,10 @@ struct Model::Impl {
                     m2.plan_ptr = LD.plan2;
                     gg::moe_gate_up(m2, d.x, d.xg, s);
                 }
-                if (lead) wait_seq(&resps[slot].seq, sq, s);
+                if (lead && mx && rw_down_wait) {   // (gg::moe_down's combine waits)
+                    ma.wait_ptr = &resps[slot].seq;
+                    ma.wait_val = sq;
+                } else if (lead) wait_seq(&resps[slot].seq, sq, s);
                 prof_mark(d, 4);
                 if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
                 else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
@@ -13862,11 +13880,9 @@ struct Model::Impl {
         const float* row = d.logits + (size_t) std::max(0, n_logits - 1) * g.vocab;
         if (d_p1 != nullptr) top1_prob(row, 1, g.vocab, d_p1, d.st);
         strata::kernels::sample_tokens(row, 1, g.vocab, hr, h, sp, d.tok, d.st);
-        int t = -1;
         float p = 1.0f;
-        cudaMemcpyAsync(&t, d.tok, 4, cudaMemcpyDeviceToHost, d.st);
         if (d_p1 != nullptr) cudaMemcpyAsync(&p, d_p1, 4, cudaMemcpyDeviceToHost, d.st);
-        cudaStreamSynchronize(d.st);
+        const int t = tok_back(d);   // (its sync on d.st brings p in too; -1 on a CUDA error)
         p1 = p;
         return t;
     }
@@ -13879,7 +13895,9 @@ struct Model::Impl {
         Dev& d = devs[(size_t) head_dev];
         cudaSetDevice(d.id);
         out.resize((size_t) std::max(1, n_logits) * g.vocab);
-        return cudaMemcpy(out.data(), d.logits, out.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+        // (on d.st: the legacy stream is not ordered after the non-blocking d.st's head)
+        return cudaMemcpyAsync(out.data(), d.logits, out.size() * 4, cudaMemcpyDeviceToHost, d.st) == cudaSuccess &&
+               cudaStreamSynchronize(d.st) == cudaSuccess;
     }
 
     void save_profile() const {

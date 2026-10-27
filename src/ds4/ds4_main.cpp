@@ -281,7 +281,8 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
     }
     if (!m.step(tok, true, err)) return false;
     out.push_back(m.sample(temperature, top_p, top_k, min_p, seed, counter++));
-    return true;
+    if (out.back() < 0) err = "the sample failed";
+    return out.back() >= 0;
 }
 
 struct Req {
