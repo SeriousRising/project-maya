@@ -2588,7 +2588,6 @@ int main(int argc, char** argv) {
         }
         return serve(m, eos, spec, o.dspark_conf, o.pack, lk.get());
     }
-    if (multi_check) return check_multi(m, parse_ids(ids_s), std::max(2, n));
     if (!ppl.empty()) {   // --ppl FILE: a line a sequence of ids (BOS + text), each in one forward, tokens 2.. scored
         std::ifstream in(ppl);
         std::string line;
@@ -2663,6 +2662,7 @@ int main(int argc, char** argv) {
         ids_s = all;
     }
     const std::vector<int> ids = parse_ids(ids_s);
+    if (multi_check) return check_multi(m, ids, std::max(2, n));   // (after --ids @FILE is read)
     if (!images.empty()) {   // --images: a GENI file's pictures, for the prompt's spans
         std::vector<Pic> pics;
         if (!read_pics(images, pics, err)) {
