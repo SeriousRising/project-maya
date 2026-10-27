@@ -4087,6 +4087,15 @@ struct Model::Impl {
             ++c.it_ram;
             return;
         }
+        if (in_ram && copy_mode && NH == 1 && rw_flow_direct && !o.expert_cache && zc_ok(l, e)) {   // (review S2: a cache swap may rewrite a copy mid-DMA)   // (rw-03: DMA'd from where its
+            // pinned copy lies, as the RAM tier's branch above: the member's gate / up rows at their offset in the
+            // copy, its down whole; host addresses - zc_mat's delta is for device-side pulls, a DMA's source is
+            // the pinned pages themselves)
+            const uint8_t* p = ram_part[(size_t) l.ram[(size_t) e]][0];
+            for (int r = 0; r < 3; ++r) it.src[r] = p + cp_lay[(size_t) l.il][(size_t) r] + mx_read_off(l, mi, r);
+            ++c.it_ram;
+            return;
+        }
         if (in_ram)   // (copied into staging by io, then DMA'd; copy_mode: from its NH parts, flow_pump)
             it.ram = copy_mode ? ram_part[(size_t) l.ram[(size_t) e]][0] : ram_slots[(size_t) l.ram[(size_t) e]];
         bool hit = false;
@@ -5643,6 +5652,10 @@ struct Model::Impl {
     // failed pin leaves every copy to the staging.  A device that does not address registered memory at its host
     // address (Windows' WDDM) takes its mapped pointer (cudaHostGetDevicePointer, one GPU)
     const bool pin_by_need = env_f("STRATA_DS4_PIN_BY_NEED", 0.0f) != 0.0f;
+    // (rw-03, DS4_RW_FLOW_DIRECT=1: the prompt flow DMAs the copied experts from where they lie instead of copying
+    //  them into the pinned staging first - zc_pin pins the copies for it even with the decode stream lane off
+    //  (MAYA_DS4_STREAM=0); decode's placement and lane stay as they are)
+    const bool rw_flow_direct = env_f("DS4_RW_FLOW_DIRECT", 0.0f) != 0.0f;
     const double pin_cap_gb = env_f("STRATA_DS4_PIN_GB", 0.0f);
     std::vector<char> zc_slot;             // ram_part slot -> its copy is pinned (pin by need)
     std::vector<ptrdiff_t> zc_delta;       // ram_part slot -> device address - host address (0: the same)
@@ -5687,9 +5700,13 @@ struct Model::Impl {
     }
     bool zc_allowed() const {
         const char* v = std::getenv("DS4_STREAM_ZC");
-        if ((v != nullptr && std::atoi(v) == 0) || lane_env_off() || !pk.gguf) return false;
+        if ((v != nullptr && std::atoi(v) == 0) || !pk.gguf) return false;
+        // (rw-03: DS4_RW_FLOW_DIRECT asks for the pin for the prompt flow's sake, the decode stream lane off
+        //  (MAYA_DS4_STREAM=0) or not; the lane itself stays off - lane_alloc / lane_setup never ran, so ln_zc
+        //  alone streams nothing at decode)
+        if (lane_env_off() && !rw_flow_direct) return false;
         // (off the one-GPU path: only when asked - DS4_STREAM_ZC=1, or MAYA_DS4_PIN_BY_NEED's own opt-in)
-        if (!ln_one && v == nullptr && !pin_by_need) return false;
+        if (!ln_one && v == nullptr && !pin_by_need && !(rw_flow_direct && lane_env_off())) return false;   // (review S1: with the lane on, the switch does not turn on in-place pulls)
         for (const LaneDev& D : ln_dev)   // (an integrated GPU's kernels may read the staging in place: theirs)
             if (D.integrated) return false;
         return zc_host_ptr() || (pin_by_need && devs.size() == 1);
@@ -5779,7 +5796,11 @@ struct Model::Impl {
             }
         zc_chunk = std::move(done);
         ln_zc = gb > 0;
-        if (pin_by_need)
+        if (rw_flow_direct && lane_env_off())
+            std::fprintf(stderr, "ds4: rw-03 flow direct: %.1f of the copies' %.1f GB pinned (%.1f s): the prompt flow "
+                                 "DMAs those from where they lie, the rest through the staging; decode's stream lane "
+                                 "stays off\n", gb, all, (now_ms() - t0) / 1000.0);
+        else if (pin_by_need)
             std::fprintf(stderr, "ds4: PCIe lane: pin by need: %.1f of the copies' %.1f GB pinned, the most-used layers first "
                                  "(%.1f s): those pulled in place, the rest through the staging\n", gb, all,
                          (now_ms() - t0) / 1000.0);
