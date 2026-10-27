@@ -12211,6 +12211,7 @@ struct Model::Impl {
     void calibrate_flow_cpu() {
         flow_cpu_dma.assign(devs.size(), 0.0);
         if (!rw_flow_cpu) return;
+        plan_streams();   // the first run has not made the host lists this calibration samples yet
         for (size_t di = 0; di < chunks.size(); ++di) {
             if (chunks[di] == nullptr || !chunks[di]->flow) continue;
             Chunk& c = *chunks[di];
