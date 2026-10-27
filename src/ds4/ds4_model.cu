@@ -4454,8 +4454,7 @@ struct Model::Impl {
         }
         std::fprintf(stderr, "ds4: flow CPU vs GPU: CUDA%d layer %d: %d of %zu rows from the GPU: lane max |diff| %.4g "
                              "RMS %.4g, F32 max |diff| %.4g RMS %.4g (RMS: of the GPU output's); tokens 0-3: lane %.4g, "
-                             "F32 %.4g of max |GPU| %.4g
-",
+                             "F32 %.4g of max |GPU| %.4g\n",
                      devs[(size_t) c.dev].id, l.il, c.cpu_grab, R, dl, sg > 0 ? std::sqrt(sl / sg) : 0.0, df,
                      sg > 0 ? std::sqrt(sf / sg) : 0.0, el, ef, eg);
         if (rw_flow_cpu_check == 4) std::memcpy(c.cpu_y, c.cpu_gy.data(), R * E * 4);
