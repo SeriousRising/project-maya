@@ -21,7 +21,7 @@ void iq256_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const 
 /// See iq512_set_q5k_fused.
 void iq256_set_q5k_fused(bool fused) noexcept;
 
-/// Decode-step rows for IQ1_M, IQ3_XXS and IQ3_S with cheaper decoding; iq256_rows' arguments and exactness.
+/// Decode-step rows for IQ1_M, IQ2_XS, IQ3_XXS and IQ3_S with cheaper decoding; iq256_rows' arguments and exactness.
 bool iq256_rows1_supported(int ggml_type) noexcept;
 void iq256_rows1(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                  float* const* out, int r0, int r1);
