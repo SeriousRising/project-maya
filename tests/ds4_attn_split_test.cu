@@ -8,6 +8,11 @@
 //   DS4_ATTN_SPLIT=1 ./ds4_attn_split_test --rope   (DS4_RW_SPLIT_ROPE: sparse_attn with AttnRope against finish(q),
 //     sparse_attn, finish(o) on the same inputs, bit for bit, T = 1..6, 10, 16 at several positions; then both timed.  With
 //     DS4_ATTN_SPLIT=0 it checks the stock fallback the same way)
+//   DS4_ATTN_SPLIT=1 ./ds4_attn_split_test --tc   (DS4_RW_ATTN_TC: attn_part_mma (chunks of 16 / 32 rows) and the FP32 split
+//     against the double reference and each other - packed rows at T = 1..16 at two score scales, the drafter's BF16
+//     rows against the stock BF16 kernel - then the time a call (RoPE fold on) at T = 1, 2, 5, 6, 16, context 4K / 32K,
+//     a ratio-4 layer (128 + 512 picked) and a ratio-128 layer (128 + every compressed row).  The dispatch itself:
+//     DS4_ATTN_SPLIT=1 DS4_RW_ATTN_TC=1 with no flag (1e-4 vs double) and with --rope (the fold, bitwise))
 //   ./ds4_attn_split_test --hc   (DS4_RW_HC_PRE / DS4_RW_HC_FUSE: hc_pre_norm_n_kernel against hc_pre_norm_kernel and
 //     hc_post_pre_norm_kernel against hc_post_kernel + hc_pre_norm_kernel, bit for bit at dim 5120, hc 4, T = 1..16; timed)
 // Build: cmake --build build --target ds4_attn_split_test (target next to ds4_gguf_test in CMakeLists.txt)
@@ -61,18 +66,20 @@ struct Cfg {
 };
 
 int main(int argc, char** argv) {
-    const int heads = 64, d = 512, kcap = 512, n_ckv = 4096, n_winrows = 1024;
+    const int heads = 64, d = 512, kcap = 512, n_winrows = 1024;
     const float scale = 1.0f / std::sqrt((float) d);
     const char* dump = nullptr;
     const char* cmp = nullptr;
-    bool time_only = false, rope_mode = false, hc_mode = false;
+    bool time_only = false, rope_mode = false, hc_mode = false, tc_mode = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--dump") == 0 && i + 1 < argc) dump = argv[++i];
         else if (std::strcmp(argv[i], "--cmp") == 0 && i + 1 < argc) cmp = argv[++i];
         else if (std::strcmp(argv[i], "--time") == 0) time_only = true;
         else if (std::strcmp(argv[i], "--rope") == 0) rope_mode = true;
         else if (std::strcmp(argv[i], "--hc") == 0) hc_mode = true;
+        else if (std::strcmp(argv[i], "--tc") == 0) tc_mode = true;
     }
+    const int n_ckv = tc_mode ? 8192 : 4096;   // (--tc: a 32K context's ratio-4 rows)
     cudaDeviceProp p{};
     CK(cudaGetDeviceProperties(&p, 0));
     const char* se = std::getenv("DS4_ATTN_SPLIT");
@@ -105,6 +112,48 @@ int main(int argc, char** argv) {
         return 2;
     }
     const float wmag = (float) rms, qmag = 3.0f / (scale * (float) rms * std::sqrt((float) d));
+    // the double reference: query t's window rows win[win0 + j], then its selected rows srows[sel[t][i]] (F32, d each)
+    auto reference = [&](const Cfg& c, const std::vector<float>& h_q, const std::vector<uint16_t>& h_win,
+                         const std::vector<float>& h_sink, const std::vector<int>& h_sel, int sel_stride, const float* srows) {
+        const int T = c.T;
+        std::vector<double> ref((size_t) T * heads * d), sc;
+        for (int t = 0; t < T; ++t) {
+            const int total = c.nwin[t] + c.nsel[t];
+            for (int h = 0; h < heads; ++h) {
+                const float* qh = h_q.data() + ((size_t) t * heads + h) * d;
+                sc.assign(total, 0.0);
+                double m = (double) h_sink[h];
+                for (int j = 0; j < total; ++j) {
+                    double s = 0;
+                    if (j < c.nwin[t]) {
+                        const uint16_t* row = h_win.data() + (size_t) (c.win0[t] + j) * d;
+                        for (int e = 0; e < d; ++e) s += (double) qh[e] * h_bf2f(row[e]);
+                    } else {
+                        const float* row = srows + (size_t) h_sel[(size_t) t * sel_stride + (j - c.nwin[t])] * d;
+                        for (int e = 0; e < d; ++e) s += (double) qh[e] * row[e];
+                    }
+                    sc[j] = s * scale;
+                    m = std::max(m, sc[j]);
+                }
+                double den = std::exp((double) h_sink[h] - m);
+                double* o = ref.data() + ((size_t) t * heads + h) * d;
+                for (int e = 0; e < d; ++e) o[e] = 0;
+                for (int j = 0; j < total; ++j) {
+                    const double pj = std::exp(sc[j] - m);
+                    den += pj;
+                    if (j < c.nwin[t]) {
+                        const uint16_t* row = h_win.data() + (size_t) (c.win0[t] + j) * d;
+                        for (int e = 0; e < d; ++e) o[e] += pj * h_bf2f(row[e]);
+                    } else {
+                        const float* row = srows + (size_t) h_sel[(size_t) t * sel_stride + (j - c.nwin[t])] * d;
+                        for (int e = 0; e < d; ++e) o[e] += pj * row[e];
+                    }
+                }
+                for (int e = 0; e < d; ++e) o[e] /= den;
+            }
+        }
+        return ref;
+    };
 
     std::vector<Cfg> cfgs = {
         {"T=1 deep (128+512)", 1, {128}, {512}, {0}},
@@ -204,6 +253,192 @@ int main(int argc, char** argv) {
         }
         std::printf("%s\n", hok ? "HC ALL BITWISE" : "HC FAILED");
         return hok ? 0 : 1;
+    }
+    if (tc_mode) {
+        // own scratch: 48 chunks (16-row chunks up to 768 rows; the engine's is kSplitCap = 24)
+        attnsplit::AttnSplitScratch sc;
+        sc.nsplit = 48;
+        sc.max_t = 16;
+        CK(cudaMalloc((void**) &sc.part, (size_t) 16 * heads * sc.nsplit * d * 4));
+        CK(cudaMalloc((void**) &sc.ml, (size_t) 16 * heads * sc.nsplit * 2 * 4));
+        struct Err {
+            double abs = 0, rel = 0, erel = 0;   // max |a - b|, that over max |b|, max elementwise (|b| >= 1e-3 max |b|)
+        };
+        auto err = [](const std::vector<float>& a, const std::vector<double>& b) {
+            double omax = 0;
+            for (double v : b) omax = std::max(omax, std::fabs(v));
+            Err e;
+            for (size_t i = 0; i < a.size(); ++i) {
+                const double x = std::isfinite(a[i]) ? std::fabs(a[i] - b[i]) : INFINITY;
+                e.abs = std::max(e.abs, x);
+                if (std::fabs(b[i]) >= 1e-3 * omax) e.erel = std::max(e.erel, x / std::fabs(b[i]));
+            }
+            e.rel = e.abs / omax;
+            return e;
+        };
+        auto todouble = [](const std::vector<float>& v) { return std::vector<double>(v.begin(), v.end()); };
+        auto fetch = [](const float* p, size_t n) {
+            std::vector<float> v(n);
+            CK(cudaMemcpy(v.data(), p, n * 4, cudaMemcpyDeviceToHost));
+            return v;
+        };
+        // the drafter's block rows (BF16, every query selects all T; as ds4_model.cu's l.mtp)
+        const int n_blk = 16;
+        std::vector<uint16_t> h_blk((size_t) n_blk * d);
+        for (auto& v : h_blk) v = h_f2bf(nd(rng) * wmag);
+        std::vector<float> h_blkf(h_blk.size());
+        for (size_t i = 0; i < h_blk.size(); ++i) h_blkf[i] = h_bf2f(h_blk[i]);
+        uint16_t* d_blk;
+        CK(cudaMalloc(&d_blk, h_blk.size() * 2));
+        CK(cudaMemcpy(d_blk, h_blk.data(), h_blk.size() * 2, cudaMemcpyHostToDevice));
+        std::vector<Cfg> dc = {
+            {"drafter T=2 (37+2)", 2, {37, 37}, {2, 2}, {0, 0}},
+            {"drafter T=6 (128+6)", 6, {128, 128, 128, 128, 128, 128}, {6, 6, 6, 6, 6, 6}, {0, 0, 0, 0, 0, 0}},
+            {"drafter T=16 (128+16)", 16,
+             {128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128},
+             {16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16}, {0}},
+        };
+        bool tok = true;
+        double worst = 0;
+        for (int pass = 0; pass < 2; ++pass)
+            for (const float qs : {1.0f, 3.0f}) {   // score spread ~3 and ~9 (a peaked softmax)
+                const std::vector<Cfg>& cl = pass ? dc : cfgs;
+                for (const Cfg& c : cl) {
+                    const int T = c.T;
+                    const bool bf = pass == 1;
+                    AttnRows ar{};
+                    int total_max = 0;
+                    for (int t = 0; t < T; ++t) {
+                        ar.win0[t] = c.win0[t];
+                        ar.nwin[t] = c.nwin[t];
+                        ar.nsel[t] = c.nsel[t];
+                        total_max = std::max(total_max, c.nwin[t] + c.nsel[t]);
+                    }
+                    std::vector<uint16_t> h_win((size_t) n_winrows * d);
+                    for (auto& v : h_win) v = h_f2bf(nd(rng) * wmag);
+                    std::vector<float> h_q((size_t) T * heads * d), h_sink(heads);
+                    for (auto& v : h_q) v = nd(rng) * qmag * qs;
+                    for (auto& v : h_sink) v = nd(rng) * 2.0f;
+                    std::vector<int> h_sel((size_t) T * kcap, 0);
+                    for (int t = 0; t < T; ++t)
+                        for (int i = 0; i < kcap; ++i) h_sel[(size_t) t * kcap + i] = bf ? i % n_blk : rowpick(rng);
+                    uint16_t* d_win;
+                    float *d_q, *d_sink, *d_out;
+                    int* d_sel;
+                    const size_t nq = h_q.size();
+                    CK(cudaMalloc(&d_win, h_win.size() * 2));
+                    CK(cudaMalloc(&d_q, nq * 4));
+                    CK(cudaMalloc(&d_sink, heads * 4));
+                    CK(cudaMalloc(&d_sel, h_sel.size() * 4));
+                    CK(cudaMalloc(&d_out, nq * 4));
+                    CK(cudaMemcpy(d_win, h_win.data(), h_win.size() * 2, cudaMemcpyHostToDevice));
+                    CK(cudaMemcpy(d_q, h_q.data(), nq * 4, cudaMemcpyHostToDevice));
+                    CK(cudaMemcpy(d_sink, h_sink.data(), heads * 4, cudaMemcpyHostToDevice));
+                    CK(cudaMemcpy(d_sel, h_sel.data(), h_sel.size() * 4, cudaMemcpyHostToDevice));
+                    const std::vector<double> ref = reference(c, h_q, h_win, h_sink, h_sel, kcap, bf ? h_blkf.data() : h_dec.data());
+                    const uint8_t* ck = bf ? (const uint8_t*) d_blk : d_ckv;
+                    // today's path: the FP32 split (packed rows) or the stock BF16 kernel (the drafter)
+                    CK(cudaMemset(d_out, 0xff, nq * 4));
+                    if (bf)
+                        sparse_attn_kernel<false><<<dim3(heads, T), kThreads>>>(d_q, d_win, d_blk, d_sel, kcap, ar, d_sink, heads, d, scale, d_out);
+                    else
+                        attnsplit::sparse_attn_split<4, 40>(d_q, d_win, d_ckv, kv_row_bytes(kKvFp4, d), d_sel, kcap, ar, d_sink, heads, T,
+                                                            scale, d_out, sc, total_max, 0);
+                    CK(cudaGetLastError());
+                    const std::vector<float> o_old = fetch(d_out, nq);
+                    const Err e_old = err(o_old, ref);
+                    std::printf("%-38s q x%.0f  %s vs double: max_abs %.3g rel %.2e erel %.2e\n", c.name, qs, bf ? "stock" : "split",
+                                e_old.abs, e_old.rel, e_old.erel);
+                    for (int NT = 1; NT <= 2; ++NT) {
+                        if (total_max > sc.nsplit * 16 * NT) continue;
+                        CK(cudaMemset(d_out, 0xff, nq * 4));
+                        if (NT == 1) sparse_attn_split_tc<1>(d_q, d_win, ck, bf, d_sel, kcap, ar, d_sink, heads, T, scale, d_out, sc, total_max, 0);
+                        else sparse_attn_split_tc<2>(d_q, d_win, ck, bf, d_sel, kcap, ar, d_sink, heads, T, scale, d_out, sc, total_max, 0);
+                        CK(cudaGetLastError());
+                        const std::vector<float> o = fetch(d_out, nq);
+                        const Err e = err(o, ref), ev = err(o, todouble(o_old));
+                        const bool pass_ = e.rel <= 1e-3;   // (bound for a hi/lo BF16 product: ~2^-16 a term)
+                        tok = tok && pass_;
+                        worst = std::max(worst, e.rel);
+                        std::printf("    tc %2d-row chunks vs double: max_abs %.3g rel %.2e erel %.2e | vs %s: max_abs %.3g rel %.2e erel %.2e  %s\n",
+                                    16 * NT, e.abs, e.rel, e.erel, bf ? "stock" : "split", ev.abs, ev.rel, ev.erel, pass_ ? "ok" : "FAIL");
+                    }
+                    CK(cudaFree(d_win));
+                    CK(cudaFree(d_q));
+                    CK(cudaFree(d_sink));
+                    CK(cudaFree(d_sel));
+                    CK(cudaFree(d_out));
+                }
+            }
+        std::printf("%s (worst tc rel vs double %.2e)\n", tok ? "TC ACCURACY OK" : "TC ACCURACY FAILED", worst);
+        // ---- time a call (the RoPE fold on, as served): context 4K / 32K, ratio-4 and ratio-128 layers, T = 1, 2, 5, 6, 16
+        std::vector<float> h_fr(32);
+        for (int i = 0; i < 32; ++i) h_fr[i] = (float) std::pow(10000.0, -2.0 * i / 64.0);
+        float* d_fr;
+        CK(cudaMalloc(&d_fr, 32 * 4));
+        CK(cudaMemcpy(d_fr, h_fr.data(), 32 * 4, cudaMemcpyHostToDevice));
+        std::vector<uint16_t> h_win((size_t) n_winrows * d);
+        for (auto& v : h_win) v = h_f2bf(nd(rng) * wmag);
+        std::vector<float> h_q((size_t) 16 * heads * d), h_sink(heads);
+        for (auto& v : h_q) v = nd(rng) * qmag;
+        for (auto& v : h_sink) v = nd(rng) * 2.0f;
+        uint16_t* d_win;
+        float *d_q, *d_sink, *d_out;
+        int* d_sel;
+        CK(cudaMalloc(&d_win, h_win.size() * 2));
+        CK(cudaMalloc(&d_q, h_q.size() * 4));
+        CK(cudaMalloc(&d_sink, heads * 4));
+        CK(cudaMalloc(&d_sel, (size_t) 16 * kcap * 4));
+        CK(cudaMalloc(&d_out, h_q.size() * 4));
+        CK(cudaMemcpy(d_win, h_win.data(), h_win.size() * 2, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_q, h_q.data(), h_q.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_sink, h_sink.data(), heads * 4, cudaMemcpyHostToDevice));
+        cudaEvent_t e0, e1;
+        CK(cudaEventCreate(&e0));
+        CK(cudaEventCreate(&e1));
+        attnsplit::SplitRope rp{d_fr, 8189};
+        std::printf("time a call, us (RoPE fold on; engine picks 16-row chunks at T=1 up to 160 rows, else 32):\n");
+        std::printf("%-7s %-26s %3s %9s %9s %9s\n", "ctx", "layer", "T", "split", "tc16", "tc32");
+        for (const int ctx : {4096, 32768})
+            for (const int ratio : {4, 128}) {
+                const int ncomp = ctx / ratio, nsel = std::min(kcap, ncomp);
+                std::vector<int> h_sel((size_t) 16 * kcap);
+                for (int t = 0; t < 16; ++t)
+                    for (int i = 0; i < kcap; ++i)
+                        h_sel[(size_t) t * kcap + i] = ratio == 4 ? (int) (rng() % (unsigned) ncomp) : i % ncomp;
+                CK(cudaMemcpy(d_sel, h_sel.data(), h_sel.size() * 4, cudaMemcpyHostToDevice));
+                for (const int T : {1, 2, 5, 6, 16}) {
+                    AttnRows ar{};
+                    for (int t = 0; t < T; ++t) ar.win0[t] = t, ar.nwin[t] = 128, ar.nsel[t] = nsel;
+                    const int total_max = 128 + nsel;
+                    float us[3] = {-1, -1, -1};
+                    for (int k = 0; k < 3; ++k) {
+                        if (k == 1 && total_max > sc.nsplit * 16) continue;
+                        auto run = [&] {
+                            if (k == 0)
+                                attnsplit::sparse_attn_split<4, 40>(d_q, d_win, d_ckv, kv_row_bytes(kKvFp4, d), d_sel, kcap, ar, d_sink,
+                                                                    heads, T, scale, d_out, sc, total_max, 0, &rp);
+                            else if (k == 1)
+                                sparse_attn_split_tc<1>(d_q, d_win, d_ckv, false, d_sel, kcap, ar, d_sink, heads, T, scale, d_out, sc, total_max, 0, &rp);
+                            else
+                                sparse_attn_split_tc<2>(d_q, d_win, d_ckv, false, d_sel, kcap, ar, d_sink, heads, T, scale, d_out, sc, total_max, 0, &rp);
+                        };
+                        for (int i = 0; i < 10; ++i) run();
+                        CK(cudaEventRecord(e0));
+                        for (int i = 0; i < 200; ++i) run();
+                        CK(cudaEventRecord(e1));
+                        CK(cudaEventSynchronize(e1));
+                        CK(cudaGetLastError());
+                        float ms = 0;
+                        CK(cudaEventElapsedTime(&ms, e0, e1));
+                        us[k] = ms / 200 * 1000;
+                    }
+                    char lay[40];
+                    std::snprintf(lay, sizeof lay, "ratio %d (128+%d rows)", ratio, nsel);
+                    std::printf("%-7s %-26s %3d %9.1f %9.1f %9.1f\n", ctx == 4096 ? "4K" : "32K", lay, T, us[0], us[1], us[2]);
+                }
+            }
+        return tok ? 0 : 1;
     }
     if (rope_mode) {
         std::vector<Cfg> rc = {
@@ -402,43 +637,7 @@ int main(int argc, char** argv) {
         std::vector<float> h_out(h_q.size());
         CK(cudaMemcpy(h_out.data(), d_out, h_out.size() * 4, cudaMemcpyDeviceToHost));
         all_out.insert(all_out.end(), h_out.begin(), h_out.end());
-        // the host reference in double
-        std::vector<double> ref(h_q.size()), sc;
-        for (int t = 0; t < T; ++t) {
-            const int total = c.nwin[t] + c.nsel[t];
-            for (int h = 0; h < heads; ++h) {
-                const float* qh = h_q.data() + ((size_t) t * heads + h) * d;
-                sc.assign(total, 0.0);
-                double m = (double) h_sink[h];
-                for (int j = 0; j < total; ++j) {
-                    double s = 0;
-                    if (j < c.nwin[t]) {
-                        const uint16_t* row = h_win.data() + (size_t) (c.win0[t] + j) * d;
-                        for (int e = 0; e < d; ++e) s += (double) qh[e] * h_bf2f(row[e]);
-                    } else {
-                        const float* row = h_dec.data() + (size_t) h_sel[(size_t) t * kcap + (j - c.nwin[t])] * d;
-                        for (int e = 0; e < d; ++e) s += (double) qh[e] * row[e];
-                    }
-                    sc[j] = s * scale;
-                    m = std::max(m, sc[j]);
-                }
-                double den = std::exp((double) h_sink[h] - m);
-                double* o = ref.data() + ((size_t) t * heads + h) * d;
-                for (int e = 0; e < d; ++e) o[e] = 0;
-                for (int j = 0; j < total; ++j) {
-                    const double pj = std::exp(sc[j] - m);
-                    den += pj;
-                    if (j < c.nwin[t]) {
-                        const uint16_t* row = h_win.data() + (size_t) (c.win0[t] + j) * d;
-                        for (int e = 0; e < d; ++e) o[e] += pj * h_bf2f(row[e]);
-                    } else {
-                        const float* row = h_dec.data() + (size_t) h_sel[(size_t) t * kcap + (j - c.nwin[t])] * d;
-                        for (int e = 0; e < d; ++e) o[e] += pj * row[e];
-                    }
-                }
-                for (int e = 0; e < d; ++e) o[e] /= den;
-            }
-        }
+        const std::vector<double> ref = reference(c, h_q, h_win, h_sink, h_sel, kcap, h_dec.data());
         double omax = 0, emax = 0;
         bool nan = false;
         for (size_t i = 0; i < ref.size(); ++i) {
