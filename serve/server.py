@@ -51,7 +51,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve import ds4_vision, gpu_map, loop_guard, mm3_vision  # noqa: E402
+from serve import ds4_vision, gpu_map, loop_guard, mm3_vision, models, savings  # noqa: E402
 
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
 from serve.frontend import (CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
@@ -674,6 +674,9 @@ class StrataEngine:
 
     def _pump(self):
         for line in self.proc.stdout:
+            if line.startswith("VRAM "):
+                self._vram_line(line)
+                continue
             if self.multi and self._route(line):
                 continue
             self.lines.put(line)
@@ -682,6 +685,13 @@ class StrataEngine:
         with self._routes_lock:
             for q in self._routes.values():
                 q.put(None)
+
+    def _vram_line(self, line: str) -> None:
+        """A VRAM line after the start (maya-ds4: its vision tower's room taken for a request's pictures, then given
+        back): the Monitor's map of that GPU follows it."""
+        part = gpu_map.parse(line)
+        if part:
+            self.vram = [part if v.get("dev") == part["dev"] else v for v in self.vram]
 
     _TAGGED = ("T ", "PP ", "DONE ", "ERR ")
 
@@ -872,6 +882,9 @@ class StrataEngine:
                 v = tune.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
                     tune_keys += f" {k}={float(v)!r}"
+            sd = tune.get("suffix_draft")   # the DeepSeek engine's prompt lookup beside DSpark: off (0) / on (1)
+            if isinstance(sd, int) and not isinstance(sd, bool) and sd in (0, 1):
+                tune_keys += f" suffix_draft={sd}"
             ct = tune.get("cpu_threads")   # the GLM engine's CPU lane threads (fewer than it started with)
             if isinstance(ct, int) and not isinstance(ct, bool) and ct > 0:
                 tune_keys += f" cpu_threads={ct}"
@@ -1746,9 +1759,12 @@ class Service:
         self.status_lock = threading.Lock()
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         self.config_path = None                          # the run config (a context change is saved into it)
+        self.savings = None                              # serve/savings.py's Ledger: what the API would have charged
         self.model_dir = None                            # the model's folder (free disk on the dashboard)
         self.model_label = None                          # what runs, as users see it: "MiniMax M3.1 · Maya-XS"
         self.trained_context = None                      # what the model was trained for (its GGUF): the slider's top
+        self.dspark = None                               # DeepSeek's: drafts with its DSpark blocks (its engine's INFO
+        #                                                  does not say: the config's --dspark and the pack's drafter)
         self.reload = None                               # a context change: {state, from, to, started, error}
         # "idle_unload_s" / --idle-unload (as Strata's): after this long without a request the engine ends, giving back
         # its GPU memory and its pinned RAM tier, and the next request starts it again (0: never).  With
@@ -1952,7 +1968,8 @@ class Service:
                 "kv_gb": info.get("kv_gb"), "kv_ctx": info.get("kv_ctx"),
                 "kv_resident": info.get("kv_resident") or 0,
                 "kv_ram_gb": round(kv_ram / 2**30, 3) if kv_ram else None, **ram,
-                "vram_gb": info.get("vram_gb"), "vram_slots": info.get("vram_slots"), "reload": reload}
+                "vram_gb": info.get("vram_gb"), "vram_slots": info.get("vram_slots"), "reload": reload,
+                "load_s": getattr(self.engine, "load_s", None)}   # (the engine's last load: what a reload takes here)
 
     def set_context(self, n: int) -> dict:
         """Reload the engine with an n-token context (the dashboard's Context size), on a thread: after the request in
@@ -1985,8 +2002,10 @@ class Service:
                 self.reload["state"] = "running"
             print(f"[maya] reloading the model with a {n}-token context (was {old}) ...", flush=True)
             err = None
+            t0 = time.time()
             try:
                 self._restart_with(n)
+                self.engine.load_s = round(time.time() - t0, 1)
             except Exception as e:  # noqa: BLE001 - any failed start: put the old context back
                 err = f"the engine did not start with a {n}-token context ({e})"
                 print(f"[maya] {err}; starting it again with {old} ...", flush=True)
@@ -2011,6 +2030,9 @@ class Service:
         try:
             p = Path(self.config_path)
             cfg = json.loads(p.read_text(encoding="utf-8-sig"))
+            inst = cfg.setdefault("installer", {})       # (the first change from the page: what the setup wrote first,
+            if "as_set_up" not in inst:                  #  the Models page's Reset - as models.save keeps it)
+                inst["as_set_up"] = models.settings_of(cfg)
             args = list(cfg.get("args") or [])
             if "--max-context" in args[:-1]:
                 args[args.index("--max-context") + 1] = str(int(n))
@@ -2084,6 +2106,94 @@ class Service:
                     script.write_bytes(new)
             except OSError as e:
                 print(f"[maya] could not change the port in {script.name}: {e}", flush=True)
+
+    # -------------------------------------------------------------- the Models page (serve/models.py)
+    def models_root(self) -> Path:
+        """Where the configs are: beside this server's own (maya.py's folder)."""
+        return Path(self.config_path).parent if self.config_path else ROOT
+
+    def models_info(self) -> dict:
+        """The configs the setup wrote, the running one marked, each with its engine settings; whether a switch or a
+        change to the running one can start Maya again at once (maya.py started this server)."""
+        out = models.listing(self.models_root(), self.config_path)
+        out.update(restarts=bool(os.environ.get("MAYA_RESTART_ON_UPDATE")),
+                   running=Path(self.config_path).name if self.config_path else None,
+                   restarting=getattr(self, "model_restart", None))
+        return out
+
+    def _model_path(self, name) -> Path:
+        name = str(name or "")
+        p = self.models_root() / name
+        if (not re.fullmatch(r"maya-[^/\\]+\.json", name) or name.endswith(".shared-settings.json")
+                or not p.is_file()):
+            raise ValueError(f"no model config named {name!r} here")
+        return p
+
+    def _is_running(self, p: Path) -> bool:
+        return bool(self.config_path) and p.resolve() == Path(self.config_path).resolve()
+
+    def _restart_busy(self):
+        if getattr(self, "model_restart", None) or getattr(self, "port_restart", None):
+            raise ValueError("Maya is already starting again")
+        if self.reloading() or self.updater.busy():
+            raise ValueError("Maya is reloading or updating; try again when it is done")
+
+    def model_settings(self, name, settings, dry_run: bool = False) -> dict:
+        """The engine settings of the config `name` (the Models page): checked, and unless dry_run saved into it.  The
+        running model's start Maya again with them (when maya.py started this server), after the request in flight;
+        another model's apply when it is switched to.  dry_run: the command they make, nothing saved."""
+        p = self._model_path(name)
+        cfg = models.read(p)
+        if not cfg:
+            raise ValueError(f"{p.name}: not a config Maya can read")
+        new = models.apply(cfg, settings)                 # (a ValueError: what is wrong, nothing saved)
+        if dry_run:
+            return {"command": models.command(new), "settings": models.shown_settings(new)}
+        running = self._is_running(p)
+        if running:
+            self._restart_busy()
+        out = models.save(p, settings)
+        restarts = bool(running and out["changed"] and os.environ.get("MAYA_RESTART_ON_UPDATE"))
+        if restarts:
+            self._restart_into(p, "settings")
+        print(f"[maya] {p.name}: engine settings saved" + (": Maya starts again with them" if restarts else
+              " - they apply from its next start" if out["changed"] else " (nothing changed)"), flush=True)
+        return {**out, "running": running, "restarts": restarts}
+
+    def switch_model(self, name) -> dict:
+        """The Models page's Switch: the config `name` becomes the most recently used one (a start without --config
+        picks it), and when maya.py started this server it ends with RESTART_EXIT after the request in flight, leaving
+        maya.py a note (models.SWITCH_FILE) to start that config, on this port."""
+        p = self._model_path(name)
+        if self._is_running(p):
+            raise ValueError(f"{p.name} is the model running now")
+        cfg = models.read(p)
+        why = models.missing(cfg)                        # (maya.py would stop at it: no model would run)
+        if why:
+            raise ValueError(f"{p.name} cannot start: {why} - run the setup again to repair it")
+        self._restart_busy()
+        os.utime(p)
+        restarts = bool(os.environ.get("MAYA_RESTART_ON_UPDATE"))
+        if restarts:
+            self._restart_into(p, "switch")
+        print(f"[maya] {p.name} is the model to start" + (": Maya starts again with it" if restarts else
+              " next (a start without --config picks it)"), flush=True)
+        return {"to": p.name, "model": cfg.get("model_name") or "", "restarts": restarts}
+
+    def _restart_into(self, p: Path, why: str):
+        _, port = getattr(self, "listen", None) or ("127.0.0.1", None)
+        note = {"config": str(p.resolve()), "port": port, "why": why, "time": time.time()}
+        (self.models_root() / models.SWITCH_FILE).write_text(json.dumps(note), encoding="utf-8")
+        self.model_restart = {"to": p.name, "why": why, "started": time.time()}
+        threading.Thread(target=self._restart_for_models, args=(p.name, why), daemon=True).start()
+
+    def _restart_for_models(self, name: str, why: str):
+        time.sleep(0.5)                                  # (the answer to the page goes out first)
+        with self.fifo:                                  # the request in flight finishes first
+            print(f"[maya] starting again with {name} ..." if why == "switch" else
+                  f"[maya] starting again with {name}'s new engine settings ...", flush=True)
+            self.close_for_restart()
+            os._exit(RESTART_EXIT)
 
     def storage(self) -> dict | None:
         """The model's folder and the free space on its drive (About)."""
@@ -2241,10 +2351,13 @@ class Service:
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress[0], progress[1]
+        # the prompt the conversation cache already held (the Monitor's Context bar), from the engine's PP lines
+        live["prompt_reused"] = progress[2] if s.get("busy") and progress and len(progress) > 2 else None
         engine = {"model": self.model, "model_label": self.model_label, "max_context": self.engine.max_context,
                   "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {}), "maya_version": MAYA_VERSION,
-                  "trained_context": self.trained_context}
+                  "trained_context": self.trained_context,
+                  **({"dspark": self.dspark} if self.dspark is not None else {})}
         with self.status_lock:
             reload = dict(self.reload) if self.reload else None
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
@@ -2262,7 +2375,8 @@ class Service:
                 "requests": hist[::-1][:None if all_requests else 12],
                 "requests_kept": len(hist), "totals": totals, "loop_guard": guard, "hardware": hw,
                 "hardware_static":
-                tel["static"], "history": tel["history"], "time": now, "reload": reload, "storage": self.storage()}
+                tel["static"], "history": tel["history"], "time": now, "reload": reload, "storage": self.storage(),
+                "savings": self.savings.summary() if self.savings is not None else None}
 
     def _gpu_map(self, cards):
         """What fills each GPU (serve/gpu_map.py): the engine's VRAM lines and NVML's cards, with the engine's and the
@@ -3041,6 +3155,7 @@ class Service:
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
+            book = None                                 # (the savings' count: after the lock, it writes a file)
             with self.status_lock:
                 self.current_requests.discard(stat)
                 if counted:
@@ -3069,6 +3184,7 @@ class Service:
                     t["prompt_tokens"] += len(ids)
                     t["reused"] += last.get("reused") or 0
                     t["output_tokens"] += n
+                    book = (len(ids), last.get("reused") or 0, n)
                     t["prompt_ms"] += last.get("prompt_ms") or 0.0
                     t["decode_ms"] += last.get("decode_ms") or 0.0
                     fresh = getattr(self.engine, "last", None)
@@ -3094,6 +3210,8 @@ class Service:
                     hold[1] = False
                     self.active -= 1
                 self.status["busy"] = self.active > 0
+            if book is not None and self.savings is not None:
+                self.savings.add(*book)
         for ev in parser.finish():
             yield "event", ev
         yield "done", {"finish": finish, "completion_tokens": n, "reasoning_tokens": reasoning_tokens,
@@ -3922,6 +4040,14 @@ def make_handler(svc: Service):
                 # the dashboard's Port: where the server listens, and whether a new one applies at once
                 if self._authorized():
                     self._json(200, svc.port_info())
+            elif path == "/api/models":
+                # the Models page: the configs the setup wrote, the running one, each one's engine settings
+                if self._authorized():
+                    self._json(200, svc.models_info())
+            elif path == "/api/savings":
+                # the sidebar's Saved: what the model's own API would have charged for the same tokens, per model
+                if self._authorized():
+                    self._json(200, svc.savings.report() if svc.savings is not None else {"usd": None, "models": []})
             elif path == "/api/update":
                 # About > Updates: the latest release (GitHub, cached six hours; ?force=1 asks now) and whether this
                 # folder can update itself
@@ -4005,6 +4131,38 @@ def make_handler(svc: Service):
                     return
                 if path == "/api/update":
                     self._update()
+                    return
+                if path in ("/api/models/settings", "/api/models/switch"):
+                    self._models(path.rsplit("/", 1)[1])
+                    return
+                if path == "/api/savings/reset":
+                    # it clears every model's count: the app's own page only
+                    self._body()
+                    if not self._own_page("the savings can be reset"):
+                        return
+                    if svc.savings is None:
+                        self._json(400, {"error": {"type": "invalid_request_error", "message": "nothing is counted here"}})
+                        return
+                    svc.savings.reset()
+                    self._json(200, svc.savings.report())
+                    return
+                if path == "/api/savings/prices":
+                    # Settings > Savings: a model's API prices ({"model", "price": {input, cached, output} or null:
+                    # the built-in ones}); every total is counted again with them - the app's own page only
+                    body = self._body()
+                    if not self._own_page("the prices can be changed"):
+                        return
+                    try:
+                        req = json.loads(body or b"{}")
+                        if svc.savings is None:
+                            raise ValueError("nothing is counted here")
+                        if not isinstance(req, dict):
+                            raise ValueError("the request body must be a JSON object")
+                        svc.savings.set_price(req.get("model"), req.get("price"))
+                    except (TypeError, ValueError) as e:
+                        self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                        return
+                    self._json(200, svc.savings.report())
                     return
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
@@ -4112,6 +4270,24 @@ def make_handler(svc: Service):
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
                 return
             self._json(202, out)
+
+        def _models(self, what: str):
+            # They change which model runs, or how, for every client: only the app's own page
+            body = self._body()
+            if not self._own_page("models can be changed"):
+                return
+            try:
+                req = json.loads(body or b"{}")
+                if not isinstance(req, dict):
+                    raise ValueError("the request body must be a JSON object")
+                if what == "switch":
+                    out = svc.switch_model(req.get("file"))
+                else:
+                    out = svc.model_settings(req.get("file"), req.get("settings") or {}, bool(req.get("dry_run")))
+            except (TypeError, ValueError, OSError) as e:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                return
+            self._json(200 if what == "settings" and req.get("dry_run") else 202, out)
 
         def _update(self):
             # It replaces the server's files and restarts it for every client: only the app's own page
@@ -4790,14 +4966,20 @@ def main() -> int:
         print("loading the model (the first start takes a minute or two) ...", flush=True)
         if len(gpu_list(cfg)) > 1:
             print(f"[maya] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
+        t0 = time.time()
         engine = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env)
+        engine.load_s = round(time.time() - t0, 1)      # (the dashboard's estimate of a reload: this start's time)
         warn_tight_ram(engine.info.get("arena_mib"))
         if vision is None and not vcfg and engine.info.get("vision") == "ds4":
             # DeepSeek-V4.1: the engine's own vision tower (the checkpoint's); the server resizes the pictures
             vision = ds4_vision.Vision(ds4_vision.Geometry.from_info(engine.info),
                                        Path(tempfile.mkdtemp(prefix="maya-ds4-pictures-")), Vision.load)
-            print(f"[maya] images: the model's vision tower runs in the engine (GPU {engine.info.get('vision_gpu')}, "
-                  f"{engine.info.get('vision_mib')} MiB), up to {vision.g.max_tokens} tokens a picture", flush=True)
+            room = engine.info.get("vision_room")
+            where = (f"{engine.info.get('vision_mib')} MiB kept" if room in (None, "resident") else
+                     f"none between pictures, ~{engine.info.get('vision_room_mib')} MiB while one is read, lent by "
+                     + {"chunk": "the prompt buffers", "tail": "expert slots", "free": "free memory"}.get(room, room))
+            print(f"[maya] images: the model's vision tower runs in the engine (GPU {engine.info.get('vision_gpu')}: "
+                  f"{where}), up to {vision.g.max_tokens} tokens a picture", flush=True)
         elif vision is None and not vcfg and engine.info.get("vision") == "mm3":
             # MiniMax-M3.1-Flash: the engine's own vision tower; the server resizes the pictures
             vision = mm3_vision.Vision(mm3_vision.Geometry.from_info(engine.info),
@@ -4875,13 +5057,20 @@ def main() -> int:
     svc.model_label = maya_quants.config_label(cfg)     # (configs of every release: by their installer record)
     if a.config:
         svc.config_path = str(Path(a.config).resolve())  # a context change from the dashboard is saved there
+        p = Path(svc.config_path)                        # the tokens it serves, and what its API would have charged
+        svc.savings = savings.Ledger(p.parent / savings.FILE, p.name, svc.model, models.quant_label(cfg, p))
     args = [str(x) for x in cfg.get("args") or []]
     if "--glm-pack" in args[:-1]:                       # the model's folder: the pack's parent holds its GGUF files
         svc.model_dir = Path(args[args.index("--glm-pack") + 1]).resolve().parent
         threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(svc.model_dir)),
                          daemon=True).start()
-    elif "--pack" in args[:-1]:                         # DeepSeek's pack (its ds4.txt), MiniMax's (mm3.txt)
+    elif "--pack" in args[:-1]:                         # DeepSeek's pack (its ds4.txt), MiniMax's (mm3.txt); its folder
         svc.trained_context = trained_context_ds4(args[args.index("--pack") + 1])
+        svc.model_dir = Path(args[args.index("--pack") + 1]).resolve().parent
+        # (DeepSeek's engine drafts unless --dspark off / none - "none" does not even load the blocks - when the pack
+        #  has them; MiniMax's says so itself, INFO dspark=)
+        if models.family(cfg) == "deepseek":
+            svc.dspark = models.flag(args, "--dspark", "on") not in ("off", "none") and models.ds4_has_drafter(cfg)
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:

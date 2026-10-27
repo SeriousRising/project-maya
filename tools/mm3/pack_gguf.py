@@ -16,7 +16,8 @@ writes <model>/maya-mm3/ in pack.py's format, so maya-mm3 reads both:
 
 MiniMax-M3.1 runs its sparse attention's indexer in all 60 layers; stock llama.cpp's `minimax-m3` (M3) creates indexers
 only from the first MoE layer on, so the Maya sets keep layers 0-2's (12 tensors) in a side file beside the shards,
-<name>-maya-indexers.gguf: this pack takes it (--indexers names another).  Without it the pack stops: the engine runs
+<name>-maya-indexers.bin (a GGUF; .gguf before v1.1.31 - the Hub took a lone .gguf for the model): this pack takes
+it (--indexers names another).  Without it the pack stops: the engine runs
 the model as MiniMax defines it, never those layers on full attention in silence.
 
 The GGUF's norms already hold Gemma's 1 + w (llama.cpp's converter adds it): mm3.txt says so (norms_plus_one 1) and the
@@ -204,13 +205,18 @@ def write_tokenizer(out: pathlib.Path, kv: dict) -> dict:
     return special
 
 
+SIDE_BIN = "-maya-indexers.bin"                     # (a GGUF; the Hub reads a lone .gguf as the model)
+SIDE_NAMES = (SIDE_BIN, "-maya-indexers.gguf")       # (.gguf: its name up to v1.1.30)
+
+
 def find_shards(model: pathlib.Path, names: list[str] | None, indexers: str | None):
-    """(the main set's shards, the indexers' side file or None) - every .gguf in the folder unless named."""
-    paths = [model / n for n in names] if names else sorted(model.glob("*.gguf"))
+    """(the main set's shards, the indexers' side file or None) - every .gguf in the folder (and the indexers'
+    -maya-indexers.bin) unless named."""
+    paths = [model / n for n in names] if names else sorted(model.glob("*.gguf")) + sorted(model.glob("*" + SIDE_BIN))
     missing = [p for p in paths if not p.is_file()]
     if not paths or missing:
         raise SystemExit("%s: no .gguf files" % model if not paths else "%s: not there" % missing[0])
-    side = [p for p in paths if p.name.endswith("-maya-indexers.gguf")]
+    side = [p for p in paths if p.name.endswith(SIDE_NAMES)]
     main = [p for p in paths if p not in side]
     if indexers:
         side = [pathlib.Path(indexers).expanduser().resolve()]
@@ -225,7 +231,7 @@ def main() -> int:
     ap.add_argument("--out", help="default: <model>/maya-mm3")
     ap.add_argument("--shards", nargs="+", help="the set's files in --model (default: every .gguf there)")
     ap.add_argument("--indexers", help="the dense layers' indexers side file (default: the folder's "
-                                       "*-maya-indexers.gguf)")
+                                       "*-maya-indexers.bin, or .gguf)")
     ap.add_argument("--companions", help="the EXL3 repo's vision tower / DSpark draft files (default: <model>/../"
                                          "%s, or a whole EXL3 download beside the model)" % COMPANIONS)
     ap.add_argument("--text-only", action="store_true", help="leave the companions' vision tower and draft out")
@@ -298,7 +304,7 @@ def main() -> int:
     if lacking:
         raise SystemExit(
             "the sparse-attention indexer of layer%s %s is not in the set%s: MiniMax-M3.1 runs it in every layer. The "
-            "Maya sets keep layers 0-2's in <name>-maya-indexers.gguf beside the shards - download it into %s (or name "
+            "Maya sets keep layers 0-2's in <name>-maya-indexers.bin beside the shards - download it into %s (or name "
             "it with --indexers)" % ("s" if len(lacking) > 1 else "", ", ".join(map(str, lacking[:8])),
                                       "" if sg is None else " nor in " + side.name, model))
     # the EXL3 repo's vision tower and DSpark draft beside the GGUF's weights (the same files, any quant)

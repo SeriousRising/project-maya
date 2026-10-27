@@ -6,12 +6,15 @@
 //   * the routed experts with MiniMax's swigluoai - gate and up of one type, and of two (two passes): the token path
 //     (an expert off the device, the CPU lane's part, the shared expert), a verify window (bit for bit the token
 //     path's), the prompt sets (light kernels and tensor-core tiles; FP16 rows given or not: the same bits);
-//   * the CPU lane's GGUF experts against the device's, and a window's tokens bit for bit each token alone.
+//   * the CPU lane's GGUF experts against the device's, and a window's tokens bit for bit each token alone;
+//   * mm3_gv's dense GEMVs bit for bit ds4_iq's mv (MiniMax's row lengths, 1 to 16 activations, rows not a multiple of
+//     a block's).
 // mm3_gguf_test [--dense | --experts | --cpu]
 #include "../src/mm3/mm3_cpu.hpp"
 #include "../src/mm3/mm3_exl3.hpp"
 #include "../src/mm3/mm3_gguf.cuh"
 #include "../src/mm3/mm3_gguf_host.hpp"
+#include "../src/mm3/mm3_gv.cuh"
 #include "../src/ds4/ds4_iq.cuh"
 
 #include "ggml.h"   // (the reference values: ggml's own dequantize_row_*)
@@ -616,6 +619,74 @@ const int kTriples[][3] = {
     {iq::kIQ2_S, iq::kIQ2_S, iq::kIQ3_XXS},     {iq::kIQ3_XXS, iq::kIQ3_XXS, iq::kIQ3_XXS},
     {iq::kIQ2_XXS, iq::kIQ2_XS, iq::kIQ2_XS},   {iq::kIQ4_XS, iq::kIQ3_S, iq::kIQ1_M}};
 
+// mm3_gv's GEMVs against ds4_iq's mv, bit for bit: every dense type, MiniMax's row lengths, 1 .. 16 columns
+__global__ void q8s_ref_kernel(const float* x, int k, int8_t* q, float* d, int* sums) {   // (the int8 rows + sums)
+    const int r = blockIdx.y, b = blockIdx.x, lane = threadIdx.x;
+    const float v = x[(size_t) r * k + (size_t) b * 32 + lane];
+    float am = fabsf(v);
+    for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+    const float sc = am / 127.0f;
+    const int qi = am > 0.0f ? __float2int_rn(v / sc) : 0;
+    q[(size_t) r * k + (size_t) b * 32 + lane] = (int8_t) qi;
+    int sm = qi;
+    for (int o = 8; o > 0; o >>= 1) sm += __shfl_xor_sync(0xffffffffu, sm, o);
+    const int hi = __shfl_sync(0xffffffffu, sm, 16);
+    if (lane == 0) {
+        d[(size_t) r * (k / 32) + b] = sc;
+        sums[(size_t) r * (k / 32) + b] = (sm & 0xffff) | (hi << 16);
+    }
+}
+void test_gv(cudaStream_t s) {
+    for (int t : kDense)
+        for (int k : {3072, 6144, 8192})
+            for (int nc : {1, 2, 5, 7, 16}) {
+                const int n = 203;   // (not a multiple of any rows-a-block)
+                const std::vector<uint8_t> w = q_rand(t, n, k);
+                uint8_t* dw = dev(w);
+                std::vector<float> x((size_t) nc * k);
+                for (auto& v : x) v = frand(2.0f);
+                std::vector<float> bias(n);
+                for (auto& v : bias) v = frand(0.1f);
+                float *dx = dev(x), *db = dev(bias), *xd = nullptr, *y0 = nullptr, *y1 = nullptr;
+                int8_t* xq = nullptr;
+                int* xs = nullptr;
+                CU(cudaMalloc(&xq, x.size()));
+                CU(cudaMalloc(&xd, x.size() / 32 * 4));
+                CU(cudaMalloc(&xs, x.size() / 32 * 4));
+                CU(cudaMalloc(&y0, (size_t) nc * n * 4));
+                CU(cudaMalloc(&y1, (size_t) nc * n * 4));
+                CU(cudaMemset(y1, 0xff, (size_t) nc * n * 4));
+                q8s_ref_kernel<<<dim3((unsigned) (k / 32), (unsigned) nc), 32, 0, s>>>(dx, k, xq, xd, xs);
+                iq::MvJob a;
+                a.w = dw, a.ld = iq::row_bytes(t, k), a.type = t, a.k = k, a.n = n, a.ncol = nc, a.xq = xq, a.xd = xd;
+                a.y = y0, a.ycs = (size_t) n, a.bias = db, a.alpha = 0.75f;
+                mm3::gv::Job b;
+                b.w = dw, b.ld = a.ld, b.type = t, b.k = k, b.n = n, b.ncol = nc, b.xq = xq, b.xd = xd, b.xs = xs;
+                b.y = y1, b.ycs = (size_t) n, b.bias = db, b.alpha = 0.75f;
+                const bool cov = mm3::gv::covered(b);
+                const bool r0 = iq::mv(&a, 1, s), r1 = cov && mm3::gv::run(&b, 1, s);
+                CU(cudaStreamSynchronize(s));
+                const std::vector<float> h0 = host(y0, (size_t) nc * n), h1 = host(y1, (size_t) nc * n);
+                char what[96];
+                std::snprintf(what, sizeof what, "gv %s k %d, %d activations = ds4_iq's mv", iq::name(t), k, nc);
+#if defined(STRATA_USE_HIP)
+                const bool hip = true;   // (HIP: the GEMVs stay ds4_iq's - mm3_gv covers nothing there)
+#else
+                const bool hip = false;
+#endif
+                if (!cov && (hip || (t == iq::kQ6_K && k % 1024 != 0))) {   // (Q6_K rows of 3072: ds4_iq's mv)
+                    std::printf("%-52s ok    not covered (ds4_iq's mv)\n", what);
+                } else if (!r0 || !r1) {
+                    ++g_fail;
+                    std::printf("%-52s FAIL  not run\n", what);
+                } else {
+                    same(what, h0.data(), h1.data(), h0.size() * 4);
+                }
+                cudaFree(dw), cudaFree(dx), cudaFree(db), cudaFree(xd), cudaFree(y0), cudaFree(y1), cudaFree(xq),
+                    cudaFree(xs);
+            }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -623,6 +694,7 @@ int main(int argc, char** argv) {
     CU(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     const std::string only = argc >= 2 ? argv[1] : "";
     if (only.empty() || only == "--dense") test_dense(s);
+    if (only.empty() || only == "--dense" || only == "--gv") test_gv(s);
     if (only.empty() || only == "--experts" || only == "--cpu")
         for (const auto& tr : kTriples) test_experts(tr[0], tr[1], tr[2], s);
     if (x3::launch_errors() != 0) {

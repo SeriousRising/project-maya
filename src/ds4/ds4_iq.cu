@@ -1,6 +1,13 @@
 // src/ds4/ds4_iq.cu - a GGUF's low-bit routed experts on the device (see ds4_iq.cuh).  The block layouts and grids are
 // ggml's (ggml-common.h, MIT, third_party/ggml/LICENSE); the sign and grid tricks are llama.cpp's vecdotq.cuh.
 #include "ds4_iq.cuh"
+#include "ds4_pdl.cuh"
+#if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)   // (#354; maya-mm3 builds ds4_iq.cu without it)
+#include "strata/prefill/moe_mmq.hpp"
+#include <cstring>
+#include <map>
+#include <memory>
+#endif
 
 #include <cuda_fp16.h>
 #if !defined(STRATA_USE_HIP)
@@ -101,6 +108,16 @@ __device__ __forceinline__ void load_tab(uint32_t* tab) {
     }
 }
 
+// (#529) DS4_IQ_STRICT_FP: on RDNA 4 (gfx1200 / gfx1201) ROCm's clang contracted the token kernels' (NE 1) and the
+// window kernels' (NE 4) multiply-adds differently, so their sums differed in the last bits (ds4_gguf_test there):
+// there every rounding is explicit (no contraction, barriers the compiler cannot fold through) and IQ4_XS's rows load
+// in 16-bit halves.  Elsewhere - gfx11 and the other AMD GPUs, CUDA - the kernels compile as before (the same bits and
+// speed as v1.1.30: the barriers cost a Strix Halo ~7% of its decode).
+#if defined(STRATA_USE_HIP) && defined(__clang__) && (defined(__gfx1200__) || defined(__gfx1201__))
+#define DS4_IQ_STRICT_FP 1
+#else
+#define DS4_IQ_STRICT_FP 0
+#endif
 __device__ __forceinline__ uint32_t ld2(const uint8_t* p) {   // 4 bytes from a 2-byte aligned address
     const uint16_t* q = (const uint16_t*) p;
     return (uint32_t) q[0] | ((uint32_t) q[1] << 16);
@@ -301,7 +318,7 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         const uint8_t* qs = b + 8 + 16 * ib;
 #pragma unroll
         for (int t = 0; t < 4; ++t) {
-            const int2 v = tab16(ld4(qs + 4 * t), tab);
+            const int2 v = tab16(DS4_IQ_STRICT_FP ? ld2(qs + 4 * t) : ld4(qs + 4 * t), tab);
             s.q[t] = v.x;
             s.q[4 + t] = v.y;
         }
@@ -316,7 +333,11 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         for (int t = 0; t < 8; ++t) s.q[t] = (int) ((ld4(qs + 4 * t) >> sh) & 0x0f0f0f0fu);
         s.s0 = s.s1 = sc;
         s.d = h2f(b);
-        s.m0 = s.m1 = h2f(b + 2) * (float) m;
+        float m0 = h2f(b + 2) * (float) m;
+#if DS4_IQ_STRICT_FP
+        asm volatile("" : "+v"(m0));
+#endif
+        s.m0 = s.m1 = m0;
     } else if constexpr (T == kQ5_K) {   // Q4_K's nibbles and scales, the 5th bit from qh (bit ib of each value's byte)
         int sc, m;
         q4k_scale(b + 4, ib, sc, m);
@@ -327,7 +348,11 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
             s.q[t] = (int) (((ld4(qs + 4 * t) >> sh) & 0x0f0f0f0fu) | (((ld4(b + 16 + 4 * t) >> ib) & 0x01010101u) << 4));
         s.s0 = s.s1 = sc;
         s.d = h2f(b);
-        s.m0 = s.m1 = h2f(b + 2) * (float) m;
+        float m0 = h2f(b + 2) * (float) m;
+#if DS4_IQ_STRICT_FP
+        asm volatile("" : "+v"(m0));
+#endif
+        s.m0 = s.m1 = m0;
     } else if constexpr (T == kQ2_K) {
         const int n = ib >> 2, j = ib & 3;
         const uint8_t* qs = b + 16 + 32 * n;
@@ -338,8 +363,12 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         s.s0 = c0 & 15;
         s.s1 = c1 & 15;
         s.d = h2f(b + 80);
-        s.m0 = dmin * (float) (c0 >> 4);
-        s.m1 = dmin * (float) (c1 >> 4);
+        float m0 = dmin * (float) (c0 >> 4), m1 = dmin * (float) (c1 >> 4);
+#if DS4_IQ_STRICT_FP
+        asm volatile("" : "+v"(m0), "+v"(m1));
+#endif
+        s.m0 = m0;
+        s.m1 = m1;
     } else if constexpr (T == kIQ1_S || T == kIQ1_M) {
         Raw1 r;
         iq1_load<T>(row, kb, r);
@@ -382,6 +411,48 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         s.d = h2f(b + 108);
     }
 }
+__device__ __forceinline__ float fadd_no_fma(float a, float b) {
+#if DS4_IQ_STRICT_FP
+#pragma clang fp contract(off)
+    float r = a + b;
+    asm volatile("" : "+v"(r));
+    return r;
+#else
+    return __fadd_rn(a, b);
+#endif
+}
+__device__ __forceinline__ float fsub_no_fma(float a, float b) {
+#if DS4_IQ_STRICT_FP
+#pragma clang fp contract(off)
+    float r = a - b;
+    asm volatile("" : "+v"(r));
+    return r;
+#else
+    return __fsub_rn(a, b);
+#endif
+}
+__device__ __forceinline__ float fmul_no_fma(float a, float b) {
+#if DS4_IQ_STRICT_FP
+#pragma clang fp contract(off)
+    float r = a * b;
+    asm volatile("" : "+v"(r));
+    return r;
+#else
+    return __fmul_rn(a, b);
+#endif
+}
+__device__ __forceinline__ float fma_no_contract(float a, float b, float c) {
+#if DS4_IQ_STRICT_FP
+#pragma clang fp contract(off)
+    asm volatile("" : "+v"(a), "+v"(b), "+v"(c));
+    float r = __builtin_fmaf(a, b, c);
+    asm volatile("" : "+v"(r));
+    return r;
+#else
+    return fmaf(a, b, c);
+#endif
+}
+
 // the sub-block against 32 int8 activations (xa: values 0..15, xb: 16..31), before their scale: an exact integer dot,
 // its scales in F32 (explicit roundings: every instantiation the same bits)
 template <int T>
@@ -394,7 +465,7 @@ __device__ __forceinline__ float sub_dot(const Sub& s, const int4& xa, const int
     hi = __dp4a(s.q[5], xb.y, hi);
     hi = __dp4a(s.q[6], xb.z, hi);
     hi = __dp4a(s.q[7], xb.w, hi);
-    float v = __fmul_rn(s.d, (float) (s.s0 * lo + s.s1 * hi));
+    float v = fmul_no_fma(s.d, (float) (s.s0 * lo + s.s1 * hi));
     if constexpr (Ty<T>::MIN) {
         int sl = __dp4a(0x01010101, xa.x, 0);
         sl = __dp4a(0x01010101, xa.y, sl);
@@ -404,7 +475,7 @@ __device__ __forceinline__ float sub_dot(const Sub& s, const int4& xa, const int
         sh = __dp4a(0x01010101, xb.y, sh);
         sh = __dp4a(0x01010101, xb.z, sh);
         sh = __dp4a(0x01010101, xb.w, sh);
-        v = __fsub_rn(v, __fadd_rn(__fmul_rn(s.m0, (float) sl), __fmul_rn(s.m1, (float) sh)));
+        v = fsub_no_fma(v, fadd_no_fma(fmul_no_fma(s.m0, (float) sl), fmul_no_fma(s.m1, (float) sh)));
     }
     return v;
 }
@@ -544,7 +615,11 @@ __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, in
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
+#if DS4_IQ_STRICT_FP
+    for (int o = 16; o > 0; o >>= 1) v = fadd_no_fma(v, __shfl_xor_sync(0xffffffffu, v, o));
+#else
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+#endif
     return v;
 }
 __device__ __forceinline__ float swiglu(float gv, float uv, float limit) {   // (ds4_gguf.cu's)
@@ -552,7 +627,7 @@ __device__ __forceinline__ float swiglu(float gv, float uv, float limit) {   // 
         gv = fminf(gv, limit);
         uv = fminf(fmaxf(uv, -limit), limit);
     }
-    return __fmul_rn(__fdiv_rn(gv, __fadd_rn(1.0f, expf(-gv))), uv);
+    return fmul_no_fma(__fdiv_rn(gv, fadd_no_fma(1.0f, expf(-gv))), uv);
 }
 // MiniMax-M3.1's swigluoai (mm3_exl3.cu's: the same operations)
 __device__ __forceinline__ float swigluoai(float gv, float uv, float limit) {
@@ -596,7 +671,11 @@ __device__ __forceinline__ bool group(const Args& a, int grp, const uint8_t*& bl
 template <int RW>
 __device__ __forceinline__ float lanes_sum(float v) {
 #pragma unroll
+#if DS4_IQ_STRICT_FP
+    for (int o = 16 / RW; o > 0; o >>= 1) v = fadd_no_fma(v, __shfl_xor_sync(0xffffffffu, v, o));
+#else
     for (int o = 16 / RW; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+#endif
     return v;
 }
 constexpr int kGuRW = 1, kDnRW = 2;   // rows a warp: gate / up (n_embd 5120: 10 sub-blocks a lane), down (2304: 9)
@@ -623,6 +702,11 @@ struct Ahead {
 // (each sub-block decoded once for them) -> h = the clamped swiglu (EPI: act_out's)
 template <int T, int NE, int RP = 1, bool AH = false, int RW = kGuRW, int EPI = 0>
 __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a) {
+#if DS4_IQ_STRICT_FP
+#pragma clang fp contract(off)
+#endif
+    pdl_wait();
+    pdl_trigger();
     constexpr int LPR = 32 / RW;
     constexpr bool TWO = kBoth<EPI>;
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
@@ -671,8 +755,8 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a) {
                         const int4* xp = (const int4*) (a.xq + (size_t) xr[i] * a.n_embd + (size_t) kb * 32);
                         const int4 xa = xp[0], xb = xp[1];
                         const float dx = a.xd[(size_t) xr[i] * nsb + kb];
-                        ag[i] = fmaf(dx, sub_dot<T>(sg, xa, xb), ag[i]);
-                        if constexpr (TWO) au[i] = fmaf(dx, sub_dot<T>(su, xa, xb), au[i]);
+                        ag[i] = fma_no_contract(dx, sub_dot<T>(sg, xa, xb), ag[i]);
+                        if constexpr (TWO) au[i] = fma_no_contract(dx, sub_dot<T>(su, xa, xb), au[i]);
                     }
                 pg = ng;
                 if constexpr (TWO) pu = nu;
@@ -697,6 +781,11 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a) {
 // part
 template <int T, int NE, int RP = 1, bool AH = false, int RW = kDnRW>
 __global__ void __launch_bounds__(kThreads) down_kernel(const Args a) {
+#if DS4_IQ_STRICT_FP
+#pragma clang fp contract(off)
+#endif
+    pdl_wait();
+    pdl_trigger();
     constexpr int LPR = 32 / RW;
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
     __shared__ int es[NE];
@@ -732,7 +821,7 @@ __global__ void __launch_bounds__(kThreads) down_kernel(const Args a) {
                     if (i < ne) {
                         const int4* hp = (const int4*) (a.hq + (size_t) es[i] * a.n_ff + (size_t) kb * 32);
                         const int4 ha = hp[0], hb = hp[1];
-                        ad[i] = fmaf(a.hd[(size_t) es[i] * nsb + kb], sub_dot<T>(sd, ha, hb), ad[i]);
+                        ad[i] = fma_no_contract(a.hd[(size_t) es[i] * nsb + kb], sub_dot<T>(sd, ha, hb), ad[i]);
                     }
             }
 #pragma unroll
@@ -754,6 +843,8 @@ static_assert((BM / TM) * (BN / TN) == kThreads, "one output tile a thread");
 // outputs.  (deq8 is the tile loader a tensor-core form takes too.)
 template <int T, bool GATE_UP, int RM = BM, int EPI = 0>
 __global__ void __launch_bounds__(kThreads) set_kernel(const SetArgs a) {
+    pdl_wait();
+    pdl_trigger();
     constexpr int RT = RM / (kThreads / (BN / TN));
     static_assert(RT >= 1 && RT * (kThreads / (BN / TN)) == RM, "the block's rows");
     constexpr bool TWO = GATE_UP && kBoth<EPI>;   // (gate and up in this pass; EPI 2 / 3: one of them, as wg)
@@ -846,6 +937,8 @@ __global__ void __launch_bounds__(kThreads) set_kernel(const SetArgs a) {
 constexpr int kLdT = 40;
 template <int T, bool GATE_UP, int EPI = 0>
 __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
+    pdl_wait();
+    pdl_trigger();
 #if defined(STRATA_USE_HIP) && !DS4_ROCWMMA
     __builtin_trap();   // (a device pass for a card without WMMA: never launched there - tc_ok)
 #else
@@ -963,6 +1056,8 @@ struct Jobs {
 };
 template <int T, int NC>
 __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
     load_tab<T>(tab);
     __syncthreads();
@@ -1159,6 +1254,8 @@ __global__ void __launch_bounds__(kThreads) light_q8_kernel(const float* __restr
                                                            const int* __restrict__ idx, int ldx, int k,
                                                            const int* __restrict__ bounds, int row0,
                                                            int8_t* __restrict__ q, float* __restrict__ d) {
+    pdl_wait();
+    pdl_trigger();
     const int e = blockIdx.y / kLightRows, i = blockIdx.y % kLightRows;
     const int rows = bounds[e + 1] - bounds[e];
     const int b = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
@@ -1179,6 +1276,8 @@ __global__ void __launch_bounds__(kThreads) light_q8_kernel(const float* __restr
 template <int T, int NE, bool GATE_UP, int EPI = 0>
 __global__ void __launch_bounds__(kThreads) light_kernel(const SetArgs a, const int8_t* __restrict__ xq,
                                                           const float* __restrict__ xd) {
+    pdl_wait();
+    pdl_trigger();
     constexpr bool TWO = GATE_UP && kBoth<EPI>;   // (gate and up in this pass; EPI 2 / 3: one of them, as w0)
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
     const int e = blockIdx.y;
@@ -1231,6 +1330,8 @@ __global__ void __launch_bounds__(kThreads) light_kernel(const SetArgs a, const 
 template <int T>
 __global__ void __launch_bounds__(kThreads) values_kernel(const uint8_t* __restrict__ w, int k, int n, float* sub,
                                                            float* tile) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
     load_tab<T>(tab);
     __syncthreads();
@@ -1345,11 +1446,11 @@ void launch_gu(const Args& a, dim3 grid, cudaStream_t s) {
         const Iq1Var& v = iq1_var();
         const bool rp = v.rp == 4 && grid.x % 4 == 0, ah = v.ah >= 0 ? v.ah != 0 : kAhead<T>;
         const dim3 g4(grid.x / 4, grid.y, grid.z);
-        if (rp && ah) { gate_up_kernel<T, NE, 4, true, kGuRW, EPI><<<g4, kThreads, 0, s>>>(a); return; }
-        if (rp) { gate_up_kernel<T, NE, 4, false, kGuRW, EPI><<<g4, kThreads, 0, s>>>(a); return; }
-        if (ah) { gate_up_kernel<T, NE, 1, true, kGuRW, EPI><<<grid, kThreads, 0, s>>>(a); return; }
+        if (rp && ah) { pdl_launch(gate_up_kernel<T, NE, 4, true, kGuRW, EPI>, g4, kThreads, 0, s, a); return; }
+        if (rp) { pdl_launch(gate_up_kernel<T, NE, 4, false, kGuRW, EPI>, g4, kThreads, 0, s, a); return; }
+        if (ah) { pdl_launch(gate_up_kernel<T, NE, 1, true, kGuRW, EPI>, grid, kThreads, 0, s, a); return; }
     }
-    gate_up_kernel<T, NE, 1, false, kGuRW, EPI><<<grid, kThreads, 0, s>>>(a);
+    pdl_launch(gate_up_kernel<T, NE, 1, false, kGuRW, EPI>, grid, kThreads, 0, s, a);
 }
 template <int T, int NE>
 void launch_dn(const Args& a, dim3 grid, cudaStream_t s) {
@@ -1357,11 +1458,11 @@ void launch_dn(const Args& a, dim3 grid, cudaStream_t s) {
         const Iq1Var& v = iq1_var();
         const bool rp = v.rp == 4 && grid.x % 4 == 0, ah = v.ah >= 0 ? v.ah != 0 : kAhead<T>;
         const dim3 g4(grid.x / 4, grid.y, grid.z);
-        if (rp && ah) { down_kernel<T, NE, 4, true><<<g4, kThreads, 0, s>>>(a); return; }
-        if (rp) { down_kernel<T, NE, 4, false><<<g4, kThreads, 0, s>>>(a); return; }
-        if (ah) { down_kernel<T, NE, 1, true><<<grid, kThreads, 0, s>>>(a); return; }
+        if (rp && ah) { pdl_launch(down_kernel<T, NE, 4, true>, g4, kThreads, 0, s, a); return; }
+        if (rp) { pdl_launch(down_kernel<T, NE, 4, false>, g4, kThreads, 0, s, a); return; }
+        if (ah) { pdl_launch(down_kernel<T, NE, 1, true>, grid, kThreads, 0, s, a); return; }
     }
-    down_kernel<T, NE><<<grid, kThreads, 0, s>>>(a);
+    pdl_launch(down_kernel<T, NE>, grid, kThreads, 0, s, a);
 }
 template <int T, int EPI = 0>
 void gu_ne(const Args& a, dim3 grid, int ne, cudaStream_t s) {
@@ -1383,16 +1484,16 @@ void launch_set(const SetArgs& a, dim3 grid, cudaStream_t s) {
     if (tc_ok()) {
         SetArgs b = a;   // (gate / up: FP16 rows when the caller gave them - set_gate_up's x16)
         b.xh_vec = b.xh != nullptr && ((uintptr_t) b.xh & 15) == 0 && (b.ldx & 7) == 0 ? 1 : 0;
-        set_tc_kernel<T, GU, EPI><<<grid, kThreads, 0, s>>>(b);
+        pdl_launch(set_tc_kernel<T, GU, EPI>, grid, kThreads, 0, s, b);
         return;
     }
 #endif
     if (a.max_rows <= 16) {   // (a block of 64 rows would do 64 rows' FMAs for the few there are)
         grid.x = (unsigned) ((a.max_rows + 15) / 16);
-        set_kernel<T, GU, 16, EPI><<<grid, kThreads, 0, s>>>(a);
+        pdl_launch(set_kernel<T, GU, 16, EPI>, grid, kThreads, 0, s, a);
         return;
     }
-    set_kernel<T, GU, BM, EPI><<<grid, kThreads, 0, s>>>(a);
+    pdl_launch(set_kernel<T, GU, BM, EPI>, grid, kThreads, 0, s, a);
 }
 // the light sets' int8 rows, per stream (kLightMaxExp kLightRows rows of k)
 struct LightBuf {
@@ -1428,9 +1529,9 @@ bool light_on() {   // STRATA_DS4_NO_LIGHT=1: every set through the GEMM tiles
 template <int T, bool GU, int EPI = 0>
 void launch_light(const SetArgs& a, const LightBuf& b, cudaStream_t s) {
     const dim3 grid((unsigned) (((GU ? a.n_ff : a.n_embd) + kWarps - 1) / kWarps), (unsigned) a.n_exp);
-    if (a.max_rows <= 4) light_kernel<T, 4, GU, EPI><<<grid, kThreads, 0, s>>>(a, b.q, b.d);
-    else if (a.max_rows <= 8) light_kernel<T, 8, GU, EPI><<<grid, kThreads, 0, s>>>(a, b.q, b.d);
-    else light_kernel<T, kLightRows, GU, EPI><<<grid, kThreads, 0, s>>>(a, b.q, b.d);
+    if (a.max_rows <= 4) pdl_launch(light_kernel<T, 4, GU, EPI>, grid, kThreads, 0, s, a, b.q, b.d);
+    else if (a.max_rows <= 8) pdl_launch(light_kernel<T, 8, GU, EPI>, grid, kThreads, 0, s, a, b.q, b.d);
+    else pdl_launch(light_kernel<T, kLightRows, GU, EPI>, grid, kThreads, 0, s, a, b.q, b.d);
 }
 // a set's gate and up of different types (SetArgs::tu, kActOai only): two passes, the gate's sums in graw between them
 bool split_gu(const SetArgs& a) { return a.act == kActOai && a.tu != 0 && a.tu != a.tg; }
@@ -1440,8 +1541,8 @@ bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
     LightBuf* b = light_buf(s, K);
     if (b == nullptr) return false;
     const dim3 gq((unsigned) ((K / 32 + kWarps - 1) / kWarps), (unsigned) (a.n_exp * kLightRows));
-    light_q8_kernel<<<gq, kThreads, 0, s>>>(gu ? a.xf : nullptr, gu ? nullptr : a.xh, a.idx, a.ldx, K, a.bounds,
-                                            a.row0, b->q, b->d);
+    pdl_launch(light_q8_kernel, gq, kThreads, 0, s, gu ? a.xf : nullptr, gu ? nullptr : a.xh, a.idx, a.ldx, K, a.bounds,
+               a.row0, b->q, b->d);
     if (gu && a.act != kActSwiglu) {   // (MiniMax's: one pass, or the gate's then the up's on the same int8 rows)
         if (!split_gu(a)) {
 #define LO_(T) launch_light<T, true, 1>(a, *b, s)
@@ -1493,9 +1594,9 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
             return;
         }
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
-    if (max_c <= 1) mv_kernel<T, 1><<<grid, kThreads, 0, s>>>(J);
-    else if (max_c <= 4) mv_kernel<T, 4><<<grid, kThreads, 0, s>>>(J);
-    else mv_kernel<T, 16><<<grid, kThreads, 0, s>>>(J);
+    if (max_c <= 1) pdl_launch(mv_kernel<T, 1>, grid, kThreads, 0, s, J);
+    else if (max_c <= 4) pdl_launch(mv_kernel<T, 4>, grid, kThreads, 0, s, J);
+    else pdl_launch(mv_kernel<T, 16>, grid, kThreads, 0, s, J);
 }
 
 }  // namespace
@@ -1587,7 +1688,276 @@ bool light_down(const SetArgs& a, cudaStream_t s) {
     return light_set(a, false, s);
 }
 
+#if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
+// Prompt expert sets through the existing GLM MMQ path (HIP, opt-in).
+// The same q8_1/MMA path the GLM prompt uses (strata::prefill::mmq): the packed expert is read once, activations are
+// rounded to q8_1, and the products run on int8 tensor cores.  Opt-in (MAYA_DS4_EXPERT_MMQ=1), sets of at least 32 rows;
+// smaller sets, unsupported shapes/types and allocation failure keep the FP32 tiled kernel above.
+namespace {
+thread_local int mmq_rows = 0;
+thread_local const int* mmq_host_bounds = nullptr;
+}
+MmqRowsScope::MmqRowsScope(int rows, const int* bounds)
+    : previous_rows_(mmq_rows), previous_bounds_(mmq_host_bounds) {
+    mmq_rows = rows;
+    mmq_host_bounds = bounds;
+}
+MmqRowsScope::~MmqRowsScope() {
+    mmq_rows = previous_rows_;
+    mmq_host_bounds = previous_bounds_;
+}
+namespace {
+
+constexpr int kMmqCap = 32768;  // maximum compact rows in one prompt set
+bool mmq_on() {
+    static const bool enabled = [] {
+        const char* e = std::getenv("STRATA_DS4_EXPERT_MMQ");
+        return e != nullptr && std::strcmp(e, "1") == 0;
+    }();
+    return enabled;
+}
+
+bool mmq_wanted(const SetArgs& a, bool gate_up) {
+    if (!mmq_on() || a.max_rows < 32 || a.n_exp <= 0 || a.n_exp > 512 || !mmq_host_bounds || mmq_rows <= 0) return false;
+    if (mmq_host_bounds[0] != a.row0 || mmq_host_bounds[a.n_exp] - a.row0 != mmq_rows) return false;
+    for (int i = 0; i < a.n_exp; ++i) {
+        const int rows = mmq_host_bounds[i + 1] - mmq_host_bounds[i];
+        if (rows < 0 || rows > a.max_rows) return false;
+    }
+    if (a.n_embd != 5120 || a.n_ff != 2304) return false;   // the DS4 pack's geometry
+    if (a.ldx < (gate_up ? a.n_embd : a.n_ff) || a.ldo < (gate_up ? a.n_ff : a.n_embd)) return false;
+    if (gate_up && a.ldx % 4 != 0) return false;   // the MMQ quantizer loads float4s
+    if (gate_up ? (a.xf == nullptr || a.h == nullptr) : (a.xh == nullptr || a.y == nullptr)) return false;
+    const int type = gate_up ? a.tg : a.td;
+    if (type != kIQ2_S && type != kIQ2_XXS && type != kIQ3_S && type != kIQ3_XXS) return false;
+    if (!strata::prefill::mmq::built() || !strata::prefill::mmq::supported(gate_up ? a.tg : a.td)) return false;
+    return true;
+}
+
+void mmq_check(cudaError_t error, const char* operation) {
+    if (error != cudaSuccess) {
+        std::fprintf(stderr, "DeepSeek expert MMQ %s failed: %s\n", operation, cudaGetErrorString(error));
+        std::abort();
+    }
+}
+
+bool mmq_resource_ok(cudaError_t error) {
+    if (error == cudaSuccess) return true;
+    if (error != cudaErrorMemoryAllocation) mmq_check(error, "scratch setup");
+    // Only an allocation shortage is a supported fallback. Do not hide an asynchronous execution error.
+    const cudaError_t last = cudaGetLastError();
+    if (last != cudaSuccess && last != cudaErrorMemoryAllocation) mmq_check(last, "scratch allocation");
+    return false;
+}
+
+bool mmq_alloc(void** ptr, size_t bytes) {
+    return mmq_resource_ok(cudaMalloc(ptr, bytes));
+}
+
+struct MmqScratch {
+    int device;
+    cudaEvent_t ready = nullptr;
+    bool recorded = false;
+    strata::prefill::mmq::Context* ctx = nullptr;
+    explicit MmqScratch(int dev) : device(dev) {}
+    ~MmqScratch() {
+        int previous = 0;
+        if (cudaGetDevice(&previous) != cudaSuccess || cudaSetDevice(device) != cudaSuccess) return;
+        release();
+        delete ctx;
+        if (ready) (void) cudaEventDestroy(ready);
+        if (previous != device) (void) cudaSetDevice(previous);
+    }
+
+    void* xq = nullptr;
+    float* gu = nullptr;
+    float* hf = nullptr;
+    int* b = nullptr;
+    int* ids = nullptr;
+    int rows = 0;
+
+    bool ensure(int nrows, int ne) {
+        if (nrows <= 0 || nrows > kMmqCap || ne <= 0 || ne > 512) return false;
+        if (!ready) {
+            cudaEvent_t created = nullptr;
+            if (!mmq_resource_ok(cudaEventCreateWithFlags(&created, cudaEventDisableTiming))) return false;
+            ready = created;
+        }
+        if (rows >= nrows && b != nullptr) return true;   // grow only
+        release();
+        const size_t q8 = strata::prefill::mmq::q8_bytes(nrows, 5120);
+        if (!mmq_alloc(&xq, q8) ||
+            !mmq_alloc((void**) &gu, (size_t) nrows * 2 * 2304 * sizeof(float)) ||
+            !mmq_alloc((void**) &hf, (size_t) nrows * 2304 * sizeof(float)) ||
+            !mmq_alloc((void**) &b, (size_t) 513 * sizeof(int)) ||
+            !mmq_alloc((void**) &ids, (size_t) (nrows + 256) * sizeof(int))) {
+            release();
+            return false;
+        }
+        if (!ctx) ctx = new strata::prefill::mmq::Context();
+        rows = nrows;
+        return true;
+    }
+    void release() {
+        if (xq) (void) cudaFree(xq);
+        if (gu) (void) cudaFree(gu);
+        if (hf) (void) cudaFree(hf);
+        if (b) (void) cudaFree(b);
+        if (ids) (void) cudaFree(ids);
+        xq = nullptr; gu = nullptr; hf = nullptr; b = nullptr; ids = nullptr; rows = 0;
+    }
+};
+
+// A thread owns its contexts; each device/stream owns separate buffers and a separate GGML fixup pool.
+// A completion event also orders reuse if the runtime recycles a destroyed stream's handle.
+MmqScratch& mmq_scratch(int device, cudaStream_t stream) {
+    using Key = std::pair<int, uintptr_t>;
+    thread_local std::map<Key, std::unique_ptr<MmqScratch>> states;
+    auto& state = states[{device, reinterpret_cast<uintptr_t>(stream)}];
+    if (!state) state = std::make_unique<MmqScratch>(device);
+    return *state;
+}
+
+__global__ void mmq_shift_bounds(const int* src, int* dst, int n, int row0) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i <= n) dst[i] = src[i] - row0;
+}
+
+__global__ void mmq_iota(int* dst, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = i;
+}
+
+__global__ void mmq_half_float(const uint16_t* __restrict__ h, float* __restrict__ f, int rows, int cols, int ld) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * cols) return;
+    const int r = i / cols, c = i - r * cols;
+    f[i] = __half2float(__ushort_as_half(h[(size_t) r * ld + c]));
+}
+
+// gate/up rows [r][2 nff] -> FP16 SwiGLU at h[r*ldo + c], the same clamp and rounding order as set_kernel.
+__global__ void mmq_epilogue(const float* __restrict__ g, uint16_t* __restrict__ h, int rows, int nff, int ldo,
+                             float limit) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * nff) return;
+    const int r = i / nff, c = i - r * nff;
+    const float gv = fminf(g[(size_t) r * 2 * nff + c], limit);
+    const float uv = fminf(fmaxf(g[(size_t) r * 2 * nff + nff + c], -limit), limit);
+    const float v = gv / (1.0f + __expf(-gv)) * uv;
+    h[(size_t) r * ldo + c] = __half_as_ushort(__float2half_rn(v));
+}
+
+bool mmq_gate_up(const SetArgs& a, cudaStream_t s) {
+    const int total = mmq_rows;
+    if (total <= 0 || total > kMmqCap) return false;
+    int device = 0;
+    cudaStreamCaptureStatus capture;
+    mmq_check(cudaGetDevice(&device), "device query");
+    mmq_check(cudaStreamIsCapturing(s, &capture), "capture query");
+    if (capture != cudaStreamCaptureStatusNone) return false;
+    MmqScratch& sc = mmq_scratch(device, s);
+    if (!sc.ensure(total, a.n_exp)) return false;
+    if (sc.recorded) mmq_check(cudaStreamWaitEvent(s, sc.ready, 0), "scratch wait");
+    mmq_shift_bounds<<<(a.n_exp + 256) / 256, 256, 0, s>>>(a.bounds, sc.b, a.n_exp, a.row0);
+    mmq_check(cudaGetLastError(), "launch");
+    mmq_iota<<<(sc.rows + 256 + 255) / 256, 256, 0, s>>>(sc.ids, sc.rows + 256);
+    mmq_check(cudaGetLastError(), "launch");
+    strata::prefill::mmq::quantize(a.xf, a.idx, sc.xq, a.tg, a.n_embd, a.ldx, total, (void*) s);
+    strata::prefill::mmq::Product p{};
+    p.w = (const uint8_t*) a.wbase + a.tr[0];
+    p.type = a.tg;
+    p.w_rows = a.n_ff;
+    p.w_cols = a.n_embd;
+    p.expert_bytes = a.stride;
+    p.n = a.n_exp;
+    p.xq = sc.xq;
+    p.bounds = sc.b;
+    p.ids = sc.ids;
+    p.total_rows = total;
+    p.max_rows = a.max_rows;
+    p.dst = sc.gu;
+    p.ld_dst = 2 * a.n_ff;
+    auto* ctx = sc.ctx;
+    const int* hb = mmq_host_bounds;
+    for (int e = 0; e < a.n_exp; ++e) {
+        const int cnt = hb[e + 1] - hb[e];
+        if (cnt <= 0) continue;
+        p.n = 1;
+        p.bounds = sc.b + e;
+        p.max_rows = a.tg == kIQ2_S ? std::max(cnt, 32) : cnt;
+        p.expert_bytes = 0;
+        p.w = (const uint8_t*) a.wbase + a.tr[0] + (size_t) e * a.stride;
+        p.dst = sc.gu;
+        ctx->run(p, (void*) s);
+        p.w = (const uint8_t*) a.wbase + a.tr[1] + (size_t) e * a.stride;
+        p.dst = sc.gu + a.n_ff;
+        ctx->run(p, (void*) s);
+    }
+    mmq_epilogue<<<(total * a.n_ff + 255) / 256, 256, 0, s>>>(sc.gu, a.h, total, a.n_ff, a.ldo, a.limit);
+    mmq_check(cudaGetLastError(), "launch");
+    mmq_check(cudaEventRecord(sc.ready, s), "scratch completion");
+    sc.recorded = true;
+    return true;
+}
+
+bool mmq_down(const SetArgs& a, cudaStream_t s) {
+    const int total = mmq_rows;
+    if (total <= 0 || total > kMmqCap) return false;
+    int device = 0;
+    cudaStreamCaptureStatus capture;
+    mmq_check(cudaGetDevice(&device), "device query");
+    mmq_check(cudaStreamIsCapturing(s, &capture), "capture query");
+    if (capture != cudaStreamCaptureStatusNone) return false;
+    MmqScratch& sc = mmq_scratch(device, s);
+    if (!sc.ensure(total, a.n_exp)) return false;
+    if (sc.recorded) mmq_check(cudaStreamWaitEvent(s, sc.ready, 0), "scratch wait");
+    mmq_shift_bounds<<<(a.n_exp + 256) / 256, 256, 0, s>>>(a.bounds, sc.b, a.n_exp, a.row0);
+    mmq_check(cudaGetLastError(), "launch");
+    mmq_iota<<<(sc.rows + 256 + 255) / 256, 256, 0, s>>>(sc.ids, sc.rows + 256);
+    mmq_check(cudaGetLastError(), "launch");
+    mmq_half_float<<<(total * a.n_ff + 255) / 256, 256, 0, s>>>(a.xh, sc.hf, total, a.n_ff, a.ldx);
+    mmq_check(cudaGetLastError(), "launch");
+    strata::prefill::mmq::quantize(sc.hf, nullptr, sc.xq, a.td, a.n_ff, a.n_ff, total, (void*) s);
+    strata::prefill::mmq::Product p{};
+    p.w = (const uint8_t*) a.wbase + a.tr[2];
+    p.type = a.td;
+    p.w_rows = a.n_embd;
+    p.w_cols = a.n_ff;
+    p.expert_bytes = a.stride;
+    p.n = a.n_exp;
+    p.xq = sc.xq;
+    p.bounds = sc.b;
+    p.ids = sc.ids;
+    p.total_rows = total;
+    p.max_rows = a.max_rows;
+    p.dst = a.y;
+    p.ld_dst = a.ldo;
+    auto* ctx = sc.ctx;
+    const int* hb = mmq_host_bounds;
+    for (int e = 0; e < a.n_exp; ++e) {
+        const int cnt = hb[e + 1] - hb[e];
+        if (cnt <= 0) continue;
+        p.n = 1;
+        p.bounds = sc.b + e;
+        p.max_rows = cnt;
+        p.expert_bytes = 0;
+        p.w = (const uint8_t*) a.wbase + a.tr[2] + (size_t) e * a.stride;
+        p.dst = a.y;
+        ctx->run(p, (void*) s);
+    }
+    mmq_check(cudaEventRecord(sc.ready, s), "scratch completion");
+    sc.recorded = true;
+    return true;
+}
+
+}  // namespace
+
+#endif
+
 bool set_gate_up(const SetArgs& a, cudaStream_t s) {
+#if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
+    if (mmq_wanted(a, true) && mmq_gate_up(a, s)) return true;
+#endif
     if (a.n_embd % 256 != 0 || a.n_ff % BN != 0) return false;
     if (split_gu(a) && a.graw == nullptr) return false;
     SetArgs t = a;
@@ -1618,6 +1988,9 @@ bool set_gate_up(const SetArgs& a, cudaStream_t s) {
 }
 
 bool set_down(const SetArgs& a, cudaStream_t s) {
+#if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
+    if (mmq_wanted(a, false) && mmq_down(a, s)) return true;
+#endif
     if (a.n_ff % 256 != 0 || a.n_embd % BN != 0) return false;
     SetArgs t = a;
     if (light_down(a, s)) {
@@ -1660,6 +2033,8 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
 template <int T>
 __global__ void __launch_bounds__(kThreads) f16_rows_kernel(const uint8_t* __restrict__ w, int k, int n,
                                                              uint16_t* __restrict__ dst, int ldd) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
     load_tab<T>(tab);
     __syncthreads();
@@ -1682,6 +2057,8 @@ __global__ void __launch_bounds__(kThreads) f16_rows_kernel(const uint8_t* __res
 __global__ void __launch_bounds__(kThreads) gather_f16_kernel(const uint16_t* __restrict__ x, int ldx,
                                                                const int* __restrict__ idx, int n, int k,
                                                                uint16_t* __restrict__ dst) {
+    pdl_wait();
+    pdl_trigger();
     const int nq = k / 8;
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < (long long) n * nq;
          i += (long long) gridDim.x * blockDim.x) {
@@ -1692,6 +2069,8 @@ __global__ void __launch_bounds__(kThreads) gather_f16_kernel(const uint16_t* __
 }
 __global__ void __launch_bounds__(kThreads) swiglu_f16_kernel(const float* __restrict__ gu, int ld, int n, int ff,
                                                                float limit, uint16_t* __restrict__ h, int ldh) {
+    pdl_wait();
+    pdl_trigger();
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < (long long) n * ff;
          i += (long long) gridDim.x * blockDim.x) {
         const int r = (int) (i / ff), c = (int) (i % ff);
@@ -1706,22 +2085,22 @@ bool f16_rows(int type, const uint8_t* w, int k, int n, uint16_t* dst, int ldd, 
     if (k % block_values(type) != 0 || k % 32 != 0 || n < 1 || ldd % 8 != 0 || ((uintptr_t) dst & 15) != 0)
         return false;
     const unsigned blocks = grid_for((long long) n * (k / 8));
-#define FR_(T) f16_rows_kernel<T><<<blocks, kThreads, 0, s>>>(w, k, n, dst, ldd)
+#define FR_(T) pdl_launch(f16_rows_kernel<T>, blocks, kThreads, 0, s, w, k, n, dst, ldd)
     DS4_IQ_SWITCH_MV(type, FR_)
 #undef FR_
     return cudaGetLastError() == cudaSuccess;
 }
 void gather_f16(const uint16_t* x, int ldx, const int* idx, int n, int k, uint16_t* dst, cudaStream_t s) {
-    gather_f16_kernel<<<grid_for((long long) n * (k / 8)), kThreads, 0, s>>>(x, ldx, idx, n, k, dst);
+    pdl_launch(gather_f16_kernel, grid_for((long long) n * (k / 8)), kThreads, 0, s, x, ldx, idx, n, k, dst);
 }
 void swiglu_f16(const float* gu, int ld, int n, int ff, float limit, uint16_t* h, int ldh, cudaStream_t s) {
-    swiglu_f16_kernel<<<grid_for((long long) n * ff), kThreads, 0, s>>>(gu, ld, n, ff, limit, h, ldh);
+    pdl_launch(swiglu_f16_kernel, grid_for((long long) n * ff), kThreads, 0, s, gu, ld, n, ff, limit, h, ldh);
 }
 
 bool decode_values(int type, const uint8_t* w, int k, int n, float* sub, float* tile, cudaStream_t s) {
     if (k % block_values(type) != 0 || k % 32 != 0 || n < 1) return false;
     const unsigned blocks = (unsigned) std::min<int>(1024, (n * (k / 32) + kThreads - 1) / kThreads);
-#define DV_(T) values_kernel<T><<<blocks, kThreads, 0, s>>>(w, k, n, sub, tile)
+#define DV_(T) pdl_launch(values_kernel<T>, blocks, kThreads, 0, s, w, k, n, sub, tile)
     DS4_IQ_SWITCH_MV(type, DV_)
 #undef DV_
     return true;

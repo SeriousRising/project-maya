@@ -106,6 +106,22 @@ class Dashboard(unittest.TestCase):
         args = json.loads(self.cfg.read_text())["args"]
         self.assertEqual(args[args.index("--max-context") + 1], "65536")
         self.assertEqual(json.loads(self.cfg.read_text())["env"]["STRATA_GLM_RAM_GB"], "20")   # the rest kept
+        self.assertGreaterEqual(j["load_s"], 0.3)       # (how long that load took: the page's estimate of the next)
+        # the setup's own size is kept for the Models page's "Reset to the setup's values", through later reloads
+        self.assertEqual(json.loads(self.cfg.read_text())["installer"]["as_set_up"]["context"], 32768)
+        self.req("POST", "/api/context", {"max_context": 16384})
+        self.wait_reload()
+        self.assertEqual(json.loads(self.cfg.read_text())["installer"]["as_set_up"]["context"], 32768)
+
+    def test_metrics_say_whether_deepseek_drafts(self):
+        # DeepSeek's engine does not say it drafts with DSpark: the server does (the Monitor's Speculation), and only
+        # for a DeepSeek config
+        s, _, b = self.req("GET", "/metrics")
+        self.assertNotIn("dspark", json.loads(b)["engine"])
+        for on in (True, False):
+            self.svc.dspark = on
+            s, _, b = self.req("GET", "/metrics")
+            self.assertIs(json.loads(b)["engine"]["dspark"], on)
 
     def test_chat_gets_503_while_reloading(self):
         os.environ["STRATA_MOCK_RELOAD_S"] = "1.5"
@@ -373,6 +389,21 @@ class GpuMap(unittest.TestCase):
         eng.vram = []
         self.assertIsNone(svc.metrics()["gpu_map"])             # (an engine without VRAM lines: no card)
 
+    def test_later_lines_follow_a_picture(self):
+        """maya-ds4 prints its VRAM lines again when a picture's room is lent to its vision tower and when it is given
+        back: the map of that GPU follows them, the others stay."""
+        from types import SimpleNamespace
+        from serve.server import StrataEngine
+        other = dict(self.r, dev=1, pci="0000:02:00")
+        eng = SimpleNamespace(vram=[self.r, other])
+        lent = LINE.replace("vision=0", "vision=0 vision_own=334495744").replace("pool=15536793108", "pool=15202297364")
+        StrataEngine._vram_line(eng, lent)
+        self.assertEqual((eng.vram[0]["vision_own"], eng.vram[0]["pool"], eng.vram[1]), (334495744, 15202297364, other))
+        StrataEngine._vram_line(eng, LINE)
+        self.assertEqual(eng.vram, [self.r, other])
+        StrataEngine._vram_line(eng, "VRAM nonsense\n")      # (not a GPU's line: nothing changes)
+        self.assertEqual(eng.vram, [self.r, other])
+
 
 class GpuRelease(unittest.TestCase):
     """A reload starts the new engine only once the GPUs have dropped the old one (its memory is freed after it ends)."""
@@ -429,6 +460,34 @@ class NvmlPids(unittest.TestCase):
             launcher.kill()
             launcher.wait()
             launcher.stdout.close()
+
+
+class Offline(unittest.TestCase):
+    """The page works without the internet: its scripts, styles, fonts and icons are all in serve/web (Preact, htm
+    and Lucide vendored with their notices) - nothing is loaded from another host."""
+    WEB = ROOT / "serve" / "web"
+
+    def test_nothing_loaded_from_the_network(self):
+        import re
+        remote = re.compile(r"""(?:\b(?:src|href|action)\s*=\s*|\burl\(\s*|\bfrom\s+|\bimport\s*\(\s*|"""
+                            r"""\bfetch\(\s*|@import\s+|new\s+(?:WebSocket|EventSource|Worker)\(\s*)["'`]?(?:https?:)?//""",
+                            re.I)
+        found = []
+        for p in sorted(self.WEB.rglob("*")):
+            if p.suffix not in (".js", ".css", ".html", ".svg", ".webmanifest"):
+                continue
+            for n, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+                if remote.search(line) and "w3.org/" not in line:
+                    found.append(f"{p.relative_to(ROOT)}:{n}: {line.strip()[:120]}")
+        self.assertEqual(found, [])
+
+    def test_the_vendored_code_keeps_its_notices(self):
+        self.assertIn("The MIT License", (self.WEB / "preact.js").read_text(encoding="utf-8")[:3000])
+        self.assertIn("Apache License, Version 2.0", (self.WEB / "preact.js").read_text(encoding="utf-8")[:3000])
+        self.assertIn("ISC License", (self.WEB / "LICENSE.lucide.txt").read_text(encoding="utf-8"))
+        self.assertTrue((self.WEB / "fonts" / "OFL.txt").is_file())
+        index = (self.WEB.parent / "web" / "index.html").read_text(encoding="utf-8")
+        self.assertNotIn("fonts.googleapis", index)
 
 
 if __name__ == "__main__":

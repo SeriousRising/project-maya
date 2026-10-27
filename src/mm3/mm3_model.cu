@@ -109,6 +109,11 @@ struct Dev {
     int id = 0;
     cudaStream_t s = nullptr;
     cublasHandle_t blas = nullptr;
+    cudaEvent_t hop = nullptr;   // (a forward crossing to the next GPU: its stream waits on this, not the host)
+    // a side stream (CUDA): a token's / a window's indexer and router beside its attention's and shared expert's
+    // GEMVs - small latency-bound kernels in the shadow of bandwidth-bound ones (fev / jev: the fork, the join)
+    cudaStream_t s2 = nullptr;
+    cudaEvent_t fev = nullptr, jev = nullptr;
     std::vector<int> layers;
     size_t free0 = 0;
     // staging
@@ -494,6 +499,10 @@ struct Model::Impl {
             if (d.win_cpu) cudaFreeHost(d.win_cpu);
             if (d.pin) cudaFreeHost(d.pin);
             if (d.blas) cublasDestroy(d.blas);
+            if (d.hop) cudaEventDestroy(d.hop);
+            if (d.fev) cudaEventDestroy(d.fev);
+            if (d.jev) cudaEventDestroy(d.jev);
+            if (d.s2) cudaStreamDestroy(d.s2);
             if (d.s) cudaStreamDestroy(d.s);
         }
     }
@@ -751,14 +760,29 @@ struct Model::Impl {
     }
     // the decode's indexer projections (a token's or a window's T rows of xn -> iq, ik): both Q8_0 matrices in one
     // launch, else each as it is held
-    void index_proj(const Layer& l, Dev& d, int T) {
+    void index_proj(const Layer& l, Dev& d, int T, cudaStream_t s) {
         const int nq = g.ix_heads * g.ix_dim;
         if (l.wiq8 != nullptr) {
-            k::rows_dot_q8(l.wiq8, nq, l.wik8, g.ix_dim, g.dim, d.xn, T, d.iq, d.ik, d.s);
+            k::rows_dot_q8(l.wiq8, nq, l.wik8, g.ix_dim, g.dim, d.xn, T, d.iq, d.ik, s);
             return;
         }
-        k::rows_dot(l.wiq, nq, g.dim, d.xn, T, d.iq, d.s);
-        k::rows_dot(l.wik, g.ix_dim, g.dim, d.xn, T, d.ik, d.s);
+        k::rows_dot(l.wiq, nq, g.dim, d.xn, T, d.iq, s);
+        k::rows_dot(l.wik, g.ix_dim, g.dim, d.xn, T, d.ik, s);
+    }
+    // the side stream's branch: it waits for d.s's work so far (fork, its stream returned - d.s without one, or `use`
+    // false), d.s for the branch's (join).  (A token's host-free layer keeps one stream: measured on the V100s, the
+    // two cross-stream waits a branch costs outweighed what the branch hid; a window's or a layer whose routing the
+    // host waits for gains.)
+    cudaStream_t fork(Dev& d, bool use = true) {
+        if (d.s2 == nullptr || !use) return d.s;
+        cudaEventRecord(d.fev, d.s);
+        cudaStreamWaitEvent(d.s2, d.fev, 0);
+        return d.s2;
+    }
+    void join(Dev& d, bool use = true) {
+        if (d.s2 == nullptr || !use) return;
+        cudaEventRecord(d.jev, d.s2);
+        cudaStreamWaitEvent(d.s, d.jev, 0);
     }
     // a layer's expert blob (the plan's estimate before expert_layout reads it): EXL3's three trellises with their
     // scales, a GGUF's three matrices aligned
@@ -909,6 +933,14 @@ struct Model::Impl {
             d.id = id;
             CK(cudaSetDevice(id));
             CK(cudaStreamCreateWithFlags(&d.s, cudaStreamNonBlocking));
+            CK(cudaEventCreateWithFlags(&d.hop, cudaEventDisableTiming));
+#if !defined(STRATA_USE_HIP)
+            if (const char* sv = ::mm3::env("MM3_SIDE"); sv == nullptr || std::atoi(sv) != 0) {
+                CK(cudaStreamCreateWithFlags(&d.s2, cudaStreamNonBlocking));
+                CK(cudaEventCreateWithFlags(&d.fev, cudaEventDisableTiming));
+                CK(cudaEventCreateWithFlags(&d.jev, cudaEventDisableTiming));
+            }
+#endif
             CB(cublasCreate(&d.blas));
             CB(cublasSetStream(d.blas, d.s));
             CB(cublasSetMathMode(d.blas, CUBLAS_PEDANTIC_MATH));   // F32 GEMMs in F32 (no TF32)
@@ -1244,11 +1276,37 @@ struct Model::Impl {
             CK(cudaSetDevice(d.id));
             size_t fr = 0, tot = 0;
             CK(cudaMemGetInfo(&fr, &tot));
-            const size_t reserve = (size_t) ((o.reserve_gb < 0 ? 1.0 : o.reserve_gb) * (1u << 30));
-            size_t budget = fr > reserve ? fr - reserve : 0;
+            size_t reserve = (size_t) ((o.reserve_gb < 0 ? 1.0 : o.reserve_gb) * (1u << 30));
             std::vector<int> moe_layers;
             for (int li : d.layers)
                 if (L[(size_t) li].moe) moe_layers.push_back(li);
+            // every expert of this GPU's layers in VRAM when its staging slots give way to them: then the slots are
+            // only a prompt's and a picture's fallback (nothing is staged: every MoE layer host-free) - a few kept
+            // (kMinSlots), the rest of their memory to the experts; and (the reserve not asked for) the GPU keeps
+            // half a GB free instead of one - what the load has not taken by now is small (the BLAS's workspace, the
+            // graphs) - or a picture's room more on the vision tower's GPU.  MAYA_MM3_SLOTS_FIT=0: as before
+            if (d.n_slots > kMinSlots && o.resident_cap < 0) {
+                const char* sv = ::mm3::env("MM3_SLOTS_FIT");
+                size_t all = 0;
+                for (int li : moe_layers) all += (size_t) g.n_exp * L[(size_t) li].blob;
+                const size_t gain = (size_t) (d.n_slots - kMinSlots) * d.slot_bytes;
+                size_t rfit = reserve;
+                if (o.reserve_gb < 0) {
+                    rfit = (size_t) 1 << 29;
+                    if (vis && vis->device() == d.id) rfit += vis->room_bytes();
+                    rfit = std::min(rfit, reserve);
+                }
+                if ((sv == nullptr || std::atoi(sv) != 0) && fr > rfit && all > fr - reserve &&
+                    all <= fr - rfit + gain && resize_slots(d, kMinSlots, err)) {
+                    CK(cudaMemGetInfo(&fr, &tot));
+                    reserve = rfit;
+                    info.push_back("CUDA" + std::to_string(d.id) + ": " + std::to_string(kMinSlots) + " staging slots " +
+                                   "(asked " + std::to_string(o.staging) + "), " + std::to_string(reserve >> 20) +
+                                   " MB kept free: every expert of its layers fits in VRAM");
+                }
+                if (!err.empty()) return false;
+            }
+            size_t budget = fr > reserve ? fr - reserve : 0;
             std::vector<int> nres(moe_layers.size(), 0);
             const int cap = o.resident_cap < 0 ? g.n_exp : std::min(o.resident_cap, g.n_exp);
             std::vector<std::vector<int>> chosen(moe_layers.size());
@@ -1466,7 +1524,26 @@ struct Model::Impl {
                                " MoE layers host-free (every expert in VRAM: the routing stays on the GPU)");
             // a token's and a window's whole forward as a graph (graph_ready): one GPU, every MoE layer host-free
             const char* gv = ::mm3::env("MM3_GRAPH");
-            graph_on = (gv == nullptr || std::atoi(gv) != 0) && D.size() == 1 && nhf > 0 && nhf == nmoe && !o.verbose &&
+            // (several GPUs: peer access between them all - the forward's copies across them plain device copies)
+            if (D.size() > 1) {
+                bool all = true;
+                for (Dev& a : D)
+                    for (Dev& b : D) {
+                        if (&a == &b) continue;
+                        int can = 0;
+                        if (cudaDeviceCanAccessPeer(&can, a.id, b.id) != cudaSuccess || !can) {
+                            all = false;
+                            continue;
+                        }
+                        cudaSetDevice(a.id);
+                        const cudaError_t pe = cudaDeviceEnablePeerAccess(b.id, 0);
+                        if (pe != cudaSuccess && pe != cudaErrorPeerAccessAlreadyEnabled) all = false;
+                        cudaGetLastError();
+                    }
+                p2p_all = all;
+            }
+            graph_on = (gv == nullptr || std::atoi(gv) != 0) && D.size() == 1 && nhf > 0 && nhf == nmoe &&
+                       !o.verbose &&
                        ::mm3::env("MM3_DUMP_HS") == nullptr;
             if (graph_on) info.push_back("decode: a token's and a verify window's forward replayed as a graph");
         }
@@ -1604,21 +1681,26 @@ struct Model::Impl {
         };
         const int Q = g.n_head * g.hd, KV = g.n_kv * g.hd;
         k::rms(d.h, l.in1, T, g.dim, g.eps, d.xn, nullptr, d.s);
+        {   // the indexer's branch (the side stream) beside q / k / v
+            const cudaStream_t xs = fork(d);
+            index_proj(l, d, T, xs);
+            k::index_norm_rope(d.iq, d.ik, l.iqn1, l.ikn1, d.pos, T, g.ix_heads, g.ix_dim, g.n_rot,
+                               inv_dev[(size_t) di], g.eps, l.ic, xs);
+            const int nblk = cur_pos / g.blk + 1;
+            k::block_scores(d.iq, l.ic, d.pos, T, g.ix_heads, nblk, g.blk, d.bs, xs);
+            k::select_blocks(d.bs, d.pos, T, g.ix_heads, nblk, g.blk, g.topk, d.kept, xs);
+        }
         const x3::MvJob qkv[3] = {job(l.q, d.xn, g.dim, d.q, Q), job(l.k, d.xn, g.dim, d.k, KV),
                                   job(l.v, d.xn, g.dim, d.v, KV)};
         if (!x3::mv(qkv, 3, d.s)) {
+            join(d);
             err = "mv q/k/v (window)";
             return false;
         }
         k::qk_norm_rope(d.q, d.k, d.v, l.qn1, l.kn1, d.pos, T, g.n_head, g.n_kv, g.hd, g.n_rot, inv_dev[(size_t) di],
                         g.eps, l.kc, l.vc, d.s, 0, l.kvq, l.kvh);
         pmark(d, kPAttnIn);
-        index_proj(l, d, T);
-        k::index_norm_rope(d.iq, d.ik, l.iqn1, l.ikn1, d.pos, T, g.ix_heads, g.ix_dim, g.n_rot, inv_dev[(size_t) di],
-                           g.eps, l.ic, d.s);
-        const int nblk = cur_pos / g.blk + 1;
-        k::block_scores(d.iq, l.ic, d.pos, T, g.ix_heads, nblk, g.blk, d.bs, d.s);
-        k::select_blocks(d.bs, d.pos, T, g.ix_heads, nblk, g.blk, g.topk, d.kept, d.s);
+        join(d);
         pmark(d, kPIndex);
         k::sparse_attn(d.q, l.kc, l.vc, d.kept, d.pos, T, g.n_head, g.n_kv, g.topk, g.blk, 1.0f / std::sqrt((float) g.hd),
                        d.att, d.s, l.kvq, l.kvh, attn_splits, d.attp);
@@ -1647,19 +1729,25 @@ struct Model::Impl {
             pmark(d, kPDense);
             return true;
         }
-        k::rows_dot(l.gate, g.n_exp, g.dim, d.xn, T, d.logit, d.s);
-        k::route(d.logit, l.bias, T, g.n_exp, g.k_exp, d.top, d.w, d.s);
+        {   // the router's branch (the side stream) beside the shared expert
+            const cudaStream_t xs = fork(d);
+            k::rows_dot(l.gate, g.n_exp, g.dim, d.xn, T, d.logit, xs);
+            k::route(d.logit, l.bias, T, g.n_exp, g.k_exp, d.top, d.w, xs);
+        }
         const x3::MvJob sgu[2] = {job(l.sg, d.xn, g.dim, d.g, g.ff_shared), job(l.su, d.xn, g.dim, d.u, g.ff_shared)};
         if (!x3::mv(sgu, 2, d.s)) {
+            join(d);
             err = "mv shared gate/up (window)";
             return false;
         }
         k::swigluoai(d.g, d.u, (size_t) T * g.ff_shared, g.alpha, g.limit, d.g, nullptr, d.s);
         const x3::MvJob sdj = job(l.sd, d.g, g.ff_shared, d.sh, g.dim);
         if (!x3::mv(&sdj, 1, d.s)) {
+            join(d);
             err = "mv shared down (window)";
             return false;
         }
+        join(d);
         // the device plan's layout (win_plan_d): plan_ptr [kWin][8], plan_w [kWin][8], grp_ptr [kWin 8], grp_start
         // [kWin 8 + 1], grp_ent [kWin 8], n_groups
         const size_t off_w = (size_t) kWin * 8 * 8, off_gp = off_w + (size_t) kWin * 8 * 4,
@@ -1847,6 +1935,36 @@ struct Model::Impl {
     // CPU lane's sums of an expert differ in their last bits: the answer is the same from run to run this way)
     // a picture's room (Vision::set_lender) when its GPU has none free: the staging slots, between forwards - their
     // experts dropped, staged or promoted again as the forwards after it ask (drop_slots)
+    // (the load, before the experts are placed) d's staging slots reallocated as n of them - their old region freed
+    static constexpr int kMinSlots = 4;
+    bool resize_slots(Dev& d, int n, std::string& err) {
+        if (d.stg == nullptr || n <= 0 || n >= d.n_slots) return false;
+        CK(cudaSetDevice(d.id));
+        CK(cudaDeviceSynchronize());
+        for (size_t i = 0; i < owned.size(); ++i)
+            if (owned[i] == (void*) d.stg) {
+                owned.erase(owned.begin() + (long) i);
+                owned_dev.erase(owned_dev.begin() + (long) i);
+                break;
+            }
+        CK(cudaFree(d.stg));
+        acct[d.id][kAPool] -= std::min(acct[d.id][kAPool], std::max<size_t>((size_t) d.n_slots * d.slot_bytes, 16));
+        d.stg = nullptr;
+        acat = kAPool;
+        const bool ok = dalloc(d.id, d.stg, (size_t) n * d.slot_bytes, err);
+        acat = kAAct;
+        if (!ok) return false;
+        for (size_t s = (size_t) n; s < d.slot_ev.size(); ++s) cudaEventDestroy(d.slot_ev[s]);
+        d.slot_ev.resize((size_t) n);
+        d.n_slots = n;
+        d.slot_owner.assign((size_t) n, -1);
+        d.slot_used.assign((size_t) n, -1);
+        d.slot_pend.assign((size_t) n, -1);
+        d.slot_iss.assign((size_t) n, 0);
+        d.n_pending = 0;
+        return true;
+    }
+
     void* lend_slots(Dev& d, size_t need) {
         if (d.stg == nullptr || (size_t) d.n_slots * d.slot_bytes < need) return nullptr;
         cudaSetDevice(d.id);
@@ -1969,21 +2087,25 @@ struct Model::Impl {
             return j;
         };
         k::rms(d.h, l.in1, 1, g.dim, g.eps, d.xn, nullptr, d.s);
+        {   // the indexer's branch (the side stream) beside q / k / v
+            const cudaStream_t xs = fork(d, !l.hf);
+            index_proj(l, d, 1, xs);
+            k::index_norm_rope(d.iq, d.ik, l.iqn1, l.ikn1, d.pos, 1, g.ix_heads, g.ix_dim, g.n_rot,
+                               inv_dev[(size_t) di], g.eps, l.ic, xs);
+            const int nblk = cur_pos / g.blk + 1;
+            k::block_scores(d.iq, l.ic, d.pos, 1, g.ix_heads, nblk, g.blk, d.bs, xs);
+            k::select_blocks(d.bs, d.pos, 1, g.ix_heads, nblk, g.blk, g.topk, d.kept, xs);
+        }
         const x3::MvJob qkv[3] = {job(l.q, d.xn, d.q), job(l.k, d.xn, d.k), job(l.v, d.xn, d.v)};
         if (!x3::mv(qkv, 3, d.s)) {
+            join(d, !l.hf);
             err = "mv q/k/v";
             return false;
         }
         k::qk_norm_rope(d.q, d.k, d.v, l.qn1, l.kn1, d.pos, 1, g.n_head, g.n_kv, g.hd, g.n_rot, inv_dev[(size_t) di],
                         g.eps, l.kc, l.vc, d.s, 0, l.kvq, l.kvh);
         pmark(d, kPAttnIn);
-        const float one = 1.0f, zero = 0.0f;
-        index_proj(l, d, 1);
-        k::index_norm_rope(d.iq, d.ik, l.iqn1, l.ikn1, d.pos, 1, g.ix_heads, g.ix_dim, g.n_rot, inv_dev[(size_t) di],
-                           g.eps, l.ic, d.s);
-        const int nblk = cur_pos / g.blk + 1;
-        k::block_scores(d.iq, l.ic, d.pos, 1, g.ix_heads, nblk, g.blk, d.bs, d.s);
-        k::select_blocks(d.bs, d.pos, 1, g.ix_heads, nblk, g.blk, g.topk, d.kept, d.s);
+        join(d, !l.hf);
         pmark(d, kPIndex);
         k::sparse_attn(d.q, l.kc, l.vc, d.kept, d.pos, 1, g.n_head, g.n_kv, g.topk, g.blk, 1.0f / std::sqrt((float) g.hd),
                        d.att, d.s, l.kvq, l.kvh, attn_splits, d.attp);
@@ -2012,20 +2134,26 @@ struct Model::Impl {
             pmark(d, kPDense);
             return true;
         }
-        k::rows_dot(l.gate, g.n_exp, g.dim, d.xn, 1, d.logit, d.s);
-        k::route(d.logit, l.bias, 1, g.n_exp, g.k_exp, d.top, d.w, d.s);
+        {   // the router's branch (the side stream) beside the shared expert
+            const cudaStream_t xs = fork(d, !l.hf);
+            k::rows_dot(l.gate, g.n_exp, g.dim, d.xn, 1, d.logit, xs);
+            k::route(d.logit, l.bias, 1, g.n_exp, g.k_exp, d.top, d.w, xs);
+        }
         // the shared expert into sh (while the router's answer comes back)
         const x3::MvJob sgu[2] = {job(l.sg, d.xn, d.g), job(l.su, d.xn, d.u)};
         if (!x3::mv(sgu, 2, d.s)) {
+            join(d, !l.hf);
             err = "mv shared gate/up";
             return false;
         }
         k::swigluoai(d.g, d.u, (size_t) g.ff_shared, g.alpha, g.limit, d.g, nullptr, d.s);
         const x3::MvJob sdj = job(l.sd, d.g, d.sh);
         if (!x3::mv(&sdj, 1, d.s)) {
+            join(d, !l.hf);
             err = "mv shared down";
             return false;
         }
+        join(d, !l.hf);
         pmark(d, kPRoute);
         if (l.hf) {   // host-free: the plan made on the device (the host's values), nothing waited for
             const size_t lh = (size_t) (&l - L.data());
@@ -2386,6 +2514,39 @@ struct Model::Impl {
         return true;
     }
 
+    // a forward's residual rows from GPU a's stream to b's (dst on b): b's stream waits on a's work there through an
+    // event, the host goes on enqueueing (CUDA; HIP - whose queued work Windows submits only at a host wait - and
+    // MAYA_MM3_HOP_EVENTS=0: the host waits for a's stream first, as before)
+    bool hop_events = [] {
+#if defined(STRATA_USE_HIP)
+        return false;
+#else
+        const char* v = ::mm3::env("MM3_HOP_EVENTS");
+        return v == nullptr || std::atoi(v) != 0;
+#endif
+    }();
+    bool hop(Dev& a, Dev& b, size_t bytes, float* dst, std::string& err) {
+        CK(cudaSetDevice(a.id));
+        if (hop_events) {
+            CK(cudaEventRecord(a.hop, a.s));
+            CK(cudaSetDevice(b.id));
+            CK(cudaStreamWaitEvent(b.s, a.hop, 0));
+        } else {
+            CK(cudaStreamSynchronize(a.s));
+            CK(cudaSetDevice(b.id));
+        }
+        return copy_peer(dst, b, a.h, a, bytes, b.s, err);
+    }
+    // peer access between every two of the GPUs where they have it (load): the forward's copies across then a plain
+    // device copy - one a graph can hold - else the runtime's peer copy (through the host where the GPUs cannot)
+    bool p2p_all = false;
+    bool copy_peer(void* dst, const Dev& db, const void* src, const Dev& sb, size_t bytes, cudaStream_t s,
+                   std::string& err) {
+        if (p2p_all) CK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, s));
+        else CK(cudaMemcpyPeerAsync(dst, db.id, src, sb.id, bytes, s));
+        return true;
+    }
+
     bool chunk(const int* ids, int T, int pos0, int want, float* logits, std::string& err) {
         const double tc = now();
         const bool ok = chunk_(ids, T, pos0, want, logits, err);
@@ -2454,11 +2615,7 @@ struct Model::Impl {
             for (int li = 0; li < g.n_layers; ++li) {
                 const int dv = L[(size_t) li].dev;
                 if (dv != cur) {
-                    Dev &a = D[(size_t) cur], &b = D[(size_t) dv];
-                    CK(cudaSetDevice(a.id));
-                    CK(cudaStreamSynchronize(a.s));
-                    CK(cudaSetDevice(b.id));
-                    CK(cudaMemcpyPeerAsync(b.h, b.id, a.h, a.id, (size_t) T * g.dim * 4, b.s));
+                    if (!hop(D[(size_t) cur], D[(size_t) dv], (size_t) T * g.dim * 4, D[(size_t) dv].h, err)) return false;
                     cur = dv;
                 }
                 CK(cudaSetDevice(D[(size_t) dv].id));
@@ -2472,8 +2629,8 @@ struct Model::Impl {
                     float* dst = taps + (size_t) tap_of[(size_t) li] * T * g.dim;
                     if (dv == head_dev)
                         CK(cudaMemcpyAsync(dst, a.h, (size_t) T * g.dim * 4, cudaMemcpyDeviceToDevice, a.s));
-                    else
-                        CK(cudaMemcpyPeerAsync(dst, hd.id, a.h, a.id, (size_t) T * g.dim * 4, a.s));
+                    else if (!copy_peer(dst, hd, a.h, a, (size_t) T * g.dim * 4, a.s, err))
+                        return false;
                 }
                 if (const char* dp = ::mm3::env("MM3_DUMP_HS")) {   // (debugging: every layer's residual stream, F32 rows)
                     std::vector<float> hh((size_t) T * g.dim);
@@ -2497,12 +2654,9 @@ struct Model::Impl {
             if (want <= 0) return true;
             Dev& a = D[(size_t) cur];
             Dev& hd = D[(size_t) head_dev];
-            if (cur != head_dev) {   // (the last layer on another GPU: its rows across; on the head's GPU stream order holds)
-                CK(cudaSetDevice(a.id));
-                CK(cudaStreamSynchronize(a.s));
-                CK(cudaSetDevice(hd.id));
-                CK(cudaMemcpyPeerAsync(hd.h, hd.id, a.h, a.id, (size_t) T * g.dim * 4, hd.s));
-            }
+            if (cur != head_dev &&   // (the last layer on another GPU: its rows across; on the head's GPU stream order holds)
+                !hop(a, hd, (size_t) T * g.dim * 4, hd.h, err))
+                return false;
             CK(cudaSetDevice(hd.id));
             const float* last = hd.h + (size_t) (T - want) * g.dim;
             k::rms(last, norm1, want, g.dim, g.eps, hd.xn, hd.xn16, hd.s);

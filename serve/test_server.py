@@ -892,6 +892,14 @@ class SamplingKeys(unittest.TestCase):
         for bad in (0, 17, True, 4.0, "6"):
             self.assertFalse([x for x in self.keys(strata_tune={"spec": bad}) if x.startswith("spec=")], bad)
 
+    def test_suffix_draft_tune_key(self):
+        # the DeepSeek engine's prompt lookup for one request (an A/B in one engine): 0 or 1, nothing else
+        self.assertIn("suffix_draft=0", self.keys(temperature=0, strata_tune={"suffix_draft": 0}))
+        self.assertIn("suffix_draft=1", self.keys(temperature=0.7, strata_tune={"suffix_draft": 1}))
+        for bad in (2, -1, True, 1.0, "1"):
+            self.assertFalse([k for k in self.keys(temperature=0, strata_tune={"suffix_draft": bad})
+                              if k.startswith("suffix_draft=")], bad)
+
     def test_read_chunks_tune_key(self):
         # setup's calibration of the disk reads' size (#67): 1-16 pieces, nothing else
         self.assertIn("read_chunks=4", self.keys(temperature=0, strata_tune={"read_chunks": 4}))
@@ -1775,8 +1783,8 @@ class WebApp(unittest.TestCase):
             self.svc.model_label = None
         self.assertEqual((health["model_label"], health["model"]), ("MiniMax M3.1 · Maya-XS", self.svc.model))
         self.assertIsNone(json.loads(self.get("/health")[2])["model_label"])   # (a hand-written config: the id)
-        app = (ROOT / "serve/web/app.js").read_text(encoding="utf-8")
-        self.assertIn("health.model_label || modelDisplayName(health.model)", app)
+        side = (ROOT / "serve/web/sidebar.js").read_text(encoding="utf-8")   # (the sidebar's model card)
+        self.assertIn("S.health.model_label || modelName(S.health.model)", side)
 
     def test_only_the_app_files_are_served(self):
         for path in ("/web/..%2Fserver.py", "/web/index.html", "/web/test.py", "/fonts/..%2F..%2Fsetup.py",

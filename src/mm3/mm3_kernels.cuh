@@ -191,15 +191,19 @@ void mxfp8_to_bf16(const uint8_t* w, const uint8_t* scale, int N, int K, uint16_
 /// y [rows][ldy] = beta y + x [rows][ldx] . W^T for an MXFP8 W [N][K] (E4M3, a UE8M0 scale every 32 inputs) read as
 /// it is stored - each weight exactly mxfp8_to_bf16's value, the sums in F32 in a fixed order.  rows <= 16, N a multiple
 /// of 32, K of 512.  part (rows x N x 16 floats, or null): a split of K for an N of few blocks, its partials added in
-/// order.  (The DSpark draft's few rows: half the bytes of its BF16 weights.)
+/// order.  (The DSpark draft's few rows: half the bytes of its BF16 weights.)  More than 16 rows: in runs of 16.
 void mx_rows(const uint8_t* w, const uint8_t* scale, int N, int K, const float* x, int rows, int ldx, float* y, int ldy,
              float beta, float* part, cudaStream_t s);
 /// BF16 copies of rows (ld floats a row in, ldo out).
 void to_bf16(const float* x, int rows, int cols, int ld, uint16_t* y, int ldo, cudaStream_t s);
+/// n BF16 values as FP16 (nearest) into y, on s (waited for); false: one past FP16's range (y then not to be used).
+bool bf16_to_f16(const uint16_t* x, size_t n, uint16_t* y, cudaStream_t s);
 /// out [T][Hq][hd]: each query head over its KV group's keys at the positions lo[t] .. hi (rings of `ring` rows,
-/// position p at row p % ring), not causal - softmax(q . k * scale) . v in F32.  hd = 128, Hq / Hkv = 16.
+/// position p at row p % ring), not causal - softmax(q . k * scale) . v in F32.  hd = 128, Hq / Hkv = 16.  part (given,
+/// attn_part_floats(T, Hkv, splits) floats): the keys in `splits` runs of blocks of their own (at most 32), combined in
+/// run order - the GPU busy instead of T x Hkv blocks walking the whole window.
 void window_attn(const float* q, const uint16_t* kc, const uint16_t* vc, int ring, const int* lo, int hi, int T,
-                 int Hq, int Hkv, float scale, float* out, cudaStream_t s);
+                 int Hq, int Hkv, float scale, float* out, cudaStream_t s, float* part = nullptr, int splits = 1);
 /// Candidates instead of a row of logits (the sampler's: main.cpp's dist() over them is its own over the row): the kc
 /// largest and every one equal to the kc-th - n of them (-1: more than kCandCap), by logit desc then id asc, their
 /// exact logits - and the logits of n_extra (<= kCandExtra) ids the caller names (the penalised ones).
@@ -225,6 +229,13 @@ struct SampleArgs {
     int top_k = kQMax;
 };
 
+/// A greedy Markov step whole (markov_pick's argmax and confidence, w2 [V][R] . w1[*prev] the bias - R 256): the bias
+/// rows over the GPU (8 lanes a row), each block's argmax, then one block for theirs and the confidence -> *prev, *out.
+/// part: markov_part_floats() floats of scratch; bias_out (if given) gets the bias.  false: R not 256 (nothing run).
+bool markov_greedy(const float* logits, const uint16_t* w2, const uint16_t* w1, int V, int R, int* prev, int* out,
+                   const float* w, const float* b, const float* hidden, int D, float* conf, float* part, float* bias_out,
+                   cudaStream_t s);
+size_t markov_part_floats();
 /// One Markov step: emb (BF16 [R], for the GEMV) and embf (F32 [R]) = table row *prev.
 void gather_row(const uint16_t* table, int R, const int* prev, uint16_t* emb, float* embf, cudaStream_t s);
 /// ... then: the next token = argmax(logits + bias) (ties: the lower id) -> *prev and *out; biased (if given) = logits +

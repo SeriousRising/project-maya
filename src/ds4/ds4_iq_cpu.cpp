@@ -24,6 +24,8 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <atomic>
+#include <thread>
 
 #if defined(__x86_64__) || defined(_M_X64)
 #define IQ_X86 1
@@ -732,6 +734,7 @@ bool own_check(int type) {
     return true;
 }
 
+#if defined(IQ_X86)
 // the time (us, best of 5 rounds) of 32 rows of 16 blocks of the type against nt tokens: ours with the IQ3 grids as
 // broadcasts + blends (variant 1) or by vpgatherdd (2), or the native lane's rows (0: the GLM lane's / ggml-cpu's)
 double time_variant(int type, int variant, int nt = 1) {
@@ -780,6 +783,7 @@ double time_variant(int type, int variant, int nt = 1) {
     if (gflag != nullptr) *gflag = keep;
     return best;
 }
+#endif  // IQ_X86
 
 // our rows for this type, here: IQ3_XXS / IQ3_S on AVX2 or AVX-512 VBMI, IQ2_XXS / IQ2_S / IQ1_S on AVX2 - checked once
 // against ggml-cpu's dot (each variant), then the fastest of ours and the native lane's measured on this CPU (they
@@ -961,6 +965,39 @@ void iq_cpu_rows(int type, const uint8_t* w, size_t rb, int k, const void* const
 
 bool iq_cpu_own_rows(int type) { return own(type); }
 void iq_cpu_iq1s_rows(bool on) { g_iq1_on.store(on, std::memory_order_relaxed); }
+
+bool dense_requant(const uint8_t* q8, int n, int k, int type, std::vector<uint8_t>& out, std::string& err) {
+    const ggml_type t = (ggml_type) type;
+    if (type < 0 || type >= GGML_TYPE_COUNT || ggml_blck_size(t) <= 0 || k % ggml_blck_size(t) != 0) {
+        err = "a row of " + std::to_string(k) + " values does not split in the type's blocks";
+        return false;
+    }
+    const size_t rb = ggml_row_size(t, k), qb = (size_t) k / 32 * 34;
+    ggml_quantize_init(t);
+    out.assign((size_t) n * rb, 0);
+    const int nth = (int) std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+    std::atomic<int> next{0};
+    constexpr int kChunk = 32;
+    std::vector<std::thread> th;
+    for (int w = 0; w < nth; ++w)
+        th.emplace_back([&] {
+            std::vector<float> f((size_t) kChunk * k);
+            for (int r0; (r0 = next.fetch_add(kChunk)) < n;) {
+                const int nr = std::min(kChunk, n - r0);
+                for (int r = 0; r < nr; ++r) {
+                    const uint8_t* row = q8 + (size_t) (r0 + r) * qb;
+                    for (int b = 0; b < k / 32; ++b) {
+                        const uint8_t* p = row + (size_t) b * 34;
+                        const float d = ggml_fp16_to_fp32((ggml_fp16_t) (p[0] | p[1] << 8));
+                        for (int j = 0; j < 32; ++j) f[(size_t) r * k + (size_t) b * 32 + j] = d * (float) (int8_t) p[2 + j];
+                    }
+                }
+                ggml_quantize_chunk(t, f.data(), out.data() + (size_t) r0 * rb, 0, nr, k, nullptr);
+            }
+        });
+    for (auto& x : th) x.join();
+    return true;
+}
 #else
 bool iq_cpu_fmt(int, int, int, int, IqCpu&, std::string& err) {
     err = "this build has no ggml-cpu (STRATA_NATIVE_EXPERTS=OFF): the low-bit experts' CPU lane is not in it";
@@ -974,6 +1011,10 @@ int iq_cpu_act_type(int) { return -1; }
 void iq_cpu_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {}
 bool iq_cpu_own_rows(int) { return false; }
 void iq_cpu_iq1s_rows(bool) {}
+bool dense_requant(const uint8_t*, int, int, int, std::vector<uint8_t>&, std::string& err) {
+    err = "this build has no ggml (STRATA_NATIVE_EXPERTS=OFF)";
+    return false;
+}
 #endif
 
 }  // namespace strata::ds4::gguf

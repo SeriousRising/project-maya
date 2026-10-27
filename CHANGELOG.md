@@ -1,9 +1,61 @@
 # Changelog
 
 Every release is on GitHub (Releases) with these notes; every published change moves the last number. Update: the
-dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
+page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.31 - 2026-10-27
+
+MiniMax answers faster, DeepSeek reads copied text faster and keeps its pictures off the GPU, orcarouter's
+abliterated DeepSeek in the setup, and a new web UI.
+
+- **MiniMax-M3.1-Flash much faster:** decoding with the DSpark drafter is about 1.5x as fast as in v1.1.30 on
+  three V100s and on a Strix Halo, plain decoding about 1.2x. A bug since v1.1.29 left the drafter guessing
+  without the prompt, so it rarely helped; it now drafts from the whole conversation. Faster dense kernels too,
+  with the same answers as before.
+- **DeepSeek: copied text up to ~1.6x faster** (#540, #543, @needmorevram): when the answer repeats earlier text -
+  a file sent back with small edits, quoted text - the engine checks the tokens that followed that text instead of
+  only the drafter's guesses, with and without DSpark. On by default on NVIDIA and AMD (about +27% on an edit on
+  a Strix Halo); `--suffix-draft 0` turns it off.
+- **DeepSeek pictures take no VRAM between pictures:** the vision tower borrows its working memory only while a
+  picture is read and gives it back, so about 320 MB more of the model stays on the GPU - as GLM and MiniMax.
+- **orcarouter's abliterated DeepSeek-V4.1-Flash** (#520, @needmorevram): `--model deepseek` offers
+  "orcarouter Abliterated Mix-128G" and "Mix-256G" below Maya's quants, the one that fits the PC recommended. They
+  use Maya's own n-gram tables (their table is DeepSeek's own, so the higher-precision copy is shared with Maya's
+  DeepSeek quants and their 110 GB table file is not downloaded). A gated repo: the setup uses your Hugging Face
+  login. Also from #520: a tensor-parallel group reads long prompts much faster (~7x at `--tp 8` in his runs).
+- **A new web UI** (#538, @needmorevram): a new chat, Settings, Monitor, a Models page to switch models and edit
+  each one's engine settings, and "Saved" - what the model's own API would have charged. The new look is the
+  default; the violet colours are a choice in Settings › General. Works offline: every library and font is in the
+  repo.
+
+From the community, thank you:
+
+- **DeepSeek decode latency** (#495, @needmorevram): the CPU lane works in one batch per node, kernels launch
+  dependent on the one before (newest GPUs), and the CPU answers its own requests - the same answers.
+- **DeepSeek on more PCs and setups, all opt-in:** a series for tensor-parallel groups and a helper GPU - fused
+  decode stages, exact trims checked at load, a pipelined all-reduce for two GPUs, uneven groups and the helper GPU in
+  the prompt path, long prompts' exact skip and borrowed expert slots, a VRAM cap for the drafter's experts (#511-#519,
+  @pepuscz); tensor parallel with uneven heads (#411, @NenadSteric); full zero-copy routes (#530) and a
+  cache-budgeted Engram read-ahead (#524, @handmade0octopus); re-quantized attention matrices at load (#473) and RAM
+  copies that follow the routes (#449, @cryptedy); direct I/O for the RAM copies (#421, @tctiger); packed cache
+  transfers for EXL3 tensor parallel 2 (#493) and a refresh of the startup expert profiles (#399, @LostVector); a
+  direction projection before each residual write, `--ablate` (#469, @JoshBolding).
+- **Loading DeepSeek:** the experts' pages are dropped as they are copied, with the load's threads and file order set
+  (#434, @Ross-Yang-94).
+- **AMD:** RDNA 4 attention acceleration (#529, @nicholas631), MI50 / gfx906 as a build target (#505, @0c33), and
+  opt-in prompt-path options: transfer pruning (#297, @LostVector) and int8 MMQ for routed experts (#354,
+  @boxwrench).
+- **NVIDIA DGX Spark (GB10) and Grace** on CUDA, and the prompt path recovers from a failed allocation (#471,
+  @xcpatr9231975).
+
+Fixes:
+
+- **DeepSeek GGUF experts uploaded from NUMA-split RAM copies** are right again (#533, @tctiger).
+- **Calibration** respects the effective tensor parallel (#435, @Whamp).
+- **`--parallel` is refused for DeepSeek and MiniMax** before it is written into their configs (#525, @DailyDisco).
+- **MiniMax quants on the Hub:** the dense layers' indexers file is now `<name>-maya-indexers.bin` (the same bytes;
+  the Hub read the lone `.gguf` as the model). The setup renames a v1.1.30 download in place.
 ## v1.1.30 - 2026-10-27
 
 MiniMax-M3.1-Flash in Project Maya's own quants: the whole model in a 128 GB PC.

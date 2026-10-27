@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace strata::ds4::gguf {
 
@@ -76,6 +77,10 @@ bool iq_cpu_own_rows(int type);
 /// IQ1_S's own multi-token rows (the same bits as ggml-cpu's dot): allowed by default; the engine turns them off where
 /// the one-GPU decode path is off (Model::Impl::one_gpu_path), so those setups keep ggml's rows as before.
 void iq_cpu_iq1s_rows(bool on);
+
+/// (DS4_DENSE_REQ) n rows of k Q8_0 values re-quantized to ggml type `type` (Q4_K, IQ4_XS, ...) by ggml's own
+/// quantizer, on the CPU's threads: out = n rows of ggml_row_size(type, k) bytes. False (err says why): not covered.
+bool dense_requant(const uint8_t* q8, int n, int k, int type, std::vector<uint8_t>& out, std::string& err);
 
 /// x rounded as the device's MXFP4 kernels round their activations (q8_quant: per 32 values sc = max|x| / 127, q =
 /// round-half-even(x / sc), the same F32 operations, so the same q), into out as q sc - an expert gives the same sums

@@ -302,13 +302,17 @@ class Drafter(unittest.TestCase):
         self.assertNotIn("dspark.bin", (q / "maya-ds4" / "tensors.txt").read_text())
 
 
-def gguf(path: pathlib.Path):
-    """A DeepSeek-V4.1 GGUF of one tensor (the embedding, BF16 [4][DIM]) and the metadata pack_gguf reads."""
+def gguf(path: pathlib.Path, meta: dict | None = None):
+    """A DeepSeek-V4.1 GGUF of one tensor (the embedding, BF16 [4][DIM]) and the metadata pack_gguf reads (meta: more
+    deepseek41.* keys, ints or lists of ints)."""
     def s(x: str) -> bytes:
         b = x.encode()
         return struct.pack("<Q", len(b)) + b
     kv = [s("general.architecture") + struct.pack("<I", 8) + s("deepseek41"),
           s("tokenizer.ggml.tokens") + struct.pack("<IIQ", 9, 8, 4) + b"".join(s(t) for t in ("a", "b", "c", "d"))]
+    for k, v in (meta or {}).items():   # (UINT32, or an ARRAY of them)
+        kv.append(s("deepseek41." + k) + (struct.pack("<IIQ", 9, 4, len(v)) + struct.pack("<%dI" % len(v), *v)
+                                          if isinstance(v, list) else struct.pack("<II", 4, v)))
     info = s("token_embd.weight") + struct.pack("<I", 2) + struct.pack("<2Q", DIM, 4) + struct.pack("<IQ", 30, 0)
     head = b"GGUF" + struct.pack("<IQQ", 3, 1, len(kv)) + b"".join(kv) + info
     head += b"\0" * ((-len(head)) % 32)

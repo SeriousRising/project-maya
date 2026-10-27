@@ -3,6 +3,7 @@
 #include "mm3_gguf.cuh"
 
 #include "mm3_env.hpp"
+#include "mm3_gv.cuh"
 #include "../ds4/ds4_iq.cuh"
 #include "../ds4/ds4_lt.hpp"
 
@@ -105,6 +106,32 @@ __global__ void __launch_bounds__(256) q8k_kernel(const float* __restrict__ x, s
 void q8(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, cudaStream_t s) {
     q8_kernel<<<dim3((unsigned) ((k / 32 + kWarps - 1) / kWarps), (unsigned) rows), kThreads, 0, s>>>(x, ldx, k, q, d);
 }
+// q8_kernel's rounding (the same q, d) with each 32's two 16-value sums of q (mm3_gv's minimum term: low 16 bits the
+// first half's, high the second's)
+__global__ void __launch_bounds__(kThreads) q8s_kernel(const float* __restrict__ x, size_t ldx, int k,
+                                                       int8_t* __restrict__ q, float* __restrict__ d, int* __restrict__ sums) {
+    const int r = blockIdx.y, b = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (b * 32 >= k) return;
+    const float v = x[(size_t) r * ldx + (size_t) b * 32 + lane];
+    float am = fabsf(v);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+    const float sc = am / 127.0f;
+    const int qi = am > 0.0f ? __float2int_rn(v / sc) : 0;
+    q[(size_t) r * k + (size_t) b * 32 + lane] = (int8_t) qi;
+    int sm = qi;
+#pragma unroll
+    for (int o = 8; o > 0; o >>= 1) sm += __shfl_xor_sync(0xffffffffu, sm, o);
+    const int hi = __shfl_sync(0xffffffffu, sm, 16);
+    if (lane == 0) {
+        d[(size_t) r * (k / 32) + b] = sc;
+        sums[(size_t) r * (k / 32) + b] = (sm & 0xffff) | (hi << 16);
+    }
+}
+void q8s(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, int* sums, cudaStream_t s) {
+    q8s_kernel<<<dim3((unsigned) ((k / 32 + kWarps - 1) / kWarps), (unsigned) rows), kThreads, 0, s>>>(x, ldx, k, q, d,
+                                                                                                      sums);
+}
 bool iq_q8k() {   // MAYA_MM3_IQ_Q8K=0: the experts' activations a scale a 32 (the dense GEMVs' rounding)
     static const bool on = [] {
         const char* v = ::mm3::env("MM3_IQ_Q8K");
@@ -192,6 +219,7 @@ struct Scratch {
     float* h = nullptr;      // [8][kMaxEmbd]: a token's experts' activations (moe_gate_up's h when the caller gives none)
     int8_t *xq = nullptr, *hq = nullptr, *mq = nullptr;   // int8 rows: x [kMaxEnt], h [kMaxEnt * 8], the GEMVs'
     float *xd = nullptr, *hd = nullptr, *md = nullptr;     //   [kMaxMvJobs * kMaxMvCols] inputs; their scales
+    int* ms = nullptr;       // the GEMVs' inputs' 16-value sums (mm3_gv)
     uint16_t* wb = nullptr;  // a GEMM's FP16 weight band (kBand bytes)
     cublasHandle_t blas = nullptr;
 };
@@ -209,7 +237,8 @@ Scratch* scratch(cudaStream_t s) {
         cudaMalloc(&sc.h, (size_t) 8 * kMaxEmbd * 4) != cudaSuccess || cudaMalloc(&sc.xq, kNx) != cudaSuccess ||
         cudaMalloc(&sc.xd, kNx / 32 * 4) != cudaSuccess || cudaMalloc(&sc.hq, kNh) != cudaSuccess ||
         cudaMalloc(&sc.hd, kNh / 32 * 4) != cudaSuccess || cudaMalloc(&sc.mq, kNm) != cudaSuccess ||
-        cudaMalloc(&sc.md, kNm / 32 * 4) != cudaSuccess || cudaMalloc(&sc.wb, kBand) != cudaSuccess) {
+        cudaMalloc(&sc.md, kNm / 32 * 4) != cudaSuccess || cudaMalloc(&sc.ms, kNm / 32 * 4) != cudaSuccess ||
+        cudaMalloc(&sc.wb, kBand) != cudaSuccess) {
         cudaGetLastError();
         fail("scratch: out of device memory");
         return nullptr;
@@ -290,7 +319,7 @@ size_t scratch_bytes() {
     // (+ cuBLAS' workspace, and ds4_iq's light sets' int8 rows - 512 experts x 16 rows of up to 8192 values - which it
     //  takes on a stream's first prompt)
     const size_t n8 = kNx + kNh + kNm;
-    return 2 * (size_t) 8 * kMaxEmbd * 4 + n8 + n8 / 32 * 4 + kBand + (16u << 20) + (72u << 20);
+    return 2 * (size_t) 8 * kMaxEmbd * 4 + n8 + n8 / 32 * 4 + kNm / 32 * 4 + kBand + (16u << 20) + (72u << 20);
 }
 int launch_errors() { return g_errors.load(std::memory_order_relaxed); }
 unsigned wait_timeouts() {
@@ -317,6 +346,8 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
     Scratch* sc = scratch(s);
     if (sc == nullptr) return false;
     iq::MvJob J[x3::kMaxMvJobs];
+    gv::Job G[x3::kMaxMvJobs];
+    bool fast = gv::enabled();   // (mm3_gv's GEMVs: the same sums, read faster - every job theirs, else none)
     for (int i = 0; i < n; ++i) {
         const x3::MvJob& q = jobs[i];
         const x3::Mat& m = *q.m;
@@ -327,8 +358,21 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
             g_errors.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
-        const size_t at = (size_t) i * x3::kMaxMvCols * kMaxQK;
-        q8(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, s);
+        size_t at = (size_t) i * x3::kMaxMvCols * kMaxQK;
+        // (a job over the same activations as an earlier one - q / k / v, the shared expert's gate / up - takes that
+        //  one's int8 rows: the same values, one rounding launch instead of several)
+        int same = -1;
+        for (int j = 0; j < i && same < 0; ++j)
+            if (jobs[j].xf == q.xf && jobs[j].ncol == q.ncol && jobs[j].m->k == m.k &&
+                (q.ncol == 1 || jobs[j].xf_cs == q.xf_cs))
+                same = j;
+        if (same >= 0) {
+            at = (size_t) same * x3::kMaxMvCols * kMaxQK;
+        } else if (fast) {
+            q8s(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, sc->ms + at / 32, s);
+        } else {
+            q8(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, s);
+        }
         iq::MvJob& b = J[i];
         b.w = (const uint8_t*) m.raw;
         b.ld = m.ld > 0 ? (size_t) m.ld : row_bytes(m.gg_type, m.k);
@@ -342,6 +386,29 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
         b.ycs = q.ncol > 1 ? q.y_cs : (size_t) m.n;
         b.bias = q.bias;
         b.alpha = q.alpha;
+        gv::Job& f = G[i];
+        f.w = b.w;
+        f.ld = b.ld;
+        f.type = b.type;
+        f.k = b.k;
+        f.n = b.n;
+        f.ncol = b.ncol;
+        f.xq = b.xq;
+        f.xd = b.xd;
+        f.xs = sc->ms + at / 32;
+        f.y = b.y;
+        f.ycs = b.ycs;
+        f.bias = b.bias;
+        f.alpha = b.alpha;
+        fast = fast && gv::covered(f);
+    }
+    if (fast) {
+        if (!gv::run(G, n, s)) {
+            fail("mv: mm3_gv refused covered jobs");
+            return false;
+        }
+        check("mv");
+        return true;
     }
     if (!iq::mv(J, n, s)) {
         fail("mv: a type not covered");

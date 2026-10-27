@@ -57,7 +57,7 @@ def gguf(path: pathlib.Path, kv: dict, tensors: list):
             f.write(d + b"\0" * ((32 - len(d) % 32) % 32))
 
 
-def model(root: pathlib.Path, side: bool = True) -> pathlib.Path:
+def model(root: pathlib.Path, side: bool = True, side_ext: str = ".bin") -> pathlib.Path:
     m = root / "MiniMax-M3.1-Flash-Maya-XS"
     m.mkdir()
     a = "minimax-m3."
@@ -102,7 +102,7 @@ def model(root: pathlib.Path, side: bool = True) -> pathlib.Path:
         ix = [("blk.%d.%s" % (li, n), t, dims) for li in range(LEAD) for n, t, dims in
               (("indexer.q_proj.weight", 8, [D, 256]), ("indexer.k_proj.weight", 8, [D, 128]),
                ("indexer.q_norm.weight", 0, [128]), ("indexer.k_norm.weight", 0, [128]))]
-        gguf(m / "MiniMax-M3.1-Flash-Maya-XS-maya-indexers.gguf",
+        gguf(m / ("MiniMax-M3.1-Flash-Maya-XS-maya-indexers" + side_ext),
              {"general.architecture": (8, "minimax-m3"), "maya.indexers.for": (8, "MiniMax-M3.1-Flash-Maya-XS")}, ix)
     return m
 
@@ -174,7 +174,7 @@ class PackGguf(unittest.TestCase):
                          "norms_plus_one": "1", "max_position_embeddings": "1048576"}.items():
                 self.assertEqual(kv.get(k), v, k)
             files, t = tensors(pack)
-            self.assertEqual(files[-1], "MiniMax-M3.1-Flash-Maya-XS-maya-indexers.gguf")
+            self.assertEqual(files[-1], "MiniMax-M3.1-Flash-Maya-XS-maya-indexers.bin")
             P = "language_model.model."
             self.assertEqual(t[P + "layers.0.self_attn.index_q_proj.weight"][0], "Q8_0")
             self.assertEqual(t[P + "layers.0.self_attn.index_q_proj.weight"][1], len(files) - 1)   # (the side file's)
@@ -227,12 +227,21 @@ class PackGguf(unittest.TestCase):
             self.assertNotIn("vision.hidden_size", (pack / "mm3.txt").read_text())
             self.assertNotIn("dspark.", (pack / "mm3.txt").read_text())
 
+    def test_side_file_under_its_v1130_name(self):
+        """Up to v1.1.30 the indexers' file was <name>-maya-indexers.gguf: still found as the side file."""
+        with tempfile.TemporaryDirectory() as d:
+            m = model(pathlib.Path(d), side_ext=".gguf")
+            r = run(m)
+            self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+            files, _ = tensors(m / "maya-mm3")
+            self.assertEqual(files[-1], "MiniMax-M3.1-Flash-Maya-XS-maya-indexers.gguf")
+
     def test_no_side_file(self):
         with tempfile.TemporaryDirectory() as d:
             m = model(pathlib.Path(d), side=False)
             r = run(m)
             self.assertNotEqual(r.returncode, 0)
-            self.assertIn("maya-indexers.gguf", r.stderr + r.stdout)
+            self.assertIn("maya-indexers.bin", r.stderr + r.stdout)
             self.assertIn("indexer of layer 0", r.stderr + r.stdout)
 
     def test_a_shard_missing(self):

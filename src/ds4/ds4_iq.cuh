@@ -1,7 +1,8 @@
 // src/ds4/ds4_iq.cuh - a GGUF's routed experts in ggml's low-bit block types on the device for maya-ds4: the i-quants
 // IQ1_S, IQ1_M, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS and the K-quants Q2_K, Q3_K, Q4_K (256 values a block, ggml's
-// layouts: ggml-common.h, llama.cpp MIT).  ds4_gguf.cu sends an expert layer here when its experts are not MXFP4
-// (x3::ExpertLayout::fmt kFmtMXFP4 with K[r] = role r's ggml type; K[r] == kTypeMXFP4: ds4_gguf.cu's own kernels).
+// layouts: ggml-common.h, llama.cpp MIT); Q5_K and Q6_K for a GGUF's dense matrices.  ds4_gguf.cu sends an expert
+// layer's gate / up, or its down, here when that role is not MXFP4 (x3::ExpertLayout::fmt kFmtMXFP4 with K[r] = role
+// r's ggml type; K[r] == kTypeMXFP4: ds4_gguf.cu's own kernels).
 //
 // Every weight is decoded exactly (ggml's dequantize_row_*: a block scale times an integer scale times a grid or code
 // value) and every product takes the activations rounded to int8 per 32 values with an F32 scale (ds4_gguf.cu's
@@ -100,6 +101,20 @@ struct SetArgs {
     int tu = 0;                // (kActOai) the up's type when it is not the gate's (0: tg) - two passes, as Args::tu
     float* graw = nullptr;     // ... the gate's F32 sums between them: [local rows][n_ff] (the caller's scratch)
 };
+#if defined(STRATA_USE_HIP)
+// Host metadata for a prompt set, valid only within this scope; nested calls restore their caller's metadata.
+// Keeping it here leaves the shared EXL3/GGUF SetArgs ABI unchanged.
+class MmqRowsScope {
+public:
+    MmqRowsScope(int total_rows, const int* host_bounds);
+    ~MmqRowsScope();
+    MmqRowsScope(const MmqRowsScope&) = delete;
+    MmqRowsScope& operator=(const MmqRowsScope&) = delete;
+private:
+    int previous_rows_;
+    const int* previous_bounds_;
+};
+#endif
 bool set_gate_up(const SetArgs& a, cudaStream_t s);
 bool set_down(const SetArgs& a, cudaStream_t s);
 /// The busy experts' path (a prompt's experts of many rows): one expert's matrix - n rows of k values, row_bytes(k)

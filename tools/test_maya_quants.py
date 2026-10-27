@@ -260,7 +260,7 @@ class MiniMaxFiles(unittest.TestCase):
             self.assertEqual((m["repo"], m["folder"]), ("peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF", tier))
             base = f"MiniMax-M3.1-Flash-{tier}-{main}"
             self.assertEqual(list(m["files"]), [f"{base}-{i:05d}-of-{n:05d}.gguf" for i in range(1, n + 1)] +
-                             [f"MiniMax-M3.1-Flash-{tier}-maya-indexers.gguf"])   # (not a {main} file)
+                             [f"MiniMax-M3.1-Flash-{tier}-maya-indexers.bin"])   # (not a {main} file)
             self.assertEqual(len(m["earlier_names"]), len(m["files"]))
             self.assertTrue(all(o.startswith(f"MiniMax-M3.1-Flash-{tier}-") for o in m["earlier_names"]))
             self.assertEqual(maya.hf_url(m["repo"], "main", m["folder"], f"{base}-00001-of-{n:05d}.gguf"),

@@ -256,7 +256,7 @@ class Gguf(unittest.TestCase):
         for q, name in (("gguf-xs", "MiniMax-M3.1-Flash-Maya-XS"), ("gguf-s", "MiniMax-M3.1-Flash-Maya-S")):
             m = maya.mm3_gguf_entry(q)
             self.assertEqual(m["folder"], name[len("MiniMax-M3.1-Flash-"):])     # (the repo's Maya-XS/, Maya-S/)
-            self.assertTrue(any(n.endswith("-maya-indexers.gguf") for n in m["files"]))
+            self.assertTrue(any(n.endswith("-maya-indexers.bin") for n in m["files"]))
             self.assertTrue(all(n.startswith(name) for n in m["files"]))
             self.assertGreater(m["memory_gb"], m["download_gb"])
             self.assertTrue(maya.mm3_gguf_published(q))               # (uploaded: the revision and every sha256)
@@ -338,6 +338,12 @@ class Gguf(unittest.TestCase):
                 with (d / n).open("wb") as f:
                     f.truncate(size)
             self.assertEqual(len(maya.mm3_gguf_model_step(args(), d, "gguf-xs")), 3)
+            # v1.1.30 named the indexers' file .gguf: the same bytes are renamed .bin, not downloaded again
+            ix = next(f for f in m["files"] if f.endswith(".bin"))
+            (d / ix).rename(d / ix.replace(".bin", ".gguf"))
+            self.assertEqual(len(maya.mm3_gguf_model_step(args(), d, "gguf-xs")), 3)
+            self.assertTrue((d / ix).is_file())
+            self.assertFalse((d / ix.replace(".bin", ".gguf")).exists())
 
 
 if __name__ == "__main__":

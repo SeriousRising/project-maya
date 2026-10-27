@@ -412,7 +412,12 @@ def main() -> int:
                                      "(default: <model>/../Engram, when it is whole)")
     ap.add_argument("--shards", nargs="+", help="the GGUF's files in --model (default: every .gguf there - one "
                                                 "model's; the setup names them: a folder may hold an earlier layout)")
+    ap.add_argument("--without", nargs="+", default=[],
+                    help="shards of the split left out on purpose: they hold only its Engram tables, which --engram's "
+                         "set gives instead (orcarouter's shard 2: the setup takes Maya's Q6_K tables for it)")
     a = ap.parse_args()
+    if a.without and not a.engram:
+        raise SystemExit("--without: the Engram tables then come from --engram's set - name it")
     model = pathlib.Path(a.model).expanduser().resolve()
     out = pathlib.Path(a.out).expanduser() if a.out else model / "maya-ds4"
     shards = [model / n for n in a.shards] if a.shards else sorted(model.glob("*.gguf"))
@@ -427,7 +432,10 @@ def main() -> int:
     if kv is None or kv["general.architecture"] not in ("deepseek41",):
         raise SystemExit("%s: not a DeepSeek-V4.1 GGUF (architecture %r)" % (model, kv and kv.get("general.architecture")))
     split = int(kv.get("split.count", 1))
-    if split != len(gs):
+    if a.without and (any(n in [p.name for p in shards] for n in a.without) or
+                      any(not re.search(r"-of-%05d\.gguf$" % split, n) for n in a.without)):
+        raise SystemExit("--without %s: not shards of this %d-shard split left out" % (" ".join(a.without), split))
+    if split != len(gs) + len(a.without):
         counts = sorted({m.group(1) for m in (re.search(r"-of-(\d{5})\.gguf$", p.name) for p in shards) if m})
         raise SystemExit("%s: %d of the %d shards are here" % (model, len(shards), split) if len(counts) < 2 else
                          "%s: the shards of more than one GGUF split (-of-%s): name the model's own with --shards" %

@@ -328,6 +328,10 @@ with `"loop_guard": false` (or `true`) beside its sampling fields (Chat Completi
 
 ## Several requests at once
 
+This is a **GLM-5.3-Flash** setting. DeepSeek and MiniMax currently serve one request at a time; the launcher rejects
+`--parallel` for them before changing a config or starting setup/calibration. DeepSeek's saved conversation slots
+reuse earlier state, but do not decode multiple requests at once.
+
 `--parallel N` (1-8, default 1). `./maya.sh --parallel 4` (Windows:
 `START-MAYA.bat --parallel 4`) keeps it in the config's `"args"`. Maya then answers up to N requests at the same time,
 and the ones after them wait their turn. The dashboard shows how many answers are being written, and `/v1/status`
@@ -464,6 +468,8 @@ windows. The stream lane's time is measured on the GPU itself. On an RTX 3090 + 
 | `MAYA_DS4_STREAM` | on (1) | `0`: every expert VRAM does not hold on the CPU, as before |
 | `DS4_STREAM_TOKEN_AB` | on (1) | `0`: the per-layer check alone decides, as in v1.1.24 |
 | `DS4_STREAM_ZC` | on with one NVIDIA GPU on Linux where experts stream | `0`: copied experts pass the pinned staging, as before (the GPU does not pull them in place) |
+| `DS4_STREAM_ZC_ALL` | off (0) | with `DS4_STREAM_ZC=1` and the baseline PCIe lane allowed: after an expert copy is actually pinned, an ordinary one-token route whose picks all have pinned, device-readable copies streams every non-VRAM pick instead of using the measured split. It never overrides a persisted device `lane=off` or changes pre-placement allocation; without usable ZC it is inert. Uncovered routes, the CPU-only/fallback A/B arms, and DSpark verify-window eligibility stay as before; the experimental device-lane decision is not persisted |
+| `DS4_STREAM_ZC_NOWAIT` | off (0) | with `DS4_STREAM_ZC_ALL` active: an ordinary one-token layer whose every possible non-VRAM expert has a pinned copy skips the empty CPU response and its wait. Partial layer coverage, the whole-step CPU A/B arm, forced routes, helpers, tensor-parallel/drafter layers, skip policies, and DSpark windows keep the original behavior; without active ZC-all this setting is inert |
 | `DS4_STREAM_WIN` | on with one NVIDIA GPU on Linux where experts stream | `0`: verify windows do not stream (a single token's experts only, as before) |
 | `DS4_STREAM_SLOTS` | 16 | a verify window's streamed experts at most, a layer (1-16) |
 | `DS4_LAND` | on with one NVIDIA GPU on Linux where experts stream | `0`: a streamed expert does not stay in VRAM, and a GGUF gets no recent slots |
@@ -473,6 +479,17 @@ windows. The stream lane's time is measured on the GPU itself. On an RTX 3090 + 
 
 The engine's decode summary (`streamed to the GPU: N`) and the `pcie=` key of its STAT lines (experts a token
 streamed) show it at work; the start's log prints each format's times and how many of a token's experts it streams.
+
+With several GPUs, where the CPU lane's experts are copied into RAM (two NUMA parts) and prompts run in chunks, the
+copies are pinned at load as well, and the prompt path copies a GGUF's expert to the GPU straight from them: no pass
+through the CPU's staging first, which only gathers a tensor-parallel member's columns of the down. The load says
+`the copied experts pinned (N GB in S s)`; where the pin fails it says so, and the prompt path stages them as before.
+On an RTX 3090 + 8 RTX 5060 Ti (`--tp 8`, orcarouter's Mix-256G, 125 GB pinned in 50-110 s) a 16K prompt 406 -> 595
+tokens/s.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `DS4_COPY_PIN` | on (several GPUs, copies in RAM, chunked prompts) | `0`: the copies are not pinned; the prompt path stages every expert through the CPU, as before |
 
 ## DeepSeek: long prompts read without the second half's work
 
@@ -487,7 +504,9 @@ that. It applies to prompts of ~3,700 new tokens or more, on one GPU (several GP
 | Setting | Default | |
 | --- | --- | --- |
 | `MAYA_DS4_PROMPT_SKIP` | on (1) | `0`: every layer on every token of a prompt, as before; `2`: DeepSeek's own (the last 128 tokens only) |
+| `MAYA_DS4_YOCO_TP` | off | `1`: the skip also for one tensor-parallel group that holds every layer and reads its prompts on the flow (`DS4_FLOW_TP=1`), its rows cut anywhere in a chunk as on one GPU (off the flow a group skips already) |
 | `MAYA_DS4_DSPARK_CUM` | 0.5 | DSpark drafting: a draft is verified only while the chance that it and every draft before it are kept (the product of their confidences) stays at least this, so a window whose later drafts would likely be lost is not verified whole. The same tokens; a Radeon 8065S with Maya-S decoded 12.04 -> 12.82 tok/s (+6.5%). `0` = off (only each draft's own floor, `--dspark-conf`); a request's `strata_tune` `spec_cum` sets it for that request |
+| `--suffix-draft` (maya-ds4) | 3 (on, NVIDIA and AMD) | prompt lookup beside DSpark: where the answer repeats earlier context (code edits, quoted text), a round verifies the tokens that followed that earlier occurrence (up to 15, past DSpark's block) instead of DSpark's drafts, when its first token agrees with DSpark's and the measured round times and acceptance say it commits more tokens a millisecond. The same tokens (greedy: identical; sampled: every token still the model's own draw). 9 GPUs (RTX 3090 + 8x RTX 5060 Ti), Mix-256G, `--tp 8`: whole-file edits 84 -> 111 and 96 -> 144 tok/s, ordinary answers unchanged. Without DSpark (`--dspark none` or `off`, or a round after DSpark's drafts all fell below their confidence) the lookup's drafts are weighed against a plain step the same way: EXL3 3.5 bpw, `--tp 8`, no DSpark, a whole-file edit 48 -> 166 tok/s, a JSON list 57 -> 154, prose unchanged. The value is the shortest match it proposes from; `--suffix-draft 0` turns it off; a request's `strata_tune` `suffix_draft` (0/1) sets it for that request. On AMD its long verify windows (up to 16 tokens) do not always give the same bits as the short ones, so a greedy answer can take another word at a near-tie (the same quality); a Strix Halo with DSpark: a whole-file edit 46 -> 58 tok/s, ordinary answers unchanged |
 
 ## DeepSeek: choosing the drafter GPU group (experimental)
 
@@ -525,6 +544,27 @@ about a topic - and does nothing where the experts sit in VRAM and RAM. Without 
 RAM cannot hold the experts a conversation uses, it keeps skipping on later answers too. The engine's decode summary
 (`decode left out ...`, `DISK_SKIP auto: ...`) and the `skipped=` / `skip_on=` keys of its STAT lines show what it
 did.
+
+An expert it leaves out is never computed, so its pages never come off the SSD: where the RAM copies
+(`--mmap-experts off`) do not hold every expert, one that is picked light again and again is left out all through a
+conversation. `MAYA_DS4_COPY_SWAP=1` lets the copies follow the routes, as the RAM tier's do: between answers' tokens a
+layer's hottest expert read from the files (its heat counts the left-out picks too) takes the place of its coldest
+copy, read by a thread of its own into a free slot the layer keeps (one expert a layer more RAM, ~0.44 GB on Maya-S).
+The copies keep their RAM, so nothing else leaves the page cache for them. The same answers' arithmetic: it changes only
+where experts sit, and so fewer are left out. An RTX 3090 with 128 GB of RAM, Maya-S, `DS4_COPY_GB=96`,
+`MAYA_DS4_DISK_SKIP_W=0.20`, 8,192-token answers: 15.0 / 15.8 -> 15.8 / 15.9 tok/s, 5.0-5.8 -> 3.5-4.5 experts a token
+left out in the second half; after a 4,096-token answer, 6 prompts' KL against no skipping 0.0184 -> 0.0149 (no skip:
+0.0171, all within the noise). The idea is Abyss's RAM fill for its disk tail skip
+([zephel01/Abyss](https://github.com/zephel01/Abyss) v1.3.46, issue #8 there).
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_COPY_SWAP` | off (0) | `1` (copy mode: `--mmap-experts off`): a layer's hottest expert read from the files takes the place of its coldest copy; nothing to do where the copies hold every expert |
+| `MAYA_DS4_COPY_SWAP_MARGIN` | 1.25 | a move when the hot one's heat is above the cold one's x this + 1 |
+| `MAYA_DS4_COPY_SWAP_EVERY` | 8 | at most one move every this many tokens (one at a time); 4 or 2 left out no fewer on the PC above and were slower |
+
+With `MAYA_DS4_DISK_SKIP_W` set, the engine log gets a line every 512 decoded tokens: the experts a token left out and
+the copy swaps (`ds4: DISK_SKIP: ...`).
 
 ## DeepSeek: explicit RAM residency
 
@@ -589,6 +629,7 @@ on are used (`taskset`, a container's cpuset).
 | `--cpu-threads N` (the config's engine `args`) | a thread per core | at most N threads, a thread per core; nothing is measured |
 | `MAYA_DS4_CPU_LANE` | measured | `cores`, `pcores`, `node` or `smt` (a thread per logical CPU): that way, nothing is measured |
 | `DS4_COPY_NUMA` (the config's `"env"`) | 2 parts at most | the CPU lane's RAM copies of its experts in this many NUMA parts, `1`-`4`, each on its own node with a worker pool there - so a host of three or four sockets uses them all (the default takes two). 4x Xeon E7-8880 v4 (88 cores), Maya-S + DSpark, `--mmap-experts off`: two RTX 3090s (a pair on sockets 0-1, and one on 2-3, two runs each on the first) 37-39 -> 49 tok/s decode, after a 68K prompt 24-26 -> 32-33 tok/s, the prompt read 644-655 -> 805 tok/s on the first pair (802 both ways on the second); four RTX 3090s (less on the CPU lane) unchanged |
+| `MAYA_DS4_LANE_SPIN_US` | 20000 | the lane's workers spin this many us idle before they sleep (0 .. 1000000): a decode hands the lane work on few layers, and on an APU a shorter spin leaves the integrated GPU more of the shared power (the answers are the same) |
 
 ## DeepSeek: IQ1_S experts on AMD Zen, Zen+ and Zen 2 CPUs
 
@@ -618,6 +659,79 @@ against the per-job one on every GPU at load (any difference fails the start).
 | `MAYA_DS4_Q8_BATCH` | off | `1`: a GEMV call's int8 rounding in one launch (the same bits) |
 | `MAYA_DS4_Q8_CHECK` | off | `1`: the batched rounding checked against the per-job one on every GPU at load |
 
+## DeepSeek: a decoded token's small launches fused
+
+A decoded token runs a few launches a layer that do almost nothing: the HC split (one warp) and its pre-norm (one
+block), the attention input's int8 rounding and the layer's copy of the pre slots; and on a group's lead the router
+stage - the layer's gate, the next layer's gate (the lookahead's guesses), the routing and the guesses, four launches.
+`MAYA_DS4_HC_FUSE=1` runs the split and the norm in one launch and rounds the attention's input there (three launches
+fewer a layer); `MAYA_DS4_ROUTE_FUSE=1` runs the two gates in one launch and the routing and the guesses in another.
+`2` does the same for a DSpark verify window's rows too (`MAYA_DS4_HC_FUSE=2` also rounds the FFN's input for the
+shared expert). The old kernels stay; at load, before any request, every GPU runs both paths on its first and last
+layers (random, edge and tie inputs) and compares every byte - a difference fails the start, so the answers are the
+same. Not on a wave64 build (gfx908).
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_HC_FUSE` | off (0) | `1`: a decoded token's HC split and norm in one launch, the attention input rounded to int8 there; `2`: a verify window's rows too, and the FFN input rounded for the shared expert (the same bits, checked at load) |
+| `MAYA_DS4_ROUTE_FUSE` | off (0) | `1`: a decoded token's router stage on a group's lead in two launches instead of four; `2`: a verify window's rows too (the same bits, checked at load; one layer of lookahead, `DS4_AHEAD` 1, the default) |
+
+`MAYA_DS4_DECODE_TRIM=<bits>` takes four more small steps out of a decoded window, each checked at load the same way:
+`1` the shared expert's swiglu rounds its output to int8 for its down GEMV, `2` q's norm rounds its output for wq_b,
+`4` a verify window's compressor snapshot (four copies) and a ratio-1 layer's latent copy one kernel each, `8` the
+DSpark drafter's hand-offs between its GPUs (`MAYA_DS4_DRAFT_DEV`) through host-mapped rows and a flag, as a layer
+split's groups hand theirs, instead of copies through pinned memory and events. The bits add up (`15`: all four).
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_DECODE_TRIM` | 0 | bits: `1` s2's int8 input from the swiglu, `2` wq_b's from q's norm, `4` the snapshot and latent copies one kernel each, `8` the drafter's hand-offs by host-mapped rows (the same bits, checked at load) |
+
+## DeepSeek: the attention's dense matrices re-quantized at load (opt-in, changes the answers)
+
+A GGUF pack keeps its dense weights in Q8_0. Every decoded token reads all of them, and they take VRAM the experts
+could use. `MAYA_DS4_DENSE_REQ=q5_k` re-quantizes the largest of them (the attention's `wq_b`, `wo_a` and `wo_b`) at load
+with ggml's own quantizer. They then run as a GGUF's low-bit dense matrices do (ds4_iq's GEMV for a token, its FP16 rows
+for a prompt). The first start converts them on the CPU (about 20 s for DeepSeek-V4.1-Flash) and keeps the result in
+the pack (`<pack>/dense-req-<type>/`, about 3 GB for Q5_K). A later start reads that cache instead (about 2 s). A
+cache from another source file or type is not used; delete the folder to free the space.
+
+On an RTX 3090 (24 GB) with 128 GB RAM (Ryzen 7 9700X), DeepSeek-V4.1-Flash-1017 Maya-S, `--mmap-experts off`, `MAYA_DS4_DISK_SKIP_W=0.20`:
+
+| | dense weights | experts in VRAM | chat decode | KL (10 questions) | 16K-token NLL |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q8_0 (off) | 8.46 GB | 1,177 | 18.6 tok/s | 0.0194 | - |
+| `q5_k` | 6.70 GB | 1,361 | 19.7 tok/s (+6%) | 0.0270 | +0.0049 |
+| `iq4_xs` | 5.97 GB | 1,407 | 20.1 tok/s (+8%) | 0.0429 | - |
+
+KL is against the unmodified model (no skip, Q8_0). `q4_k` and `iq4_xs` save a little more and change the answers two
+to three times as much, so `q5_k` is the one to try. The gain comes from the experts the freed VRAM holds, so it is
+largest where the CPU lane runs many experts, and nothing where VRAM already holds every expert.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_DENSE_REQ` | off | `q5_k`, `q4_k` or `iq4_xs`: the Q8_0 dense matrices below re-quantized to that type at load (changes the answers a little). The GPU kernels are in every build; the conversion needs the native-experts build (ggml) - without it the matrices stay Q8_0, with a log line |
+| `MAYA_DS4_DENSE_REQ_MATCH` | `attn.wq_b,attn.wo_a,attn.wo_b` | the matrices it takes: a comma-separated list, a tensor whose name contains one of them |
+
+## DeepSeek: projecting a direction out (`--ablate`)
+
+`--ablate FILE` removes one direction r from every residual write: each layer's attention output and MoE output
+become y - s r (r . y) right before `hc_post`. The use it is written for is abliteration (r a refusal direction), and
+the pack is not changed. The direction comes from a `llama-cvector-generator` file (`direction.N`, pick N with
+`--ablate-layer`) or from a rank-1 abliteration LoRA GGUF (`lora_a` = s r^T W, `lora_b` = -r, the
+`abliterate.direction_layer` and `abliterate.scale` keys), whose direction, layer and scale it reads. An adapter is
+applied only as a projection: it must carry the same direction on all three writers of every block (`attn_output_b`,
+`ffn_down_shexp`, `ffn_down_exps`); one for some blocks only, without the routed experts, or for another depth is
+refused. Its A halves are not used; on the weights it was computed against the result is the
+adapter's, on other weights it is the exact projection rather than the adapter. Without `--ablate` nothing runs.
+Measured with drafting off, 4x RTX 3090, four restart pairs alternating the two: decode 1.5-3.8% slower (about 3%),
+no consistent prompt-speed difference.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `--ablate FILE` (the config's engine `args`) | off | a control vector or a whole-model abliteration adapter (GGUF) |
+| `--ablate-layer N` | the adapter's, or a one-direction file's | which `direction.N` of a control vector (1-4096) |
+| `--ablate-scale F` | the adapter's `abliterate.scale` (x `adapter.lora.alpha`), else 1 | s, 1e-6 to 1e6; 1 removes the component along r, above 1 over-projects |
+
 ## DeepSeek: tensor parallel 2 on Maya's own quants
 
 `--tp n` splits each expert's FFN between the group's GPUs, and a GGUF's experts split only in whole blocks of their
@@ -625,17 +739,35 @@ type: Maya's quants use 256-value blocks, n_ff 2304 = 9 blocks, so `--tp 2` (or 
 "tensor parallel 2 -> 1". `MAYA_DS4_TP_GGUF_UNEVEN=1` lets a member take whole blocks as even as they go, 5 + 4 for
 two GPUs, with the odd block going round the members layer by layer, as EXL3's split128 does. Each member loads,
 streams and swaps its own range, the shared expert is split at the same range, and each member's exact expert bytes
-are fitted to its own VRAM (a slot fewer at a time when the mean overshoots). With `DS4_FLOW_TP=1` its members take
+are fitted to its own VRAM (a slot fewer at a time when the mean overshoots). A member's prompt copies carry only its
+own part (its gate / up rows and its columns of the down), not the whole expert. With `DS4_FLOW_TP=1` its members take
 the prompt flow too, each streaming its own rows, the down gathered on the GPU (on a disk-streaming box the group's
 prompts are much slower off the flow).
 `MAYA_DS4_TP_CHECK=1` checks every expert format and rotation at load, before any request: one token through each
 member's parts as decode runs them, summed on the host and compared with the whole expert and shared expert (more than
-1e-3 of the largest output fails the start).
+1e-3 of the largest output fails the start), and each member's prompt copies on its GPU against the file's bytes, bit
+for bit.
 
 | Setting | Default | |
 | --- | --- | --- |
-| `MAYA_DS4_TP_GGUF_UNEVEN` | off | `1`: a GGUF's experts split in whole blocks, as even as they go, so its group can form |
+| `MAYA_DS4_TP_GGUF_UNEVEN` | off | `1`: a GGUF's experts split in whole blocks, as even as they go, so its group can form; with `MAYA_DS4_HELPER`, the helper takes the group's layers too (on its lead) |
 | `MAYA_DS4_TP_CHECK` | off | `1`: each member's parts checked against the whole expert at load |
+| `MAYA_DS4_FLOW_DOWN_SHARE` | off | `1` (with `DS4_FLOW_TP=1`): a group's members read each streamed expert's down from the files once, through the page cache (dropped once every member read it), where each member read it from the disk itself - the same bytes |
+| `MAYA_DS4_FLOW_DOWN_PART` | off | `1` (with `DS4_FLOW_TP=1` and `MAYA_DS4_TP_GGUF_UNEVEN`): each member copies only its own columns of a streamed expert's down to the GPU, compacted where it was read, not the whole down and a gather there - the same bytes in its slot (`MAYA_DS4_TP_CHECK` checks them at load) |
+| `MAYA_DS4_TP_BORROW` | off | `1` (with `DS4_FLOW_TP=1`): a group's members lend the prompt path the room of their last expert slots for its buffers, as one GPU does, so larger chunks (16K / 32K tokens) leave the decode as many VRAM experts; the experts under the buffers stream during the prompt and are read back after it (its time logged, as the decode waits for it) |
+
+A group of two sums its members' partial rows (the attention output's and the MoE's, every layer) by writing its whole
+partial out to host-mapped memory and then reading the other's in, four bytes a lane - one direction of the links at a
+time. `MAYA_DS4_AR2=1` does a prompt chunk's all-reduces in one launch that writes and reads in 128 KB pieces, the
+other member's rows read 16 bytes a lane: the same sums, bit for bit. `2` also sends both partials as FP16 (half the
+bytes; both members round theirs alike, so they stay equal, but the sums are FP16's, not exact).
+`MAYA_DS4_AR2_DECODE=1` takes the decode windows' all-reduces to the same kernel, exact. A group of three or more is
+unchanged. `ds4_gguf_test --ar <GPU> <GPU>` checks both against the host's sums on two GPUs and times them.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_AR2` | off (0) | a group of two's prompt-chunk all-reduces: `1` pipelined in one launch, the same sums; `2` FP16 on the wire (half the bytes, the sums FP16's) |
+| `MAYA_DS4_AR2_DECODE` | off (0) | `1`: a group of two's decode-window all-reduces in the same kernel, exact |
 
 ## DeepSeek: the DSpark drafter's blocks on a group's members
 
@@ -647,9 +779,16 @@ tightest member's room), so the tightest member has more left for the trunk. Eac
 itself; between two blocks on different GPUs their rows go through pinned host memory, as a layer split's groups
 hand theirs. The load line names the blocks a GPU holds (`+ blocks 0`).
 
+How many of a block's experts VRAM keeps: on one GPU, all of them as the room goes; on a group of several, once the
+expert profile has seen the drafter, those that take 99% of the block's routes, and more only while its member keeps
+the room of the group's next tightest member - the rest on the CPU lane. `MAYA_DS4_DRAFT_VRAM` sets it instead: each
+block keeps up to that many, the profile's hottest, as the room goes; the rest on the CPU lane, so the trunk keeps the
+room. A request's log then says how many of the drafter's picks took the CPU lane.
+
 | Setting | Default | |
 | --- | --- | --- |
 | `MAYA_DS4_DRAFT_DEV` | off (every block on the lead) | the member each DSpark block runs on: one number for every block, or one a block (`1,0,0`: block 0 on member 1, the others on the lead); 0 is the lead |
+| `MAYA_DS4_DRAFT_VRAM` | off (placed as above) | the most VRAM experts each DSpark block keeps, its profile's hottest: one number for every block, or one a block (`96,48,32`); 0 .. a block's experts (128) |
 
 ## DeepSeek: a helper GPU for the experts VRAM leaves over
 
@@ -663,12 +802,32 @@ the last bits. The DeepSeek counterpart of GLM's `MAYA_GLM_EXPERT_HELPER` (#201)
 AMD untested** - there AMD's driver starts queued GPU work only when the host waits, so the helper is likely to
 stay silent past the 10 s limit and hand its picks back to the CPU lane.
 
+A tensor-parallel group's layers stay off the helper (their picks on the CPU lane), unless
+`MAYA_DS4_TP_GGUF_UNEVEN=1`: then the helper takes them too, on the group's lead - its pool holds whole experts, the
+lead's requests take them and each pick's sum joins the lead's CPU part once, before the group's all-reduce.
+`MAYA_DS4_HELPER_CHECK` checks such a layer apart from a one-GPU layer of the same format.
+
 | Setting | Default | |
 | --- | --- | --- |
 | `MAYA_DS4_HELPER` | off | the helper's visible GPU index (not one of `--gpus`); with `MAYA_DS4_HELPER_GB`. Linux only (tested); Windows + AMD untested |
 | `MAYA_DS4_HELPER_GB` | - | its experts' pool, GB |
 | `MAYA_DS4_WARM_CAP_GB` | - | required with the helper: the load's experts in host RAM, GB, beside the pool (an integrated GPU's pool is host RAM too); ignored under `DS4_REQUIRE_ALL_RAM=1` (every expert in RAM) |
 | `MAYA_DS4_HELPER_CHECK` | off | `1`: at load, two tokens per expert format through the helper against the CPU lane, and its grouped window path against its per-token one, bit for bit |
+
+A prompt's experts that VRAM does not hold are read from the model's files as the prompt picks them (the flow), those
+the helper's pool holds too. With `MAYA_DS4_FLOW_HELPER=1` an expert the pool holds is copied out of it instead - the
+same bytes, so the same answers, the decode unchanged - and the disk reads only the rest.
+`MAYA_DS4_FLOW_HELPER_CHECK=N` has the load's first N prompts compare every expert copied out of the pool with the
+model's files (each read again, so those prompts are not timed); a difference fails the prompt.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_FLOW_HELPER` | off | `1`: a prompt's streamed experts the helper's pool holds copied out of it instead of read from the files (the same bytes) |
+| `MAYA_DS4_FLOW_HELPER_CHECK` | 0 | N: the load's first N prompts compare every expert copied out of the pool with the model's files; a difference fails the prompt |
+| `MAYA_DS4_HELPER_RECENT` | 0 (off) | N (up to 64): N slots a layer in the helper's pool (inside `MAYA_DS4_HELPER_GB`, carved first) for the CPU lane's experts the layer used lately - one used `MAYA_DS4_HELPER_RECENT_NEED` times in the layer's last `MAYA_DS4_HELPER_RECENT_WIN` decode steps is copied in, the least recently used goes; such an expert is summed on the helper, so the answers can differ in the last bits |
+| `MAYA_DS4_HELPER_RECENT_NEED` | 2 | its uses in the window that bring an expert to a recent slot (1-64, at most `_WIN`) |
+| `MAYA_DS4_HELPER_RECENT_WIN` | 8 | the decode steps a layer's uses are counted over (1-64) |
+| `MAYA_DS4_HELPER_RECENT_FILLS` | 2 | new recent slots a layer a step at most (1-16) |
 
 ## DeepSeek: where the measured hipBLASLt picks are kept (AMD)
 
@@ -680,6 +839,25 @@ installs, or checked by hash before each start) can keep them elsewhere.
 | --- | --- | --- |
 | `MAYA_DS4_LT_STORE` | `<pack>/lt-picks.txt` | the picks in this file instead; empty: none kept, each start measures its own |
 
+## DeepSeek: packed EXL3 tensor-parallel cache transfers
+
+`DS4_EXL3_PACKED_HOST=1` stores resident EXL3 host experts as GPU-ready member blobs;
+the CPU reads views of those blobs while retaining the original split-K reduction
+order. This experimental layout requires a two-member tensor-parallel group, one
+host NUMA part, uniform integer-bit expert layouts and aligned FFN partitions.
+The additional host storage is checked against the available RAM budget.
+
+With that layout enabled, `DS4_EXL3_DIRECT_SWAPS=1` enables a cache replacement path.
+It copies the GPU-ready member blobs directly between their host and VRAM slots,
+avoiding host reassembly and splitting, and queues both members before waiting.
+The existing GPU-turn copy guards and cache publication rules still apply.
+
+Both options default to `0`; unsupported layouts use the original path. They change
+transfer scheduling, not expert selection or compute kernels. Different cache
+completion timing can still change CPU/GPU execution placement and model numerics.
+Use `DS4_CHECK_SWAPS=1` for byte checks against the model files during validation;
+leave those checks off for timing measurements.
+
 ## DeepSeek: the starting expert profile
 
 The engine keeps how often each expert was routed in `<pack>/expert-profile.bin`: at a start the most-routed experts
@@ -688,6 +866,124 @@ pack has no counts yet, so the setup copies `data/expert-profile-ds4.bin` into i
 chat, code, multilingual text, reasoning and tool calls (`tools/ds4/profile.py`). Its counts weigh as much as about
 2,000 tokens of answers, so what your PC routes soon outweighs them. A pack that already has a profile keeps its own;
 an `--expert-profile` in the config's `args` (a file, or `none`) is used instead.
+
+## DeepSeek: loading the experts
+
+The engine reads the pack's expert regions into VRAM and RAM at start: 15,744 experts, 73 GB into VRAM and 147 GB
+into RAM here. The load is disk-bound, and the pack's files are read one after another, so a single file's regions
+are read in sequence. Three settings change how it reads them: the first is on, the other two keep today's behaviour
+by default.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_LOAD_DROP_CACHE` | on | drop each region's pages from the file cache once its bytes are copied; `0` keeps them |
+| `MAYA_DS4_LOAD_THREADS` | 12 | the threads that read the experts' regions (an EXL3 or other region pack; a GGUF pack's copies keep their own count): more threads load faster on a machine with the cores |
+| `MAYA_DS4_LOAD_INTERLEAVE` | off | `1`: the files round-robin - the first expert of each file, then the second, ... - so the threads read several files at once (a pack split over two drives streams both); `0`: file by file, as before |
+
+### The pages are dropped as the bytes are copied
+
+A buffered read leaves the expert's bytes in the file cache as well as in VRAM or RAM - the same 223 GB twice, on
+a machine with 251 GB. Past the first ~77 GB every new page is then allocated by reclaiming in the thread that
+copies: 0.79-0.91 GB/s measured, with 124-140 GB of page cache, memory PSI full at 69.7% and `pgsteal_direct`
+growing at the very rate of the copy. The load now calls `posix_fadvise(DONTNEED)` on each expert's region once its
+bytes are copied (`copy_experts` for a GGUF's experts into RAM, `load_experts` for an EXL3 pack's): the page cache
+stays at a few MB and the copy runs at the disk's speed. In place, where the CPU lane's experts *are* the file cache,
+only the VRAM experts' pages are dropped, as they already were.
+
+The drop is not free: walking 203 GB of pages costs about 20 us a MB, 4 s in all - and on a pack whose RAM tier
+leaves the cache room, the reclaim that the drop saves costs less than that. It is on by default because the pack
+that does not fit pays minutes, not seconds, and `MAYA_DS4_LOAD_DROP_CACHE=0` is the better setting where the drop
+costs more than it saves.
+
+Measured cold (the container stopped, `echo 3 > /proc/sys/vm/drop_caches`, then started; the engine's own
+`ds4: loaded in` line):
+
+UD-Q4_K_XL, GGUF, 11 files over two NVMe drives (65 GB of experts into VRAM, 223 GB copied into RAM):
+
+- before: 0.79-0.91 GB/s, page cache 124-140 GB, ~6 min to `/health` 200
+- after: 5.6-6.0 GB/s, page cache 4 MB, **56.7-58.6 s** to `/health` 200
+
+EXL3 2.9bpw, 203 GB (14.7k experts into 146.7 GB of RAM, `--mmap-experts off`):
+
+- today (12 threads, file by file, no drop): 41.4 and 42.1 s, page cache peaking at 140-143 GB
+- pages dropped (12 threads, file by file): 45.2 and 48.5 s, page cache 11 GB
+- pages dropped, 24 threads, interleaved: 27.1 and 27.0 s, page cache 12 GB, 11.4 GB/s
+
+The second line is the cost above: the RAM tier leaves the cache room, so the drop alone is a little slower. What
+takes 203 GB to 27 s is the order and the threads.
+
+### If the load stalls part-way: huge pages
+
+The RAM tier is allocated with `MADV_HUGEPAGE`. On a machine where the 2 MB blocks run out (here: at 190 GB of the
+223), every further 2 MB fault does a synchronous direct compaction, and when that keeps failing the fault stalls
+and retries: 77 MB/s measured, `/proc/buddyinfo` with no order-9 blocks left, `compact_stall` 108 a second and
+`compact_success` 0. `echo defer > /sys/kernel/mm/transparent_hugepage/defrag` makes a fault that cannot have a
+huge page fall back to 4 KB at once and leaves `kcompactd` to refill in the background: 77 MB/s -> 760 MB/s, and
+no stalls. That is the machine's setting, not the engine's - a `tmpfiles.d` line keeps it:
+
+    w /sys/kernel/mm/transparent_hugepage/defrag - - - - defer
+
+### DeepSeek expert-copy I/O
+
+These Linux options apply only to GGUF CPU experts selected for copying into anonymous RAM
+(`--mmap-experts off` or an explicit copy budget). They do not change routing, tensor bytes, Engram reads,
+CPU/GPU placement, or inference arithmetic. Both default to `0`; the normal buffered read path remains the default. The release of the source pages runs by
+default anyway through `MAYA_DS4_LOAD_DROP_CACHE` (above), with this boundary-page rule.
+
+| Environment variable | Default | Effect |
+|---|---|---|
+| `DS4_COPY_DROP_CACHE` | `0` (the release is on through `MAYA_DS4_LOAD_DROP_CACHE`) | `1`: after all three matrices and both NUMA parts of an expert have copied successfully, advise the filesystem to release whole source pages with `POSIX_FADV_DONTNEED`. Partial boundary pages are retained. Eviction is advisory, and mapped, locked or busy pages can remain cached. |
+| `DS4_COPY_DIRECT` | `0` | `1`: copy expert data through the existing Linux direct-I/O descriptor and a reusable per-worker 4 KiB-aligned staging buffer. The exact bytes are then copied to the NUMA destination. Unsupported or failed direct reads fall back to buffered reads; startup reports direct and fallback byte counts. |
+
+Put the variables in a model config's `env`, for example:
+
+```json
+{"DS4_COPY_DROP_CACHE": "1", "DS4_COPY_DIRECT": "0"}
+```
+
+For direct reads instead, use `DS4_COPY_DROP_CACHE=0`, `DS4_COPY_DIRECT=1`. They can also be combined so that
+buffered fallbacks receive release hints. A hint may affect another process reading the same expert file, so use
+it when startup cache pressure matters more than retaining that file's cache. Other tensor ranges are not explicitly
+advised; OS eviction remains advisory and is page/folio-granular. Windows ignores both controls. Direct reads are not
+necessarily faster than buffered reads with source-page release.
+
+The controls do not clear global caches, compact memory, change ZFS limits, lock CPU expert RAM, or guarantee zero
+swap. They also do not eliminate page cache created by other startup readers. Check the existing Engram residency
+and strict-expert RAM settings separately.
+
+CPU-only checks: `python tools/test_ds4_copy_cache.py`. On filesystems that refuse direct I/O the test still checks
+buffered fallback; its output says whether direct reads were exercised. `DS4_TEST_FILE_DIR=/path/on/nvme` selects a
+filesystem for the fixture. Cache residency is diagnostic because DONTNEED does not promise immediate eviction.
+
+## DeepSeek: Engram prompt read-ahead
+
+On one GPU with a nonzero `DS4_ENGRAM_CACHE_MB`, `DS4_ENGRAM_PREFETCH=1` reads a prompt's Engram rows into the ordinary
+row cache before the consuming layers ask for them. Sorted canonical rows are read in zones, duplicate destinations are
+filled from the canonical row, and a consumer waits for its own unit rather than racing the prefetcher. This changes I/O
+scheduling only: the row payload presented to the model is the same, and decode does not use the prefetcher.
+
+The automatic policy uses 75% of the row-cache budget for its live-set estimate. It reads the whole prompt when that fits.
+On chunk-major runs it otherwise picks the largest compute-chunk window whose current-plus-previous live set fits;
+layer-major retains completed layers in the shared cache, so its automatic policy is whole-prompt-or-ordinary instead of
+using that two-window estimate. Sparse YOCO unit lists also use the ordinary path because their chunk-index gaps cannot
+receive consumption credits. Scratch space, the hash index, reader buffers, and the model itself still need RAM beyond
+the row payload, so a large cache is not a promise that any particular full-context prompt fits. If even one look-ahead
+unit cannot fit the estimate, the ordinary read path is used instead.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `DS4_ENGRAM_PREFETCH` | `0` | `1`: enable one-GPU prompt read-ahead; `0`: the existing prompt/decode behavior |
+| `DS4_ENGRAM_PREFETCH_CHUNKS` | `-1` | `-1`: automatic cache-budgeted whole/bounded planning; `0`: explicit whole-prompt look-ahead, allowed up to actual row capacity; a positive value fixes look-ahead to that many compute chunks |
+| `MAYA_DS4_EG_RANDOM` | off (0) | Linux: `1` turns the kernel's readahead off on the Engram reader's files (its rows are small reads at hashed offsets, so a readahead window is mostly bytes no one asked for, which can push the CPU lane's experts out of the page cache on a PC short of RAM). Off by default: where the page cache has room it made prompts a few percent slower |
+| `DS4_EG_ZONE_KB` | `0` | maximum read-zone span in KiB (capped at 64 MiB); `0`: ordinary row reads. `4096` was validated on Windows with an NVMe Engram file; other storage may prefer another value |
+
+`DS4_EG_SORT_MODE=std` forces the portable sort, and `DS4_EG_DEDUP=0` disables post-sort deduplication; both exist as
+fallbacks and A/B controls. By default radix32 is used only after every row proves its 32-bit row-ID/byte-offset mapping;
+otherwise radix64 or `std::sort` is used. `DS4_EG_PROFILE=1` logs planning and read/cache timings. Cancellation wakes the
+prefetch condition variable, and an active batch finishes before its worker can exit. While prefetch is active, `STAT`
+reports `eg_prefetch_rows`, `eg_prefetch_hits`, `eg_prefetch_reads`, `eg_prefetch_io_ms`, and `eg_prefetch_wait_ms`;
+these are separate from the consumer's lookup/on-demand-read counters, so prefetched physical reads are not mislabeled
+as consumer cache hits.
 
 ## DeepSeek: conversations kept (an agent's parent and workers on one model)
 
@@ -720,6 +1016,37 @@ The engine's log says what happened (`ds4 slots: saved/took back/wrote ...`; the
 `[maya] sessions: ...`). A slot's identity is the engine's version, the model's geometry and files and whether the
 DSpark blocks are loaded, so a slot from another model, another pack or an engine that changed the state's layout is
 refused rather than read.
+
+## DeepSeek: tensor parallel groups of 3 with a GGUF pack (experimental)
+
+A GGUF pack's tensor parallel width must divide the attention heads (64) and the output groups (8), so `--tp 3`
+falls back to a narrower group (the log says `tensor parallel 3 -> ...`), although Maya-S's and Maya-XS's experts
+split in 3 (n_ff 2304: 768 rows a member, whole 256-value blocks) and not in 2.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `DS4_TP_UNEVEN_HEADS` | off | `1`: keep a width the heads do not split in evenly. The heads go over the most members they split among evenly (64 heads over 3: 2 members of 32), the remaining member computes only its FFN share, as a non-GGUF pack's group does; a BF16 / Q8_0 head whose vocabulary does not split evenly takes 128-column shares. The FFN must still split in whole blocks |
+
+## DeepSeek: pictures without VRAM between them
+
+DeepSeek's vision tower keeps its weights (about 1 GB) in RAM and holds no VRAM between pictures, so that memory
+goes to the model's experts. A picture borrows about 320 MB of the first GPU's memory while it is read, and the
+engine gives it back before the prompt is read. Where the memory comes from depends on the setup:
+
+- Usually it is the prompt buffers, which are idle between prompts. This costs nothing.
+- On one GPU with unsloth's GGUFs, the prompt path borrows expert slots of its own, and a picture borrows those same
+  slots. The experts in them are read back afterwards, as after a long prompt. A tensor-parallel group's borrowed
+  slots (`DS4_TP_BORROW`) are not lent to pictures: there the tower keeps its room if the prompt buffers are smaller.
+- Otherwise, a picture takes free memory while it is read.
+
+The pictures of one request share a single borrowing. The monitor's GPU map shows the vision tower only while a
+picture is being read. The picture itself is read exactly as before. When prompts run in windows
+(`--prefill-chunk 0`), there are no prompt buffers to lend, so the tower keeps its room for the whole run, as before
+v1.1.31.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `MAYA_DS4_VISION_RESIDENT` | off | `1`: the tower keeps its ~320 MB on the first GPU for the whole run (as before v1.1.31) |
 
 ## MiniMax-M3.1-Flash
 
@@ -782,7 +1109,7 @@ MiniMax M3.1 · Maya-S (about 2.1 bits, ~122 GB), from
 (`Maya-XS/MiniMax-M3.1-Flash-Maya-XS-IQ1_S-0000N-of-00002.gguf`, `Maya-S/MiniMax-M3.1-Flash-Maya-S-IQ2_XXS-...`); each
 gets a config of its own, `maya-minimax-maya-xs.json` / `maya-minimax-maya-s.json`. They run on NVIDIA
 from V100 on and on AMD, Linux and Windows. The files follow llama.cpp's MiniMax-M3 layout; the sparse-attention
-indexers of the first three layers sit in a small file of their own beside them (`...-maya-indexers.gguf`), which
+indexers of the first three layers sit in a small file of their own beside them (`...-maya-indexers.bin`, a GGUF; `.gguf` up to v1.1.30, renamed by the setup), which
 Maya loads so the model runs as MiniMax defines it - keep it with the other files. Pictures and the DSpark drafter
 come from the EXL3 repo's own files (its vision tower and its draft, about 4 GB, downloaded into
 `MiniMax-M3.1-Flash-companions` beside the model, or taken from an EXL3 download already there), on NVIDIA and on
@@ -815,3 +1142,13 @@ Setup and debugging variables:
 | `MM3_STRESS`, `MM3_STRESS_T` | off | debugging: a drafting stress run |
 | `MM3_DUMP_KEPT`, `MM3_DUMP_HS` | off | debugging: write the sparse attention's kept blocks / hidden states to files |
 | `MM3_TOPK` | the model's | debugging only: routes each token to this many experts - the answers are no longer the model's |
+
+## DeepSeek: routed prompt experts on AMD
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_EXPERT_MMQ` | unset (off) | `1`: use the existing GLM q8_1/int8 MMQ path for supported DeepSeek IQ expert prompt sets of at least 32 rows; other sets keep the existing path. HIP only. |
+
+The switch quantizes both the prompt activations and the FP16 SwiGLU intermediate to q8_1.
+This approximate prompt path can change answers; it is off by default. It uses a separate workspace for each
+host thread, device and stream, and keeps the existing path during graph capture.

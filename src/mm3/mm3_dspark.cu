@@ -92,6 +92,12 @@ struct Draft::Impl {
     };
     std::vector<L> L;
     uint16_t *fc = nullptr, *w1 = nullptr, *w2 = nullptr;
+    // fc's GEMMs in FP16 instead of BF16 where the GPU has no BF16 tensor cores (CUDA before sm_80: cuBLAS took a
+    // generic kernel there, ~1.2 ms a tap on a V100) - fc converted once at the load when every value fits FP16
+    bool fc16 = false;
+    float* apart = nullptr;   // window_attn's split partials (the block's queries)
+    float* mkpart = nullptr;  // markov_greedy's blocks' argmax
+    static constexpr int kSplits = 16;
     float *hid1 = nullptr, *fin1 = nullptr, *cw = nullptr, *cb = nullptr, *inv = nullptr;
     // scratch
     float *ctx = nullptr, *xn = nullptr, *h = nullptr, *q = nullptr, *kk = nullptr, *vv = nullptr, *att = nullptr;
@@ -204,12 +210,13 @@ struct Draft::Impl {
         return true;
     }
 
-    // C [rows][N] F32 = X [rows][K] BF16 . W [N][K]^T BF16 (+ beta C)
+    // C [rows][N] F32 = X [rows][K] BF16 . W [N][K]^T BF16 (+ beta C) - both FP16 instead with f16
     bool gemm(const uint16_t* W, int N, int K, int ldw, const uint16_t* X, int rows, int ldx, float* C, int ldc,
-              float beta, std::string& err) {
+              float beta, std::string& err, bool f16 = false) {
         const float one = 1.0f;
-        DB(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, N, rows, K, &one, W, CUDA_R_16BF, ldw, X, CUDA_R_16BF, ldx,
-                        &beta, C, CUDA_R_32F, ldc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        const auto ty = f16 ? CUDA_R_16F : CUDA_R_16BF;   // (auto: the BLAS's own type name on HIP)
+        DB(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, N, rows, K, &one, W, ty, ldw, X, ty, ldx, &beta, C, CUDA_R_32F,
+                        ldc, CUBLAS_COMPUTE_32F, f16 ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT));
         return true;
     }
 
@@ -260,6 +267,29 @@ struct Draft::Impl {
             !vec(pk, DP + "confidence_head.proj.weight", 0.0f, cw, (size_t) D + R, err) ||
             !vec(pk, DP + "confidence_head.proj.bias", 0.0f, cb, 1, err))
             return false;
+#if !defined(STRATA_USE_HIP)
+        {   // (fc in FP16 where BF16 has no tensor cores; MAYA_MM3_DSPARK_FC16=0 keeps BF16 everywhere)
+            cudaDeviceProp pr{};
+            const char* fv = std::getenv("MAYA_MM3_DSPARK_FC16");
+            if ((fv == nullptr || std::atoi(fv) != 0) && cudaGetDeviceProperties(&pr, dev) == cudaSuccess &&
+                pr.major < 8) {
+                const size_t n = (size_t) D * NT * D;
+                uint16_t* h = nullptr;
+                if (cudaMalloc(&h, n * 2) == cudaSuccess) {
+                    if (k::bf16_to_f16(fc, n, h, s)) {
+                        for (void*& x : owned)
+                            if (x == fc) x = h;
+                        cudaFree(fc);
+                        fc = h;
+                        fc16 = true;
+                    } else {
+                        cudaFree(h);
+                    }
+                }
+                cudaGetLastError();
+            }
+        }
+#endif
         L.resize((size_t) g.n_layers);
         for (int i = 0; i < g.n_layers; ++i) {
             const std::string P = DP + "layers." + std::to_string(i) + ".decoder_layer.";
@@ -279,6 +309,8 @@ struct Draft::Impl {
         k::rope_inv_freq(g.theta, g.n_rot, inv_h.data());
         const int Rw = max_rows, B = g.block;
         if (!alloc(mxpart, (size_t) 16 * 16 * std::max(D, std::max(Q, F)), err)) return false;
+        if (!alloc(apart, k::attn_part_floats(B, g.n_kv, kSplits), err) || !alloc(mkpart, k::markov_part_floats(), err))
+            return false;
         if (!alloc(inv, inv_h.size(), err) || !alloc(ctx, (size_t) Rw * D, err) || !alloc(xn, (size_t) Rw * D, err) ||
             !alloc(h, (size_t) B * D, err) || !alloc(q, (size_t) B * Q, err) || !alloc(kk, (size_t) Rw * KV, err) ||
             !alloc(vv, (size_t) Rw * KV, err) || !alloc(att, (size_t) B * Q, err) || !alloc(ao, (size_t) B * D, err) ||
@@ -325,8 +357,9 @@ struct Draft::Impl {
     bool context_tap(int j, const float* rows, int n, std::string& err) {
         const int D = g.dim, NT = (int) g.taps.size();
         cudaSetDevice(dev);
-        k::to_bf16(rows, n, D, D, x16, D, s);
-        return gemm(fc + (size_t) j * D, D, D, NT * D, x16, n, D, ctx, D, j == 0 ? 0.0f : 1.0f, err);
+        if (fc16) k::to_f16(rows, n, D, D, x16, D, s);
+        else k::to_bf16(rows, n, D, D, x16, D, s);
+        return gemm(fc + (size_t) j * D, D, D, NT * D, x16, n, D, ctx, D, j == 0 ? 0.0f : 1.0f, err, fc16);
     }
 
     bool context_finish(int n, int pos0, std::string& err) {
@@ -367,7 +400,7 @@ struct Draft::Impl {
             mxg(l.v, xn, B, D, vv, KV, 0.0f);
             k::qk_norm_rope(q, kk, vv, l.qn1, l.kn1, pos, B, g.n_head, g.n_kv, g.hd, g.n_rot, inv, g.eps, l.kc, l.vc,
                             s, ring);
-            k::window_attn(q, l.kc, l.vc, ring, lo, P + B - 1, B, g.n_head, g.n_kv, scale, att, s);
+            k::window_attn(q, l.kc, l.vc, ring, lo, P + B - 1, B, g.n_head, g.n_kv, scale, att, s, apart, kSplits);
             mxg(l.o, att, B, Q, h, D, 1.0f);   // h += attn Wo
             k::rms(h, l.post1, B, D, g.eps, xn, nullptr, s);
             mxg(l.g, xn, B, D, gt, F, 0.0f);
@@ -395,6 +428,11 @@ struct Draft::Impl {
         prof.mark(s, 1);
         k::set_int(prev, anchor, s);
         for (int i = 0; i < n; ++i) {
+            // (greedy: the bias, the argmax and the confidence in two kernels - else the gathered row, the BLAS GEMV
+            //  and markov_pick / markov_sample)
+            if (!sa && k::markov_greedy(logit + (size_t) i * V, w2, w1, V, R, prev, out + i, cw, cb, hid + (size_t) i * D,
+                                        D, conf + i, mkpart, nullptr, s))
+                continue;
             k::gather_row(w1, R, prev, embb, embf, s);
             const float one = 1.0f, zero = 0.0f;
             DB(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, V, 1, R, &one, w2, CUDA_R_16BF, R, embb, CUDA_R_16BF, R,
