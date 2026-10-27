@@ -4524,6 +4524,7 @@ bool sparse_attn_split_try(const float* q, const uint16_t* win, const void* ckv,
     // chunk's tensor-core request (kAttnWmma), and the chunked-prefill caller (a.gen) stays on the stock dispatch.
     // DS4_RW_ATTN_TC=1 (with DS4_ATTN_SPLIT=1): phase 1 on the tensor cores (attn_part_mma, the prompt kernel's BF16
     // high + low numerics: bounded, not bitwise), the same scratch and merge; it also takes the drafter's BF16 rows.
+    // DS4_ATTN_MMA=0 turns it off too.
     static const bool tc_env = std::getenv("DS4_RW_ATTN_TC") != nullptr && std::atoi(std::getenv("DS4_RW_ATTN_TC")) != 0;
 #if defined(STRATA_USE_HIP)
     const bool tc = false;
@@ -4539,14 +4540,12 @@ bool sparse_attn_split_try(const float* q, const uint16_t* win, const void* ckv,
             const attnsplit::AttnSplitScratch sc = split_scratch(s, heads);
             if (sc.part != nullptr) {
                 const bool bf = ckv_fmt == kKvBf16;
-                // 32-row chunks, except T=1 at <= 160 rows: the only measured case where 16 won (17.0 vs 19.3 us;
-                // at 384 rows 32 won at every T, rw-11c-t1.log)
-                if (T == 1 && total_max <= 160)
-                    sparse_attn_split_tc<1>(q, win, (const uint8_t*) ckv, bf, sel, sel_stride, a, sink, heads, T, scale, out, sc,
-                                            total_max, s, rope);
-                else
-                    sparse_attn_split_tc<2>(q, win, (const uint8_t*) ckv, bf, sel, sel_stride, a, sink, heads, T, scale, out, sc,
-                                            total_max, s, rope);
+                // always 32-row chunks: a query's chunking (so its bits) must not depend on T or on the call's other
+                // queries - a token verified in a DSpark window must equal the same token decoded alone (gate2).  16-row
+                // chunks won only at T=1 <= 160 rows (17.0 vs 19.3 us, rw-11c-t1.log).  (A call over 768 rows leaves the tc
+                // path, as one over 960 leaves the FP32 split: unreachable, a query has at most 128 + 512 rows)
+                sparse_attn_split_tc<2>(q, win, (const uint8_t*) ckv, bf, sel, sel_stride, a, sink, heads, T, scale, out, sc,
+                                        total_max, s, rope);
                 if (rope == nullptr)
                     attn_split_check(q, win, ckv, sel, sel_stride, a, sink, heads, d, T, scale, out, s, ckv_fmt,
                                      heads_per_block, scr, total_max);

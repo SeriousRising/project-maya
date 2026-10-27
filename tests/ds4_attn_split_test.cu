@@ -13,6 +13,8 @@
 //     rows against the stock BF16 kernel - then the time a call (RoPE fold on) at T = 1, 2, 5, 6, 16, context 4K / 32K,
 //     a ratio-4 layer (128 + 512 picked) and a ratio-128 layer (128 + every compressed row).  The dispatch itself:
 //     DS4_ATTN_SPLIT=1 DS4_RW_ATTN_TC=1 with no flag (1e-4 vs double) and with --rope (the fold, bitwise))
+//   DS4_ATTN_SPLIT=1 [DS4_RW_ATTN_TC=1] ./ds4_attn_split_test --tinv   (gate2's invariant: a query's output through the
+//     dispatch, plain and with the RoPE fold, is the same bits alone (T=1) and inside every T=2..16 call that holds it)
 //   ./ds4_attn_split_test --hc   (DS4_RW_HC_PRE / DS4_RW_HC_FUSE: hc_pre_norm_n_kernel against hc_pre_norm_kernel and
 //     hc_post_pre_norm_kernel against hc_post_kernel + hc_pre_norm_kernel, bit for bit at dim 5120, hc 4, T = 1..16; timed)
 // Build: cmake --build build --target ds4_attn_split_test (target next to ds4_gguf_test in CMakeLists.txt)
@@ -70,7 +72,7 @@ int main(int argc, char** argv) {
     const float scale = 1.0f / std::sqrt((float) d);
     const char* dump = nullptr;
     const char* cmp = nullptr;
-    bool time_only = false, rope_mode = false, hc_mode = false, tc_mode = false;
+    bool time_only = false, rope_mode = false, hc_mode = false, tc_mode = false, tinv_mode = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--dump") == 0 && i + 1 < argc) dump = argv[++i];
         else if (std::strcmp(argv[i], "--cmp") == 0 && i + 1 < argc) cmp = argv[++i];
@@ -78,6 +80,7 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--rope") == 0) rope_mode = true;
         else if (std::strcmp(argv[i], "--hc") == 0) hc_mode = true;
         else if (std::strcmp(argv[i], "--tc") == 0) tc_mode = true;
+        else if (std::strcmp(argv[i], "--tinv") == 0) tinv_mode = true;
     }
     const int n_ckv = tc_mode ? 8192 : 4096;   // (--tc: a 32K context's ratio-4 rows)
     cudaDeviceProp p{};
@@ -397,7 +400,7 @@ int main(int argc, char** argv) {
         CK(cudaEventCreate(&e0));
         CK(cudaEventCreate(&e1));
         attnsplit::SplitRope rp{d_fr, 8189};
-        std::printf("time a call, us (RoPE fold on; engine picks 16-row chunks at T=1 up to 160 rows, else 32):\n");
+        std::printf("time a call, us (RoPE fold on; the engine always takes 32-row chunks, see --tinv):\n");
         std::printf("%-7s %-26s %3s %9s %9s %9s\n", "ctx", "layer", "T", "split", "tc16", "tc32");
         for (const int ctx : {4096, 32768})
             for (const int ratio : {4, 128}) {
@@ -439,6 +442,71 @@ int main(int argc, char** argv) {
                 }
             }
         return tok ? 0 : 1;
+    }
+    if (tinv_mode) {
+        // 16 queries of 1..640 rows (both sides of 160 and of a chunk), each a fixed window / selection / q / position;
+        // query s0 + t of the call (s0, T) must equal query s0 + t run alone
+        const int NQ = 16;
+        const int nw[NQ] = {1, 37, 128, 128, 128, 128, 128, 128, 128, 128, 128, 64, 3, 128, 17, 90};
+        const int ns[NQ] = {0, 41, 5, 32, 33, 160, 255, 512, 0, 1, 2, 300, 0, 40, 129, 7};
+        const size_t qn = (size_t) heads * d;
+        std::vector<uint16_t> h_win((size_t) n_winrows * d);
+        for (auto& v : h_win) v = h_f2bf(nd(rng) * wmag);
+        std::vector<float> h_q(NQ * qn), h_sink(heads), h_fr(32);
+        for (auto& v : h_q) v = nd(rng) * qmag;
+        for (auto& v : h_sink) v = nd(rng) * 2.0f;
+        for (int i = 0; i < 32; ++i) h_fr[i] = (float) std::pow(10000.0, -2.0 * i / 64.0);
+        std::vector<int> h_sel((size_t) NQ * kcap);
+        for (auto& v : h_sel) v = rowpick(rng);
+        uint16_t* d_win;
+        float *d_q0, *d_q, *d_sink, *d_out, *d_fr;
+        int* d_sel;
+        CK(cudaMalloc(&d_win, h_win.size() * 2));
+        CK(cudaMalloc(&d_q0, h_q.size() * 4));
+        CK(cudaMalloc(&d_q, h_q.size() * 4));
+        CK(cudaMalloc(&d_sink, heads * 4));
+        CK(cudaMalloc(&d_fr, 32 * 4));
+        CK(cudaMalloc(&d_sel, h_sel.size() * 4));
+        CK(cudaMalloc(&d_out, h_q.size() * 4));
+        CK(cudaMemcpy(d_win, h_win.data(), h_win.size() * 2, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_q0, h_q.data(), h_q.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_sink, h_sink.data(), heads * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_fr, h_fr.data(), 32 * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_sel, h_sel.data(), h_sel.size() * 4, cudaMemcpyHostToDevice));
+        bool iok = true;
+        for (int rp = 0; rp < 2; ++rp) {
+            std::vector<uint32_t> solo(NQ * qn), o(NQ * qn);
+            std::printf("tinv %-5s differing values (of a call's), T=2..16:", rp ? "rope" : "plain");
+            for (int T = 1; T <= NQ; ++T) {
+                size_t ndiff = 0;
+                for (int s0 = 0; s0 + T <= NQ; ++s0) {
+                    AttnRows ar{};
+                    for (int t = 0; t < T; ++t) {
+                        ar.win0[t] = (s0 + t) * 13 % 256;
+                        ar.nwin[t] = nw[s0 + t];
+                        ar.nsel[t] = ns[s0 + t];
+                    }
+                    AttnRope rope;   // query t at pos + t, as in a window
+                    rope.freqs = d_fr;
+                    rope.pos = 8189 + s0;
+                    rope.rd = 64;
+                    CK(cudaMemcpy(d_q, d_q0, h_q.size() * 4, cudaMemcpyDeviceToDevice));   // (a fallback may rotate q in place)
+                    CK(cudaMemset(d_out, 0xff, T * qn * 4));
+                    sparse_attn(d_q + s0 * qn, d_win, d_ckv, d_sel + (size_t) s0 * kcap, kcap, ar, d_sink, heads, d, T, scale,
+                                d_out, 0, kKvFp4, 0, nullptr, rp ? &rope : nullptr);
+                    CK(cudaGetLastError());
+                    CK(cudaMemcpy(o.data(), d_out, T * qn * 4, cudaMemcpyDeviceToHost));
+                    if (T == 1) std::memcpy(solo.data() + s0 * qn, o.data(), qn * 4);
+                    else
+                        for (size_t i = 0; i < T * qn; ++i) ndiff += o[i] != solo[s0 * qn + i];
+                }
+                if (T > 1) std::printf(" %zu", ndiff);
+                iok = iok && ndiff == 0;
+            }
+            std::printf("\n");
+        }
+        std::printf("%s\n", iok ? "TINV ALL BITWISE" : "TINV FAILED");
+        return iok ? 0 : 1;
     }
     if (rope_mode) {
         std::vector<Cfg> rc = {
