@@ -2575,7 +2575,7 @@ int main(int argc, char** argv) {
         // layer split (serve_pipe) - only where this load may (pipe_ready) and the model reads no pictures
         const char* pv = std::getenv("STRATA_DS4_PIPE");
         if (pv == nullptr) pv = std::getenv("DS4_PIPE");
-        if (pv != nullptr && std::atoi(pv) != 0) {
+        if (pv != nullptr && std::atoi(pv) != 0 && o.seqs <= 1) {   // (--parallel: serve() runs them; the load said so)
             std::string why;
             if (m.image_token() >= 0)
                 std::fprintf(stderr, "maya ds4 serve: MAYA_DS4_PIPE with a vision tower - one request at a "
