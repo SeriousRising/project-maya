@@ -4295,8 +4295,11 @@ struct Model::Impl {
             int r0 = 0, nr = 0;   // (a call's rows: c_yd holds kSlots)
             auto flush = [&] {
                 if (ents.empty()) return;
-                cpu_experts(l, c.cpu_x.data(), ents, (size_t) D);
-                std::memcpy(c.cpu_y + (size_t) r0 * D, c_yd.data(), (size_t) nr * D * 4);
+                {   // (c_yd: the CPU lane scratch, which the other flow device task overwrites once unlocked)
+                    std::lock_guard<std::mutex> lk(cpu_mu);
+                    cpu_experts_unlocked(l, c.cpu_x.data(), ents, (size_t) D, nullptr);
+                    std::memcpy(c.cpu_y + (size_t) r0 * D, c_yd.data(), (size_t) nr * D * 4);
+                }
                 ents.clear();
                 r0 += nr;
                 nr = 0;
