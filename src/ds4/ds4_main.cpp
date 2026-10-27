@@ -1172,6 +1172,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 finish = "cancel";
                 break;
             }
+            if (tok < 0) {   // (the first sample's CUDA error: rounds check theirs)
+                std::fprintf(stderr, "ds4: the sample failed\n");
+                finish = "cancel";
+                break;
+            }
             std::printf("T %d\n", tok);
             ++produced;
             if (in_think && tok == r.think_end) in_think = false;   // (closed: by the model, or by the budget)
@@ -1487,6 +1492,10 @@ int serve_pipe(strata::ds4::Model& m, const std::string& eos_list, bool spec, fl
                         std::isfinite(r.pen_freq) ? r.pen_freq : 0.0f,
                         std::isfinite(r.pen_present) ? r.pen_present : 0.0f);
         g.tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, counter++);
+        if (g.tok < 0) {   // (not in gens yet: its ERR here, as a failed feed's)
+            std::printf("ERR %lld the sample failed\n", r.rid);
+            fatal("the sample failed");
+        }
         g.s_dec = m.stats();
         g.in_think = r.think_budget > 0 && r.think_end >= 0;
         g.pos = m.pos();
@@ -2060,6 +2069,10 @@ int main(int argc, char** argv) {
     bool cool = false;
     if (n > 0) {
         int tok = m.sample(temp, 1.0f, temp > 0 ? 64 : 1, 0.0f, cli_seed, counter++);
+        if (tok < 0) {
+            std::fprintf(stderr, "maya-ds4: the sample failed\n");
+            return 1;
+        }
         std::vector<int> got;
         for (;;) {
             out.push_back(tok);
