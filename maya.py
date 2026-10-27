@@ -1685,6 +1685,9 @@ def refresh_engine(cfg: dict) -> None:
     src = S.source_hash(S.ENGINE_SOURCES)
     if meta.get("src") == src:
         return
+    if os.environ.get("MAYA_NO_REBUILD", "0") not in ("", "0"):   # (a tree being served or A/B'd: never rebuilt here)
+        warn(f"the engine's source changed since it was compiled, but MAYA_NO_REBUILD is set: starting {exe} as built")
+        return
     if cfg.get("backend") == "hip":
         root = Path(meta.get("rocm") or "/opt/rocm")
         llama = Path(meta.get("llama") or ROOT / "third_party/llama.cpp")
