@@ -270,16 +270,20 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
     if (drafter) {
         std::vector<int> drafts;
         std::vector<float> conf;
-        if (!m.draft(tok, drafts, conf, err, temperature, top_p, top_k, min_p, seed, counter)) return false;
-        int keep = 0;
         if (cum_min < 0) cum_min = dspark_cum_default();
+        // (the lookup's proposal first: with one, the drafter makes its first row even past the cut - the lazy head
+        //  would skip it at a cut first draft, leaving none to weigh the lookup against; past it, the lazy cut)
+        const int k = lk != nullptr ? lk->sfx.propose(std::min(room, m.verify_max()) - 1, lk->buf.data()) : 0;
+        if (!m.draft(tok, drafts, conf, err, temperature, top_p, top_k, min_p, seed, counter, room - 1, conf_min, cum_min,
+                     k > 0 ? 1 : 0))
+            return false;
+        int keep = 0;
         float cum = 1.0f;
         while (keep < (int) drafts.size() && keep < room - 1 && conf[(size_t) keep] >= conf_min &&
                (cum *= conf[(size_t) keep]) >= cum_min)
             ++keep;
         bool from_lk = false;
         if (lk != nullptr && !drafts.empty() && !m.drafts_sampled()) {
-            const int k = lk->sfx.propose(std::min(room, m.verify_max()) - 1, lk->buf.data());
             match = lk->sfx.last_match();
             if (k > 0 && lk->buf[0] == drafts[0]) {
                 const strata::spec::DraftPolicy::Pick pk = lk->policy.choose(keep + 1, k, match);

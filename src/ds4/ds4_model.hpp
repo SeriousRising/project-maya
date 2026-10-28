@@ -151,8 +151,13 @@ public:
     /// DeepSeek's reference does.  verify() keeps a draft d with probability min(1, p(d) / q(d)) over the request's
     /// chain - the speculative-sampling rule, so every token is still distributed as the model's own draw.
     int draft_block() const;
+    /// max_n / conf_min / cum_min: the caller's cut (at most max_n drafts - 0: any -, kept while each confidence is
+    /// at least conf_min and their running product at least cum_min); the drafts past the first one it cuts may be
+    /// left out (fewer returned), those before it are the same.  min_n: at least that many returned past a cut
+    /// (within max_n)
     bool draft(int y, std::vector<int>& drafts, std::vector<float>& conf, std::string& err, float temperature = 0.0f,
-               float top_p = 1.0f, int top_k = 0, float min_p = 0.0f, uint64_t seed = 0, uint64_t counter = 0);
+               float top_p = 1.0f, int top_k = 0, float min_p = 0.0f, uint64_t seed = 0, uint64_t counter = 0,
+               int max_n = 0, float conf_min = 0.0f, float cum_min = 0.0f, int min_n = 0);
     bool verify(int y, const std::vector<int>& drafts, float temperature, float top_p, int top_k, float min_p,
                 uint64_t seed, uint64_t counter, int& accepted, int& next, std::string& err);
     /// A verify window's tokens at most (y and the drafts after it); verify() takes drafts from any source - those not
