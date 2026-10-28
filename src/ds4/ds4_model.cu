@@ -3465,6 +3465,13 @@ struct Model::Impl {
             d.attn_scr.max_t = kAttnScratchT;
             d.attn_scr.cap = (int) topk_stride();
             if (!dalloc(d, d.attn_scr.rows, (size_t) kAttnScratchT * topk_stride() * g.hd, err)) return false;
+            // DS4_ATTN_SPLIT's scratch at load time (no decode-time malloc, capture-safe); a no-op
+            // unless the split path is on.  One allocation a distinct per-member head count on this device.
+            for (const Layer& l0 : L)
+                for (int m = 0; m < l0.nm; ++m) {
+                    const Layer& ll = member(l0, m);
+                    if (ll.dev == (int) di && ll.ahn > 0) attn_split_prewarm(d.st, ll.ahn);
+                }
             d.tks.T = (int) kTksRows, d.tks.P = (int) tks_p(), d.tks.K = g.ix_topk;
             if ((decode_trim & 1) && !(dalloc(d, d.shq8, (size_t) kWin * g.ff, err) &&
                                        dalloc(d, d.shd8, (size_t) kWin * g.ff / 32, err)))

@@ -725,6 +725,27 @@ split's groups hand theirs, instead of copies through pinned memory and events. 
 | --- | --- | --- |
 | `MAYA_DS4_DECODE_TRIM` | 0 | bits: `1` s2's int8 input from the swiglu, `2` wq_b's from q's norm, `4` the snapshot and latent copies one kernel each, `8` the drafter's hand-offs by host-mapped rows (the same bits, checked at load) |
 
+## DeepSeek: split-KV decode attention for verify windows (opt-in)
+
+The stock decode attention runs one 256-thread block a (head, query), so a DSpark or prompt-lookup verify window's
+queries each walk their rows mostly serially. With `DS4_ATTN_SPLIT=1` a gen-0 decode / verify call of 1-16 rows
+(FP4 KV, d 512, `heads % 4 == 0`, at most 960 rows) splits its keys over row chunks - a block takes 4 heads x a
+40-row chunk x one query, the rows decoded once to BF16 in shared memory for the 4 heads, and the chunks merged
+with the sink (adapted from Niko1221/Strata (MIT) v0.2.6; scratch 48 MiB a device at 16 rows, taken at load).
+`DS4_ATTN_SPLIT_TC=1` runs phase 1 on the tensor cores instead (q and the probabilities split into BF16 high and
+low parts, F32 accumulation; NVIDIA sm_80+, `heads % 16 == 0`,
+fixed 32-row chunks, so a query's chunking never depends on its window). Both change the softmax summation order,
+so the answers are bounded, not bit for bit the stock kernel's (on real activations the difference sits below the
+FP8 rounding of the attention output that follows; `tests/ds4_attn_split_test.cu` plain / `--tc` / `--tinv`).
+2x CMP 170HX (sm_80), DeepSeek-V4.1-Flash GSQ-RCO with DSpark, one CLI run each: a verify window -4.0 % with the
+split, -8.1 % with the tensor-core phase 1.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `DS4_ATTN_SPLIT` | off | `1`: split-KV decode attention for gen-0 windows of 1-16 rows (bounded, not the same bits) |
+| `DS4_ATTN_SPLIT_TC` | off | `1`: phase 1 on the tensor cores (NVIDIA sm_80+; needs `DS4_ATTN_SPLIT=1`) |
+| `DS4_ATTN_SPLIT_CHECK` | off | `N`: re-run the stock kernel on the same inputs for N calls and report the difference (debug) |
+
 ## DeepSeek: the attention's dense matrices re-quantized at load (opt-in, changes the answers)
 
 A GGUF pack keeps its dense weights in Q8_0. Every decoded token reads all of them, and they take VRAM the experts

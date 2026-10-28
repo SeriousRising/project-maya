@@ -528,6 +528,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     if(STRATA_ENABLE_HIP)
       target_link_libraries(ds4_gguf_test PRIVATE strata_mmq)
     endif()
+    # the split-KV decode attention (DS4_ATTN_SPLIT) against a double-precision reference at decode shapes
+    # (the test includes ds4_kernels.cu itself, so it is not listed again; needs a GPU, no model)
+    add_executable(ds4_attn_split_test tests/ds4_attn_split_test.cu src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu
+                                       src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_host_ar.cpp)
+    target_include_directories(ds4_attn_split_test PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
+    target_link_libraries(ds4_attn_split_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
   endif()
 
   # MiniMax-M3.1-Flash (EXL3, tools/mm3/pack.py): its own engine (src/mm3), with its own copy of the EXL3 device kernels

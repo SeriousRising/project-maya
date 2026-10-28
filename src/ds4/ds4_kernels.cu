@@ -5,6 +5,7 @@
 #include "ds4_numerics.cuh"
 #include "ds4_q6k.cuh"
 #include "ds4_pool.hpp"
+#include "ds4_attn_split.cuh"
 
 #include <cuda_fp16.h>
 #if !defined(STRATA_USE_HIP)
@@ -24,6 +25,10 @@
 #include <memory>
 #include <thread>
 #include <mutex>
+#include <map>
+#include <tuple>
+#include <cmath>
+#include <utility>
 #include <deque>
 #include <condition_variable>
 #if !defined(_WIN32)   // (the host all-reduce's rows on a NUMA node)
@@ -2247,6 +2252,205 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_mma_kernel(const float* 
     (void) q, (void) win, (void) ckv, (void) sel, (void) sel_stride, (void) ar, (void) sink, (void) heads, (void) scale, (void) out;
 #endif
 }
+
+// DS4_ATTN_SPLIT_TC: the split-KV decode attention's phase 1 (attnsplit::attn_part) on the tensor cores, with
+// sparse_attn_mma_kernel's arithmetic (16 heads a block; q and the probabilities each a BF16 high + low part, the rows
+// exact, F32 accumulation).  Block (16-head group, chunk, query) takes rows chunk * RC .. + RC (RC = 16 NT): every
+// tile staged up front; warp w the dots of tile w / WT over dimensions (w % WT) * 64 NT .. + 64 NT (summed in shared
+// memory in warp order), one softmax a chunk, then output dimensions w * 64 .. + 64 over all RC rows.  It writes the
+// un-normalised sums and (max, sum) into attn_part's part / ml layout for attnsplit::attn_merge, unchanged.
+// sel_bf16: the selected rows are BF16 (the drafter's block rows), else kKvFp4.
+template <int NT>
+__global__ void __launch_bounds__(kThreads, 2) attn_part_mma(const float* __restrict__ q, const uint16_t* __restrict__ win,
+                                                             const uint8_t* __restrict__ ckv, int sel_bf16,
+                                                             const int* __restrict__ sel, int sel_stride, AttnRows ar,
+                                                             int heads, float scale, float* __restrict__ part,
+                                                             float* __restrict__ ml, int nsplit) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr int d = 512, RC = 16 * NT, dp = d + 8, WT = 8 / NT, KK = 4 * NT;
+    const int hb = blockIdx.x * 16, chunk = blockIdx.y, t = blockIdx.z;
+    const int n_win = ar.nwin[t], total = n_win + ar.nsel[t], j0 = chunk * RC;
+    if (j0 >= total) return;
+    const int n = min(RC, total - j0);
+    __shared__ __align__(16) uint16_t tile[RC * dp];
+    __shared__ float sp[WT][16 * RC];
+    __shared__ __align__(16) float pr[16 * RC];
+    __shared__ float mloc[16], lloc[16];
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, g = lane >> 2, c2 = (lane & 3) * 2;
+    const int kt = wp / WT, kw = wp % WT;   // the dots: tile kt, dimensions kw * 64 NT ..
+    // ---- issue every load first: the rows (thread: row sr + 16 i, values prt * 32 .. + 32), then q
+    const int sr = threadIdx.x >> 4, prt = threadIdx.x & 15;
+    const size_t crow = sel_bf16 ? (size_t) d * 2 : kv_row_bytes(kKvFp4, d);
+    uint4 rw[NT][4];
+    uint32_t rs[NT];
+    int kind[NT];   // 0: past the chunk (zeros), 1: BF16, 2: packed
+#pragma unroll
+    for (int i = 0; i < NT; ++i) {
+        const int r = sr + 16 * i, j = j0 + r;
+        kind[i] = 0;
+        if (r < n) {
+            const uint8_t* p = j < n_win ? (const uint8_t*) (win + (size_t) (ar.win0[t] + j) * d)
+                                         : ckv + (size_t) sel[(size_t) t * sel_stride + (j - n_win)] * crow;
+            if (j < n_win || sel_bf16) {
+                const uint4* src = (const uint4*) (p + prt * 64);
+                rw[i][0] = src[0], rw[i][1] = src[1], rw[i][2] = src[2], rw[i][3] = src[3];
+                kind[i] = 1;
+            } else {
+                rw[i][0] = *(const uint4*) (p + prt * 16);
+                rs[i] = *(const uint16_t*) (p + 256 + prt * 2);
+                kind[i] = 2;
+            }
+        }
+    }
+    float2 qx[KK][4];
+    {
+        const float* q0 = q + ((size_t) t * heads + hb + g) * d + kw * 64 * NT + c2;
+        const float* q1 = q0 + (size_t) 8 * d;
+#pragma unroll
+        for (int kk = 0; kk < KK; ++kk) {
+            qx[kk][0] = *(const float2*) (q0 + kk * 16);
+            qx[kk][1] = *(const float2*) (q1 + kk * 16);
+            qx[kk][2] = *(const float2*) (q0 + kk * 16 + 8);
+            qx[kk][3] = *(const float2*) (q1 + kk * 16 + 8);
+        }
+    }
+    // ---- the rows to shared memory as BF16 (unpack32's decode for the packed ones)
+#pragma unroll
+    for (int i = 0; i < NT; ++i) {
+        uint4* dst = (uint4*) (tile + (sr + 16 * i) * dp + prt * 32);
+        if (kind[i] == 0) {
+            dst[0] = dst[1] = dst[2] = dst[3] = make_uint4(0u, 0u, 0u, 0u);
+        } else if (kind[i] == 1) {
+            dst[0] = rw[i][0], dst[1] = rw[i][1], dst[2] = rw[i][2], dst[3] = rw[i][3];
+        } else {
+            const float k0 = e4m3_value((uint8_t) rs[i]) * 16384.0f, k1 = e4m3_value((uint8_t) (rs[i] >> 8)) * 16384.0f;
+            const uint32_t wv[4] = {rw[i][0].x, rw[i][0].y, rw[i][0].z, rw[i][0].w};
+            uint32_t o[16];
+#pragma unroll
+            for (int k = 0; k < 16; ++k) {
+                const uint32_t b = wv[k >> 2] >> (8 * (k & 3));
+                const float ks = k < 8 ? k0 : k1;
+                const float lo = e2m1_val14(b) * ks, hi = e2m1_val14(b >> 4) * ks;
+                o[k] = (__float_as_uint(lo) >> 16) | (__float_as_uint(hi) & 0xffff0000u);
+            }
+            dst[0] = make_uint4(o[0], o[1], o[2], o[3]);
+            dst[1] = make_uint4(o[4], o[5], o[6], o[7]);
+            dst[2] = make_uint4(o[8], o[9], o[10], o[11]);
+            dst[3] = make_uint4(o[12], o[13], o[14], o[15]);
+        }
+    }
+    // ---- q as A fragments: heads hb + g, + 8; dimensions kw * 64 NT + kk * 16 + c2, + 1 (+ 8, + 9)
+    uint32_t qa[KK][4], qb[KK][4];
+#pragma unroll
+    for (int kk = 0; kk < KK; ++kk) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) split_bf16x2(qx[kk][e], qa[kk][e], qb[kk][e]);
+    }
+    __syncthreads();
+    {   // ---- the dots (high and low parts in separate accumulators: two independent chains)
+        const uint16_t* kb = tile + (kt * 16 + (lane & 7) + ((lane >> 4) << 3)) * dp + kw * 64 * NT + ((lane >> 3) & 1) * 8;
+        float sh[2][4] = {}, sl[2][4] = {};
+#pragma unroll
+        for (int kk = 0; kk < KK; ++kk) {
+            uint32_t b0, b1, b2, b3;
+            mma_ldsm_x4(b0, b1, b2, b3, kb + kk * 16);
+            mma_bf16(sh[0], qa[kk], b0, b1);
+            mma_bf16(sl[0], qb[kk], b0, b1);
+            mma_bf16(sh[1], qa[kk], b2, b3);
+            mma_bf16(sl[1], qb[kk], b2, b3);
+        }
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            const int r0 = kt * 16 + nt * 8 + c2;
+            sp[kw][g * RC + r0] = sh[nt][0] + sl[nt][0];
+            sp[kw][g * RC + r0 + 1] = sh[nt][1] + sl[nt][1];
+            sp[kw][(g + 8) * RC + r0] = sh[nt][2] + sl[nt][2];
+            sp[kw][(g + 8) * RC + r0 + 1] = sh[nt][3] + sl[nt][3];
+        }
+    }
+    __syncthreads();
+    {   // ---- the chunk's softmax: 16 threads a head, rows sub + 16 i
+        const int h = threadIdx.x >> 4, sub = threadIdx.x & 15;
+        float v[NT], mx = -INFINITY;
+#pragma unroll
+        for (int i = 0; i < NT; ++i) {
+            const int r = sub + 16 * i;
+            float a = 0.0f;
+#pragma unroll
+            for (int w = 0; w < WT; ++w) a += sp[w][h * RC + r];
+            v[i] = r < n ? a * scale : -INFINITY;
+            mx = fmaxf(mx, v[i]);
+        }
+#pragma unroll
+        for (int k = 8; k >= 1; k >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, k));
+        float l = 0.0f;
+#pragma unroll
+        for (int i = 0; i < NT; ++i) {
+            const int r = sub + 16 * i;
+            const float p = r < n ? expf(v[i] - mx) : 0.0f;
+            pr[h * RC + r] = p;
+            l += p;
+        }
+#pragma unroll
+        for (int k = 8; k >= 1; k >>= 1) l += __shfl_xor_sync(0xffffffffu, l, k);
+        if (sub == 0) {
+            mloc[h] = mx;
+            lloc[h] = l;
+        }
+    }
+    __syncthreads();
+    // ---- the weighted sums: output dimensions wp * 64 + nt * 8 + c2, + 1 of heads hb + g, + 8
+    float acc[8][4];
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt) acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.0f;
+    const uint16_t* vb = tile + (lane & 15) * dp + wp * 64 + (lane >> 4) * 8;
+#pragma unroll
+    for (int k2 = 0; k2 < NT; ++k2) {
+        const float* pp = pr + k2 * 16;
+        uint32_t pa[4], pb[4];
+        split_bf16x2(*(const float2*) (pp + g * RC + c2), pa[0], pb[0]);
+        split_bf16x2(*(const float2*) (pp + (g + 8) * RC + c2), pa[1], pb[1]);
+        split_bf16x2(*(const float2*) (pp + g * RC + c2 + 8), pa[2], pb[2]);
+        split_bf16x2(*(const float2*) (pp + (g + 8) * RC + c2 + 8), pa[3], pb[3]);
+#pragma unroll
+        for (int np = 0; np < 4; ++np) {
+            uint32_t b0, b1, b2, b3;
+            mma_ldsm_x4_t(b0, b1, b2, b3, vb + k2 * 16 * dp + np * 16);
+            mma_bf16(acc[2 * np], pa, b0, b1);
+            mma_bf16(acc[2 * np], pb, b0, b1);
+            mma_bf16(acc[2 * np + 1], pa, b2, b3);
+            mma_bf16(acc[2 * np + 1], pb, b2, b3);
+        }
+    }
+    const size_t bi = ((size_t) t * heads + hb + g) * nsplit + chunk;
+    float* o0 = part + bi * d + wp * 64 + c2;
+    float* o1 = o0 + (size_t) 8 * nsplit * d;
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt) {
+        *(float2*) (o0 + nt * 8) = make_float2(acc[nt][0], acc[nt][1]);
+        *(float2*) (o1 + nt * 8) = make_float2(acc[nt][2], acc[nt][3]);
+    }
+    if (threadIdx.x < 16) {
+        const size_t bh = ((size_t) t * heads + hb + threadIdx.x) * nsplit + chunk;
+        ml[bh * 2] = mloc[threadIdx.x];
+        ml[bh * 2 + 1] = lloc[threadIdx.x];
+    }
+#else
+    (void) q, (void) win, (void) ckv, (void) sel_bf16, (void) sel, (void) sel_stride, (void) ar, (void) heads, (void) scale;
+    (void) part, (void) ml, (void) nsplit;
+#endif
+}
+// the tensor-core split: attn_part_mma<NT> into sc, then attnsplit::attn_merge (chunks of 16 NT rows; heads % 16 == 0,
+// total_max <= sc.nsplit * 16 NT)
+template <int NT>
+void sparse_attn_split_tc(const float* q, const uint16_t* win, const uint8_t* ckv, bool sel_bf16, const int* sel,
+                          int sel_stride, const AttnRows& ar, const float* sink, int heads, int T, float scale, float* out,
+                          const attnsplit::AttnSplitScratch& sc, int total_max, cudaStream_t s) {
+    const dim3 grid(heads / 16, (total_max + 16 * NT - 1) / (16 * NT), T);
+    attn_part_mma<NT><<<grid, kThreads, 0, s>>>(q, win, ckv, sel_bf16, sel, sel_stride, ar, heads, scale, sc.part, sc.ml,
+                                               sc.nsplit);
+    attnsplit::attn_merge<<<dim3(heads, T), 256, 0, s>>>(sc.part, sc.ml, sink, heads, sc.nsplit, 16 * NT, ar, out);
+}
 #endif   // !STRATA_USE_HIP
 
 // the ring's rows are kKvFp8: E4M3 codes, a UE8M0 scale per 32 (decoded: exactly the BF16 values they were made from)
@@ -3959,9 +4163,79 @@ static bool attn_mma_now() {
 #endif
 }
 
-void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
-                 const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
-                 int ckv_fmt, int heads_per_block, const AttnScratch* scr) {
+namespace {
+
+// ---- the split-KV attention's scratch: a device allocation a (device, stream, heads), allocated at load time
+// by attn_split_prewarm (ds4_model.cu, next to AttnScratch) and kept (Strata 0.2.6 keys it a (device, stream);
+// the heads in the key keep a later wider call off a narrower first allocation).  A first-use allocation is
+// still the fallback for a (stream, heads) the prewarm did not cover, but never inside a stream capture: an
+// uncached key under capture runs stock for that call only (the null is not cached).  kSplitCap * kSplitR =
+// 960 rows covers this model's window 128 + index_topk 512; anything wider stays on the stock path.
+// kSplitMaxT = kWin covers every window the engine can build (verify() caps T at kWin; DSpark's block of 5
+// drafts verifies at T <= 6): scratch 16 * 64 * 24 * 512 floats = 48 MiB a device, inside the 600 MiB reserve.
+constexpr int kSplitG = 4, kSplitR = 40, kSplitCap = 24, kSplitMaxT = kWin;
+bool split_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("DS4_ATTN_SPLIT");
+        return e != nullptr && std::atoi(e) != 0;   // opt-in: the merge sums in another order (the bits differ)
+    }();
+    return on;
+}
+bool stream_capturing(cudaStream_t s) {
+#if defined(STRATA_USE_HIP)
+    (void) s;   // (no capture path in the HIP build; the load-time prewarm still applies)
+    return false;
+#else
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(s, &st) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return st != cudaStreamCaptureStatusNone;
+#endif
+}
+attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
+    static std::mutex mu;
+    static std::map<std::tuple<int, cudaStream_t, int>, attnsplit::AttnSplitScratch> m;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        cudaGetLastError();
+        return {};
+    }
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = m.find({dev, s, heads});
+    if (it != m.end()) return it->second;
+    if (stream_capturing(s)) return {};   // (not cached: a later uncaptured call allocates)
+    attnsplit::AttnSplitScratch sc;
+    sc.nsplit = kSplitCap;
+    sc.max_t = kSplitMaxT;
+    const size_t np = (size_t) kSplitMaxT * heads * kSplitCap;
+    const size_t part_b = np * 512 * sizeof(float), ml_b = np * 2 * sizeof(float);
+    cudaError_t e1 = cudaMalloc((void**) &sc.part, part_b);
+    cudaError_t e2 = e1 == cudaSuccess ? cudaMalloc((void**) &sc.ml, ml_b) : e1;
+    if (e1 != cudaSuccess || e2 != cudaSuccess) {
+        std::fprintf(stderr, "ds4: attn split scratch allocation failed on CUDA%d (heads=%d, %.0f MiB): %s - stock attention runs\n",
+                     dev, heads, (double) (part_b + ml_b) / 1048576.0, cudaGetErrorString(e1 != cudaSuccess ? e1 : e2));
+        cudaGetLastError();
+        if (sc.part != nullptr) cudaFree(sc.part);
+        sc = attnsplit::AttnSplitScratch{};
+    } else {
+        std::fprintf(stderr, "ds4: attn split on CUDA%d (heads=%d, T<=%d, scratch %.0f MiB)\n", dev, heads, kSplitMaxT,
+                     (double) (part_b + ml_b) / 1048576.0);
+    }
+    m[{dev, s, heads}] = sc;
+    return sc;
+}
+}  // namespace
+
+void attn_split_prewarm(cudaStream_t s, int heads) {
+    if (!split_enabled() || heads <= 0 || heads % kSplitG != 0) return;
+    (void) split_scratch(s, heads);   // (the caller's device must be current, as after its dalloc)
+}
+
+static void sparse_attn_stock(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
+                              const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
+                              int ckv_fmt, int heads_per_block, const AttnScratch* scr) {
     if (d != 512 || (ckv_fmt != kKvFp4 && ckv_fmt != kKvBf16)) {
         std::fprintf(stderr, "ds4 sparse_attn: head dim %d (rows %d) not covered\n", d, ckv_fmt);
         return;
@@ -4031,6 +4305,110 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     else if (G == 4) pdl_launch(sparse_attn_packed_kernel<4>, grid, kThreads, 0, s, q, win, c, sel, sel_stride, a, sink, heads, scale, out);
     else if (G == 2) pdl_launch(sparse_attn_packed_kernel<2>, grid, kThreads, 0, s, q, win, c, sel, sel_stride, a, sink, heads, scale, out);
     else pdl_launch(sparse_attn_packed_kernel<1>, grid, kThreads, 0, s, q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+}
+
+namespace {
+// DS4_ATTN_SPLIT_CHECK=N: the first N split calls also run the stock dispatch on the same live inputs into a
+// side buffer and print the largest difference (a synchronising debug path; never set it for timing)
+void attn_split_check(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
+                      const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
+                      int ckv_fmt, int heads_per_block, const AttnScratch* scr, int total_max) {
+    static const int budget = [] {
+        const char* e = std::getenv("DS4_ATTN_SPLIT_CHECK");
+        return e != nullptr ? std::atoi(e) : 0;
+    }();
+    if (budget <= 0) return;
+    if (stream_capturing(s)) {   // (the check mallocs and synchronises: it cannot run inside a capture)
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "attn split check: refused under stream capture\n");
+        return;
+    }
+    static std::atomic<int> done{0};
+    if (done.fetch_add(1, std::memory_order_relaxed) >= budget) return;
+    auto ck = [](cudaError_t e, const char* what) {
+        if (e == cudaSuccess) return true;
+        std::fprintf(stderr, "attn split check: %s: %s\n", what, cudaGetErrorString(e));
+        cudaGetLastError();
+        return false;
+    };
+    const size_t n = (size_t) T * heads * d;
+    float* ref = nullptr;
+    if (!ck(cudaMalloc((void**) &ref, n * sizeof(float)), "cudaMalloc")) return;
+    sparse_attn_stock(q, win, ckv, sel, sel_stride, a, sink, heads, d, T, scale, ref, s, ckv_fmt, heads_per_block, scr);
+    std::vector<float> got(n), stock(n);
+    const bool good = ck(cudaMemcpyAsync(got.data(), out, n * sizeof(float), cudaMemcpyDeviceToHost, s), "copy split out") &&
+                      ck(cudaMemcpyAsync(stock.data(), ref, n * sizeof(float), cudaMemcpyDeviceToHost, s), "copy stock out") &&
+                      ck(cudaStreamSynchronize(s), "sync");
+    cudaFree(ref);
+    if (!good) return;
+    double max_abs = 0.0, max_rel = 0.0, omax = 0.0;
+    size_t bad = 0, nonfinite = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (!std::isfinite(got[i]) || !std::isfinite(stock[i])) ++nonfinite;
+        const double err = std::abs((double) got[i] - stock[i]);
+        max_abs = std::max(max_abs, err);
+        omax = std::max(omax, std::abs((double) stock[i]));
+        max_rel = std::max(max_rel, err / std::max(std::abs((double) stock[i]), 1e-12));
+        bad += err > 1e-4 + 1e-4 * std::abs((double) stock[i]);
+    }
+    int dev = 0;
+    cudaGetDevice(&dev);
+    cudaGetLastError();
+    std::fprintf(stderr,
+                 "attn split check: dev=%d T=%d heads=%d rows<=%d nsel0=%d values=%zu max_abs=%.9g max_abs_over_max=%.9g max_rel=%.9g bad=%zu nonfinite=%zu\n",
+                 dev, T, heads, total_max, a.nsel[0], n, max_abs, omax > 0 ? max_abs / omax : 0.0, max_rel, bad, nonfinite);
+}
+}  // namespace
+
+void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
+                 const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
+                 int ckv_fmt, int heads_per_block, const AttnScratch* scr) {
+    // a decode step / short verify window of packed rows: the split-KV kernel (Strata's CUDA lab, ds4_attn_split.cuh; 2.9x at
+    // one query on an A4000).  The same inputs; the merge sums the chunks in another order, so the bits differ in the last
+    // place (4e-7 against a double reference).  DS4_ATTN_SPLIT=1 turns it on (off by default).  It never pre-empts a prompt
+    // chunk's tensor-core request (kAttnWmma), and the chunked-prefill caller (a.gen) stays on the stock dispatch.
+    // DS4_ATTN_SPLIT_TC=1 (with DS4_ATTN_SPLIT=1, sm_80+, heads % 16 == 0): phase 1 on the tensor cores (attn_part_mma,
+    // the prompt kernel's BF16 high + low numerics: bounded, not bitwise), the same scratch and merge; it also takes
+    // the drafter's BF16 rows.  DS4_ATTN_MMA=0 turns it off too.
+    static const bool tc_env = std::getenv("DS4_ATTN_SPLIT_TC") != nullptr && std::atoi(std::getenv("DS4_ATTN_SPLIT_TC")) != 0;
+#if defined(STRATA_USE_HIP)
+    const bool tc = false;
+#else
+    const bool tc = tc_env && heads % 16 == 0 && attn_mma_now();
+#endif
+    if (split_enabled() && d == 512 && (ckv_fmt == kKvFp4 || (tc && ckv_fmt == kKvBf16)) && a.gen == 0 &&
+        heads_per_block != kAttnWmma && T >= 1 && T <= kSplitMaxT && heads > 0 && heads % kSplitG == 0) {
+        int total_max = 0;
+        for (int t = 0; t < T; ++t) total_max = std::max(total_max, a.nwin[t] + a.nsel[t]);
+#if !defined(STRATA_USE_HIP)
+        if (tc && total_max > 0 && total_max <= kSplitCap * 32) {
+            const attnsplit::AttnSplitScratch sc = split_scratch(s, heads);
+            if (sc.part != nullptr) {
+                // always 32-row chunks: a query's chunking (so its bits) must not depend on T or on the call's other
+                // queries - a token verified in a window must equal the same token decoded alone.  (A call over 768
+                // rows leaves the tc path, as one over 960 leaves the FP32 split: unreachable, a query has at most
+                // 128 + 512 rows)
+                sparse_attn_split_tc<2>(q, win, (const uint8_t*) ckv, ckv_fmt == kKvBf16, sel, sel_stride, a, sink, heads,
+                                        T, scale, out, sc, total_max, s);
+                attn_split_check(q, win, ckv, sel, sel_stride, a, sink, heads, d, T, scale, out, s, ckv_fmt,
+                                 heads_per_block, scr, total_max);
+                return;
+            }
+        }
+#endif
+        if (ckv_fmt == kKvFp4 && total_max > 0 && total_max <= kSplitCap * kSplitR) {
+            const attnsplit::AttnSplitScratch sc = split_scratch(s, heads);
+            if (sc.part != nullptr) {
+                attnsplit::sparse_attn_split<kSplitG, kSplitR>(q, win, (const uint8_t*) ckv, kv_row_bytes(kKvFp4, d), sel,
+                                                               sel_stride, a, sink, heads, T, scale, out, sc, total_max, s);
+                attn_split_check(q, win, ckv, sel, sel_stride, a, sink, heads, d, T, scale, out, s, ckv_fmt,
+                                 heads_per_block, scr, total_max);
+                return;
+            }
+        }
+    }
+    sparse_attn_stock(q, win, ckv, sel, sel_stride, a, sink, heads, d, T, scale, out, s, ckv_fmt, heads_per_block, scr);
 }
 
 void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, cudaStream_t s) {
