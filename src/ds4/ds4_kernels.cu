@@ -3188,14 +3188,26 @@ __host__ __device__ __forceinline__ size_t xfer_unit(const Xfer& x, int i) {
 __host__ __device__ __forceinline__ size_t xfer_units(const Xfer& x) {
     size_t total = 0;
     for (int i = 0; i < x.n; ++i) total += x.bytes[i] / xfer_unit(x, i);
-    return total;
+    return total + x.bf16_n;
 }
 
 // the hand-offs through host-mapped memory: a grid-stride copy of the segments (a unit a thread), then (put, flag
 // given) the last block to finish sets the flag after a system fence; a get first waits for the flag
 __device__ __forceinline__ void xfer_copy(const Xfer& x, bool from_host) {
-    const size_t total = xfer_units(x);
+    const size_t raw = xfer_units(x) - x.bf16_n, total = raw + x.bf16_n;
     for (size_t q = (size_t) blockIdx.x * blockDim.x + threadIdx.x; q < total; q += (size_t) gridDim.x * blockDim.x) {
+        if (q >= raw) {
+            const size_t r = q - raw;
+            if (from_host) {
+                const uint16_t h = ((const volatile uint16_t*) x.bf16_host)[r];
+                x.bf16_dst[r] = __uint_as_float((uint32_t) h << 16);
+            } else {
+                uint32_t u = __float_as_uint(x.bf16_src[r]);
+                u += 0x7fffu + ((u >> 16) & 1u);   // round to nearest, ties to even
+                x.bf16_host[r] = (uint16_t) (u >> 16);
+            }
+            continue;
+        }
         size_t r = q;
         int i = 0;
         while (r >= x.bytes[i] / xfer_unit(x, i)) r -= x.bytes[i] / xfer_unit(x, i), ++i;

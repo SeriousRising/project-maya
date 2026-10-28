@@ -417,6 +417,12 @@ struct Xfer {
     void* dst[4] = {nullptr, nullptr, nullptr, nullptr};
     size_t bytes[4] = {0, 0, 0, 0};
     int n = 0;
+    // DS4_RW_HANDOFF_BF16: a separate residual segment, rounded to BF16 in host-mapped memory on a put and
+    // reconstructed on a get.  The ordinary segments above keep their exact bytes and the same flag protocol.
+    const float* bf16_src = nullptr;
+    float* bf16_dst = nullptr;
+    uint16_t* bf16_host = nullptr;
+    size_t bf16_n = 0;
 };
 void xfer_put(const Xfer& x, unsigned* flag, unsigned seq, unsigned* cnt, cudaStream_t s);
 // Windows (WDDM, CUDA and HIP alike) holds launches back until the host waits or queries the stream: the work queued on

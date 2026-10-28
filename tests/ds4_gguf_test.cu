@@ -2476,6 +2476,59 @@ void test_ar2(int da, int db, int rows) {
     CU(cudaFreeHost(a.pflags));
 }
 
+void test_handoff_bf16(cudaStream_t s) {
+    const size_t n = 8192 * 4 * 5120;
+    std::vector<float> src(n);
+    for (size_t i = 0; i < n; ++i) src[i] = frand(8.0f);
+    for (size_t i = 0; i < 16 && i < n; ++i) src[i] = (float) i * 0.5000001f;
+    float* d_src = dev(src);
+    float* d_dst = dev(std::vector<float>(n, -99.0f));
+    float* d_raw = dev(std::vector<float>(32, 1.25f));
+    unsigned* d_cnt = dev(std::vector<unsigned>(1, 0));
+    uint16_t* hbuf = nullptr;
+    unsigned* flag = nullptr;
+    CU(cudaHostAlloc((void**) &hbuf, n * 2 + 32 * 4, cudaHostAllocMapped));
+    CU(cudaHostAlloc((void**) &flag, 32, cudaHostAllocMapped));
+    *flag = 0;
+    strata::ds4::Xfer x;
+    x.src[0] = d_raw;
+    x.dst[0] = hbuf + n;
+    x.bytes[0] = 32 * 4;
+    x.n = 1;
+    x.bf16_src = d_src;
+    x.bf16_host = hbuf;
+    x.bf16_n = n;
+    strata::ds4::xfer_put(x, flag, 1, d_cnt, s);
+    strata::ds4::Xfer y;
+    y.src[0] = hbuf + n;
+    y.dst[0] = d_raw;
+    y.bytes[0] = 32 * 4;
+    y.n = 1;
+    y.bf16_dst = d_dst;
+    y.bf16_host = hbuf;
+    y.bf16_n = n;
+    strata::ds4::xfer_get(y, flag, 1, s);
+    CU(cudaStreamSynchronize(s));
+    std::vector<float> got = host(d_dst, n);
+    double max_abs = 0, max_src = 0;
+    size_t mismatch = 0;
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t u;
+        std::memcpy(&u, &src[i], 4);
+        u += 0x7fffu + ((u >> 16) & 1u);
+        const float want = bf16f((uint16_t) (u >> 16));
+        mismatch += std::memcmp(&got[i], &want, 4) != 0;
+        max_abs = std::max(max_abs, (double) std::fabs(got[i] - src[i]));
+        max_src = std::max(max_src, (double) std::fabs(src[i]));
+    }
+    const size_t raw_same = std::memcmp(hbuf + n, std::vector<float>(32, 1.25f).data(), 32 * 4) == 0;
+    std::printf("handoff BF16: %zu values, max_abs %.9g, max_abs_over_max %.9g, rounded mismatches %zu, raw exact %zu\n",
+                n, max_abs, max_abs / max_src, mismatch, raw_same);
+    if (mismatch != 0 || raw_same != 1 || *flag != 1) ++g_fail;
+    cudaFree(d_src), cudaFree(d_dst), cudaFree(d_raw), cudaFree(d_cnt);
+    cudaFreeHost(hbuf), cudaFreeHost(flag);
+}
+
 int main(int argc, char** argv) {
     cudaStream_t s;
     CU(cudaStreamCreate(&s));
@@ -2560,6 +2613,11 @@ int main(int argc, char** argv) {
     }
     if (argc >= 2 && std::strcmp(argv[1], "--kv") == 0) {   // the caches' packing alone
         test_kv_pack(s);
+        std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
+        return g_fail ? 1 : 0;
+    }
+    if (argc >= 2 && std::strcmp(argv[1], "--handoff-bf16") == 0) {
+        test_handoff_bf16(s);
         std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
         return g_fail ? 1 : 0;
     }
