@@ -357,7 +357,6 @@ struct Req {
     // block still open after n tokens of the answer is closed - its next token is think_end - and the answer follows
     long long think_budget = 0;
     int think_end = -1;
-    int rid = -1;       // multi: this request's conversation id
     std::vector<int64_t> marks;   // marks=a,b: prompt positions to checkpoint at (the server: where the system message ends)
     std::string file;   // GENI: the pictures
     std::vector<int> ids;
@@ -1875,7 +1874,7 @@ int serve_multi(strata::ds4::Model& m, const std::string& eos_list, bool spec, f
     };
     std::vector<R> reqs((size_t) N);
     std::vector<char> used((size_t) N, 0);
-    struct Item { int rid, seq; int64_t p0; };
+    struct Item { long long rid; int seq; int64_t p0; };
     // q1 carries what stage 0 ran: one step (one item), or a row group (MAYA_DS4_ROWS_BATCH: its items, the first the
     // group's lead)
     struct Step { std::vector<Item> it; bool group = false; };
