@@ -2225,5 +2225,32 @@ for line in sys.stdin:
         self.assertEqual(self.run_gen(3), [66, 67])
 
 
+
+class NoDelayStreaming(unittest.TestCase):
+    """Streamed replies are flush-per-token small frames; without TCP_NODELAY, Nagle + delayed ACK
+    can hold a frame ~40 ms on the LAN to LiteLLM.  _sse (every streaming path goes through it) sets it."""
+
+    def test_sse_sets_tcp_nodelay(self):
+        import socket
+
+        from serve.server import make_handler
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        client = socket.create_connection(listener.getsockname())
+        conn, _ = listener.accept()
+        try:
+            handler_cls = make_handler(None)
+            handler = handler_cls.__new__(handler_cls)
+            handler.connection = conn
+            handler.send_response = lambda *a, **k: None
+            handler.send_header = lambda *a, **k: None
+            handler.end_headers = lambda *a, **k: None
+            self.assertEqual(conn.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY), 0)
+            handler._sse()
+            self.assertEqual(conn.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY), 1)
+        finally:
+            conn.close(), client.close(), listener.close()
+
 if __name__ == "__main__":
     unittest.main()

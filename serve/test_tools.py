@@ -370,5 +370,37 @@ class ForcedToolCalls(unittest.TestCase):
         self.assertFalse(tok.decode(engine.last_prompt).rstrip().endswith("<tool_call>"))
 
 
+class CallEndRescan(unittest.TestCase):
+    """In call state the parser searched for </tool_call> from offset 0 on every delta while the
+    body accumulated - O(body) per token on a large file-write argument.  The search now resumes where
+    the last one stopped (less a possible partial tag); every split of the same text must parse the same."""
+
+    BODY = ("<tool_call>bash\n<arg_key>command</arg_key>\n<arg_value>"
+            + "echo line </tool_cal and </tool_callx and </tool_call\n" * 60
+            + "</arg_value>\n</tool_call>done")
+
+    def shape(self, events):
+        return (content(events),
+                [(c.name, c.arguments) for c in calls(events)],
+                "".join(e.text for e in events if e.kind == "tool_args"))
+
+    def test_every_split_agrees_with_whole(self):
+        whole = self.shape(run(self.BODY))
+        self.assertEqual(len(whole[1]), 1)
+        self.assertTrue(whole[1][0][1]["command"].startswith("echo line"))
+        for pieces in (1, 2, 3, 5, 11, 64):
+            self.assertEqual(self.shape(run(self.BODY, pieces=pieces)), whole, f"pieces={pieces}")
+
+    def test_search_resume_advances_with_the_body(self):
+        p = OutputParser(thinking=True, tools=TOOLS, stream_tools=True)
+        p.feed("think</think>\n\n<tool_call>bash\n<arg_key>command</arg_key>\n<arg_value>")
+        p.feed("x" * 5000)
+        self.assertGreater(p._call_resume, 4000)
+        p.feed("</arg_value>\n</tool_cal")          # a partial end tag: not a close, and not skipped either
+        self.assertEqual(p.state, "call")
+        out = p.feed("l>")
+        self.assertEqual([e.kind for e in out].count("tool_call"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

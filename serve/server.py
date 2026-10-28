@@ -4274,6 +4274,13 @@ def make_handler(svc: Service):
             self._json(200, {"shared": bool(shared), "defaults": shared})
 
         def _sse(self):
+            # token frames are small and flushed as they come; Nagle would otherwise hold one
+            # for the peer's delayed ACK (~40 ms) on its way to the client.
+            try:
+                import socket
+                self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
