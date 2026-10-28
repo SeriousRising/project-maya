@@ -497,6 +497,36 @@ class StableToolOrder(unittest.TestCase):
         self.assertIs(stable_tool_order(nameless), nameless)
         self.assertIsNone(stable_tool_order(None))
 
+    def test_deepseek_paths_are_stabilized_too(self):
+        # the DeepSeek converters skipped stable_tool_order, so one swap on the DS4 path (an agent client's
+        # or an MCP hub's tool order) re-rendered the tools at the prompt's head in a new order and the engine
+        # re-read the whole conversation.  Unique names: _TOOL_ORDERS is process-global.
+        from serve.frontend import anthropic_to_messages, openai_to_messages
+
+        def oa(*names):
+            return openai_to_messages({"messages": [{"role": "user", "content": "q"}], "tools": [
+                {"type": "function", "function": {"name": n, "parameters": {}}} for n in names]}, deepseek=True)[1]
+
+        def an(*names):
+            return anthropic_to_messages({"messages": [{"role": "user", "content": "q"}], "tools": [
+                {"name": n, "input_schema": {}} for n in names]}, deepseek=True)[1]
+
+        self.assertEqual(self.names(oa("ds_a", "ds_b", "ds_c")), ["ds_a", "ds_b", "ds_c"])   # first sight
+        self.assertEqual(self.names(oa("ds_c", "ds_a", "ds_b")), ["ds_a", "ds_b", "ds_c"])
+        self.assertEqual(self.names(an("ds_b", "ds_c", "ds_a")), ["ds_a", "ds_b", "ds_c"])  # the same set
+
+    def test_deepseek_namespaced_tools_key_on_the_encoding_name(self):
+        from serve.frontend import openai_to_messages
+
+        def oa(*tools):
+            return openai_to_messages({"messages": [{"role": "user", "content": "q"}], "tools": list(tools)},
+                                      deepseek=True)[1]
+
+        one = {"type": "function", "namespace": "nsx", "function": {"name": "probe", "parameters": {}}}
+        two = {"type": "function", "function": {"name": "plain", "parameters": {}}}
+        self.assertEqual(self.names(oa(one, two)), ["nsx::probe", "plain"])
+        self.assertEqual(self.names(oa(two, one)), ["nsx::probe", "plain"])
+
 
 class ClientShapes(unittest.TestCase):
     """What real clients send: Claude Code posts /v1/messages?beta=true (issue #55) and puts hook context into the

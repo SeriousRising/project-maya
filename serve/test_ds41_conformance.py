@@ -15,7 +15,8 @@ import unittest
 from pathlib import Path
 
 from serve import ds41_encoding as reference, ds4_vision
-from serve.frontend import ChatTemplate, OutputParser, anthropic_to_messages, deepseek_images, openai_to_messages
+from serve.frontend import (ChatTemplate, OutputParser, _TOOL_ORDERS, _TOOL_ORDERS_LOCK,
+                            anthropic_to_messages, deepseek_images, openai_to_messages)
 from serve.server import (ByteTokenizer, MockEngine, Service, anthropic_collect, anthropic_events,
                           openai_chunks, openai_collect)
 
@@ -47,7 +48,16 @@ def dsml(parameters, name="lookup"):
             + '\n</｜DSML｜ invoke>\n</｜DSML｜ calls>')
 
 
-class Rendering(unittest.TestCase):
+class _CleanToolOrders(unittest.TestCase):
+    # stable_tool_order's memory is process-global and the DeepSeek converters use it
+    # now, so a golden repeating a tool-name set in another order would render in whichever order an
+    # earlier test (in this process, any file) first sent.  Goldens must not depend on test order.
+    def setUp(self):
+        with _TOOL_ORDERS_LOCK:
+            _TOOL_ORDERS.clear()
+
+
+class Rendering(_CleanToolOrders):
     @classmethod
     def setUpClass(cls):
         cls.template = ChatTemplate(ROOT / "tools/ds4/chat_template.jinja")
@@ -257,7 +267,7 @@ class Rendering(unittest.TestCase):
                         self.assertTrue(closed.endswith(header + marker))
 
 
-class Parsing(unittest.TestCase):
+class Parsing(_CleanToolOrders):
     def test_official_fixture_completions_at_chunk_boundaries(self):
         for number in range(1, 6):
             text = (FIXTURES / f"test_output_{number}.txt").read_text(encoding="utf-8")
@@ -408,7 +418,7 @@ class Parsing(unittest.TestCase):
                                  {"q": {"nested": [True, None, 2]}})
 
 
-class ResponseSerialization(unittest.TestCase):
+class ResponseSerialization(_CleanToolOrders):
     def service(self):
         tok = ByteTokenizer()
         script = "reason</think>" + dsml(
@@ -454,7 +464,7 @@ class ResponseSerialization(unittest.TestCase):
         self.assertEqual(result["stop_reason"], "tool_use")
 
 
-class ServiceIntegration(unittest.TestCase):
+class ServiceIntegration(_CleanToolOrders):
     class DeepSeekTokenizer(ByteTokenizer):
         SPECIALS = ByteTokenizer.SPECIALS + [
             reference.bos_token, reference.eos_token, "<｜User｜>", "<｜Assistant｜>", "<｜System｜>",
@@ -582,7 +592,7 @@ class ServiceIntegration(unittest.TestCase):
                         self.assertEqual(result["stop_reason"], "tool_use")
 
 
-class Images(unittest.TestCase):
+class Images(_CleanToolOrders):
     def test_parallel_result_images_follow_reference_call_order_without_mutation(self):
         request = {"messages": BASE + [
             {"role": "assistant", "content": "", "tool_calls": [tool_call("a", "alpha"), tool_call("b", "beta")]},
