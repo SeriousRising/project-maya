@@ -1,18 +1,22 @@
 // ds4_pool_test: IoQueue's device-copy jobs (DS4_FLOW_HELPER's copies out of the helper's pool), CPU only - a fake
 // copy function stands in for the GPU runtime; DS4_FLOW_DOWN_PART's compact_rows - in place against a naive gather,
-// alone and on IoQueue's three kinds of job; and DS4_TP_BORROW's tail arithmetic (ds4_borrow.hpp).
+// alone and on IoQueue's three kinds of job; DS4_TP_BORROW's tail arithmetic (ds4_borrow.hpp); and Pool::start waking
+// a worker that is going to sleep (a batch no caller helps).
 // Build: g++ -std=c++17 -O2 -pthread -I src/ds4 tests/ds4_pool_test.cpp
 #include "ds4_borrow.hpp"
 #include "ds4_pool.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
 #include <vector>
 #if !defined(_WIN32)
 #include <unistd.h>
 #endif
 
 using strata::ds4::IoQueue;
+using strata::ds4::Pool;
 
 namespace {
 
@@ -180,6 +184,41 @@ void tp_borrow_arithmetic() {
 // touched. A pattern that differs at every byte of a row and between rows, so a misplaced byte shows
 uint8_t pat(size_t i) { return (uint8_t) (i * 131 + (i >> 8) * 7 + 1); }
 
+// Pool::start stores the generation, then loads the sleeper count; a worker going to sleep adds itself to that count,
+// then loads the generation.  Without a fence between the two (store -> load) both can read the old value: the worker
+// sleeps through the batch and the starter skips the notify.  A batch nobody help()s (run_nodes' second pool) then
+// never runs, so the test is a batch no caller helps, many times over, on a worker that sleeps as soon as it is idle.
+// Its first batch also checks the worker's start: one that read gen_ only once its thread ran took a batch start()ed
+// before that as already seen (on a 16-vCPU Xeon VM, 9 runs in 10 hung at batch 0 that way).
+void pool_start_wakes_sleeper() {
+    Pool p(1, {}, 0);
+    const int batches = 200000;
+    std::atomic<int> ran{0}, done{0};
+    std::atomic<bool> over{false};
+    const std::function<void(int)> fn = [&](int) { ran.fetch_add(1, std::memory_order_relaxed); };
+    std::thread dog([&] {   // (a missed wakeup hangs wait() for good: report it and exit)
+        int last = -1;
+        for (int still = 0; !over.load(); std::this_thread::sleep_for(std::chrono::milliseconds(100))) {
+            const int d = done.load();
+            still = d == last ? still + 1 : 0;
+            last = d;
+            if (still == 50) {
+                std::fprintf(stderr, "FAILED %s:%d: batch %d of a pool nobody helps never ran (a missed wakeup)\n",
+                             __FILE__, __LINE__, d);
+                std::_Exit(1);
+            }
+        }
+    });
+    for (int i = 0; i < batches; ++i) {
+        p.start(1, fn);
+        p.wait();
+        done.store(i + 1);
+    }
+    over.store(true);
+    dog.join();
+    EXPECT(ran.load() == batches);
+}
+
 bool compacts(size_t rows, size_t pitch, size_t off, size_t len) {
     const size_t n = rows * pitch, guard = 64;
     std::vector<uint8_t> buf(n + guard), want(rows * len);
@@ -326,6 +365,7 @@ int main() {
     tp_borrow_arithmetic();
     compact_rows_shapes();
     compact_rows_jobs();
+    pool_start_wakes_sleeper();
     if (failures) {
         std::fprintf(stderr, "ds4_pool_test: %d FAILED\n", failures);
         return 1;
