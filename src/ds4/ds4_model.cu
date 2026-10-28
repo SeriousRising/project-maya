@@ -18465,6 +18465,7 @@ const std::vector<int32_t>& Model::tokens() const { return p_->toks; }
 // (one sequence API for both ways of holding several: MAYA_DS4_PIPE's two (pipe_n, pipe_bind) and --parallel's n
 //  (sqs, seq_bind); a load makes at most one of them - pipe_alloc_try)
 int Model::seq_count() const { return p_->pipe_n > 1 ? p_->pipe_n : p_->seq_count(); }
+bool Model::parallel() const { return p_->seq_count() > 1; }
 void Model::seq_bind(int s) {
     if (p_->pipe_n > 1) p_->pipe_bind(s);
     else p_->seq_bind(s);

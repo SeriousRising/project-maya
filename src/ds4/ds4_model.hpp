@@ -193,6 +193,7 @@ public:
     /// --parallel's conversations (Options::seqs): each its own state.  seq_bind(s): every call of this class acts on
     /// conversation s from here - feed, step, draft / verify, sample, checkpoints, slots, reset, tokens (0 at load).
     int seq_count() const;
+    bool parallel() const;   // --parallel holds the conversations (seq_count() also counts the pipe's sequences)
     void seq_bind(int s);
     int seq_bound() const;
     int64_t seq_pos(int s) const;

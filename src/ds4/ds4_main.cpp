@@ -410,7 +410,6 @@ struct Req {
     long long rid = -1;   // rid=<id>: several conversations at once (serve_pipe; the server routes by it)
     std::string file;   // GENI: the pictures
     std::vector<int> ids;
-    long long rid = -1;   // rid=<id> (--parallel: every request's, its lines tagged with it)
 };
 
 // A prompt's picture: where its span starts, its pixels (the server's resize: RGB rows, both sides multiples of the
@@ -570,7 +569,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
           Lookup* lk) {
     std::vector<int> eos = parse_ids(eos_list);
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
-    if (m.seq_count() > 1)   // (--parallel: n conversations at once, GEN rid=<id>)
+    if (m.parallel())   // (--parallel: n conversations at once, GEN rid=<id>)
         std::printf("READY %lld stop multi=%d\n", (long long) m.max_context(), m.seq_count());
     else
         std::printf("READY %lld stop\n", (long long) m.max_context());
@@ -1319,7 +1318,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         P.from = from;
         return true;
     };
-    const bool multi = m.seq_count() > 1;
+    const bool multi = m.parallel();   // (not the pipe's second sequence: a pipe that fell back serves one at a time)
     while (!multi) {   // one conversation: a request at a time
         g_busy.store(false);   // (waiting for a request: no watchdog)
         if (!in.next(line) || line == "QUIT") break;
