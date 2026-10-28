@@ -14045,6 +14045,16 @@ struct Model::Impl {
         return d_pen;
     }
 
+    // the token sample_tokens left in d.tok; -1 on a CUDA error, printed here (the callers reject a -1)
+    int tok_back(Dev& d) {
+        int t = -1;
+        cudaError_t e = cudaMemcpyAsync(&t, d.tok, 4, cudaMemcpyDeviceToHost, d.st);
+        if (e == cudaSuccess) e = cudaStreamSynchronize(d.st);
+        if (e == cudaSuccess) return t;
+        std::fprintf(stderr, "ds4 sample: %s\n", cudaGetErrorString(e));
+        return -1;
+    }
+
     // `hist_end`: the pick's penalty history ends there (toks[0 .. hist_end): the tokens up to its row's position)
     int sample_row(int row, float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter,
                    const float* bias, int64_t hist_end) {
@@ -14062,10 +14072,7 @@ struct Model::Impl {
         int h = 0;
         const int* hr = pen_rows(hist_end, 1, sp, h);
         strata::kernels::sample_tokens(d.logits + (size_t) row * g.vocab, 1, g.vocab, hr, h, sp, d.tok, d.st);
-        int t = -1;
-        cudaMemcpyAsync(&t, d.tok, 4, cudaMemcpyDeviceToHost, d.st);
-        cudaStreamSynchronize(d.st);
-        return t;
+        return tok_back(d);
     }
 
     // [y, drafts] at positions pos ..: the trunk's verdict, its next token, and the state back to what it kept.
@@ -17576,10 +17583,7 @@ struct Model::Impl {
         const int* hr = pen_rows((int64_t) toks.size(), 1, sp, h);   // (the last fed token's row: every token consumed)
         strata::kernels::sample_tokens(d.logits + (size_t) std::max(0, n_logits - 1) * g.vocab, 1, g.vocab, hr, h,
                                        sp, d.tok, d.st);
-        int t = -1;
-        cudaMemcpyAsync(&t, d.tok, 4, cudaMemcpyDeviceToHost, d.st);
-        cudaStreamSynchronize(d.st);
-        return t;
+        return tok_back(d);
     }
 
     // ---- --parallel: one token of each of T conversations through the model together (Model::step_multi).  The rows
@@ -17705,10 +17709,7 @@ struct Model::Impl {
         int h = 0;
         const int* hr = pen_rows((int64_t) hist.size(), 1, sp, h, &hist);
         strata::kernels::sample_tokens(d.logits + (size_t) row * g.vocab, 1, g.vocab, hr, h, sp, d.tok, d.st);
-        int t = -1;
-        cudaMemcpyAsync(&t, d.tok, 4, cudaMemcpyDeviceToHost, d.st);
-        cudaStreamSynchronize(d.st);
-        return t;
+        return tok_back(d);
     }
 
     bool logits(std::vector<float>& out) {
@@ -17719,7 +17720,9 @@ struct Model::Impl {
         Dev& d = devs[(size_t) head_dev];
         cudaSetDevice(d.id);
         out.resize((size_t) std::max(1, n_logits) * g.vocab);
-        return cudaMemcpy(out.data(), d.logits, out.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+        // (on d.st: the legacy stream is not ordered after the non-blocking d.st's head)
+        return cudaMemcpyAsync(out.data(), d.logits, out.size() * 4, cudaMemcpyDeviceToHost, d.st) == cudaSuccess &&
+               cudaStreamSynchronize(d.st) == cudaSuccess;
     }
 
     void save_profile() const {

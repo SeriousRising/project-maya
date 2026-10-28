@@ -1334,6 +1334,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 finish = "cancel";
                 break;
             }
+            if (tok < 0) {   // (a sample's CUDA error, printed by the sampler: no T -1 to the client)
+                std::fprintf(stderr, "ds4: the sample failed\n");
+                finish = "cancel";
+                break;
+            }
             std::printf("T %d\n", tok);
             beat();
             ++produced;
@@ -1592,6 +1597,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             for (auto& ap : acts) {
                 Act& a = *ap;
                 if (in.stopped(a.r.rid)) {
+                    a.finish = "cancel";
+                    a.done = true;
+                    continue;
+                }
+                if (a.tok < 0) {   // (a sample's CUDA error, printed by the sampler: no T -1 to the client)
+                    std::fprintf(stderr, "ds4: the sample failed\n");
                     a.finish = "cancel";
                     a.done = true;
                     continue;
@@ -2120,6 +2131,10 @@ int main(int argc, char** argv) {
         if (lk) lk->start(m.tokens());
         const long long lk_w0 = lk ? lk->windows : 0, lk_o0 = lk ? lk->offered : 0, lk_a0 = lk ? lk->accepted : 0;
         for (;;) {
+            if (tok < 0) {   // (a sample's CUDA error, printed by the sampler)
+                std::fprintf(stderr, "maya-ds4: the sample failed\n");
+                return 1;
+            }
             out.push_back(tok);
             std::printf("%d,", tok);
             std::fflush(stdout);
