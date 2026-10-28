@@ -1322,7 +1322,8 @@ struct Model::Impl {
     // DS4_RW_DOWN_WAIT=1: a window of one waits for the CPU lane after its down rows, before the combine (as
     // win_experts does) - the down rows run while the CPU lane computes (the same bits)
     bool rw_down_wait = std::getenv("DS4_RW_DOWN_WAIT") != nullptr && std::atoi(std::getenv("DS4_RW_DOWN_WAIT")) != 0;
-    // DS4_RW_FLOW_CPU=1: every flow device hands some streamed experts to the CPU lane; =2: only the slowest link's
+    // DS4_RW_FLOW_CPU=2: the slowest link's flow device hands some streamed experts to the CPU lane (=1, every flow
+    // device, runs as 2: it measured no faster - card 0's fast link gains nothing - and drifts the logits further)
     int rw_flow_cpu = std::getenv("DS4_RW_FLOW_CPU") ? std::atoi(std::getenv("DS4_RW_FLOW_CPU")) : 0;
     // DS4_RW_FLOW_CPU_CHECK=1: each CPU-taken expert again in F32 (flow_cpu_check), its distance printed a layer; =2: and
     // the F32 rows used in its place (the rest of the path then carries no CPU-lane rounding); =3: the GPU computes the
@@ -4245,9 +4246,8 @@ struct Model::Impl {
         if (!rw_flow_cpu || c.cpu_x16 == nullptr || c.lm || l.nm != 1 || l.ram.empty() || c.dev < 0 ||
             (size_t) c.dev >= flow_cpu_dma.size() || !(flow_cpu_dma[(size_t) c.dev] > 0))
             return;
-        if (rw_flow_cpu == 2)   // (only the slowest link's device)
-            for (double r : flow_cpu_dma)
-                if (r > 0 && r < flow_cpu_dma[(size_t) c.dev]) return;
+        for (double r : flow_cpu_dma)   // (only the slowest link's device; =1 runs as 2, calibrate_flow_cpu)
+            if (r > 0 && r < flow_cpu_dma[(size_t) c.dev]) return;
         const auto mc = flow_cpu_cost.find(lane_fmt(l));
         if (mc == flow_cpu_cost.end()) return;
         const double dma = flow_cpu_dma[(size_t) c.dev], s_ms = 1000.0 * (double) l.blob / dma;
@@ -12404,6 +12404,9 @@ struct Model::Impl {
     void calibrate_flow_cpu() {
         flow_cpu_dma.assign(devs.size(), 0.0);
         if (!rw_flow_cpu) return;
+        if (rw_flow_cpu != 2)
+            std::fprintf(stderr, "ds4: DS4_RW_FLOW_CPU=%d is not supported, running as 2 (the slowest link's device "
+                                 "only)\n", rw_flow_cpu);
         plan_streams();   // the first run has not made the host lists this calibration samples yet
         for (size_t di = 0; di < chunks.size(); ++di) {
             if (chunks[di] == nullptr || !chunks[di]->flow) continue;
