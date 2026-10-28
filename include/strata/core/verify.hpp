@@ -171,6 +171,7 @@ private:
     int max_t_ = 0;
     int last_t_ = 0;
     int64_t last_pos0_ = 0;
+    int64_t next_pos_ = -1;   ///< where a window that continues the last committed one starts (-1: none yet)
     int32_t last_tokens_[8] = {};
     int64_t n_vocab_ = 0;
     cudaStream_t cs_ = nullptr;

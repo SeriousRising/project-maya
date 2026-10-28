@@ -4,9 +4,12 @@ each one runs with, and the engine settings the page changes in them.
 A config's settings, as the page shows them (None: the engine's own default, or "auto"):
   both:      context, images, gpus, reserve_mib, env
   GLM:       parallel, draft ("mtp" | "dflash2"), expert_cache, prefill, kv_streaming, kv_resident
-  DeepSeek:  draft ("dspark" | "none"), tp, mmap ("auto" | "on" | "off"), prefill_chunk, cpu_threads
-  MiniMax:   draft ("dspark" | "none"), tp (0: the layers split, no groups), kv_cache, kv_streaming, kv_resident,
-             cpu_threads (maya-mm3 stops at a flag it does not know: only its own are written)
+  DeepSeek:  parallel, draft ("dspark" | "none"), tp, mmap ("auto" | "on" | "off"), prefill_chunk, cpu_threads
+  MiniMax:   parallel, draft ("dspark" | "none"), tp (0: the layers split, no groups), kv_cache, kv_streaming,
+             kv_resident, cpu_threads (maya-mm3 stops at a flag it does not know: only its own are written)
+  CYBER-FROST (the `maya` engine's Qwen path; its server always loads the MTP drafter - "none" is --mtp-max-t 1):
+             draft ("mtp" | "none"), expert_cache, prefill, kv ("fp16" | "int8" |
+             "k8v4" | "q4_0"), ram_gb (the experts' RAM tier, MAYA_EXPERT_RAM_GB); no images (text only)
 apply() writes them back into the config's "args", "env", "gpu" and "vision" - its other keys as they are."""
 from __future__ import annotations
 
@@ -26,6 +29,8 @@ SWITCH_FILE = ".maya-switch.json"           # the server's note to maya.py: star
 CONTEXTS = [8192, 32768, 65536, 131072]       # the setup's choices (a config's own size is offered too)
 DS4_CONTEXTS = [32768, 65536, 131072, 262144, 524288, 1048576]   # ... for DeepSeek (maya.py's DS4_CONTEXTS)
 MM3_CONTEXTS = DS4_CONTEXTS                                       # ... and MiniMax (maya.py's MM3_CONTEXTS)
+QWEN_CONTEXTS = [32768, 65536, 131072, 262144]                    # ... and CYBER-FROST (maya.py's QWEN_CONTEXTS)
+QWEN_KV = ("fp16", "int8", "k8v4", "q4_0")                        # the Qwen path's --kv
 MM3_KV = ("bf16", "int8", "fp8", "fp4")                           # maya-mm3 --kv-cache (one format for K and V)
 # files the setup's quant list (tools/maya_quants.py) does not name, by their config's installer key
 OTHER_QUANTS = {("deepseek", "abliterated"): "Mix-256G"}
@@ -37,9 +42,11 @@ MASK = "***"
 ENV_LOADER = re.compile(r"^(?:LD_\w*|DYLD_\w*|PYTHON\w*|PATH|PATHEXT|BASH_ENV|ENV|IFS|COMSPEC|SYSTEMROOT)$", re.I)
 GLM_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "parallel", "draft", "expert_cache", "prefill",
             "kv_streaming", "kv_resident")
-DS4_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "draft", "tp", "mmap", "prefill_chunk", "cpu_threads")
-MM3_KEYS = ("context", "images", "gpus", "env", "draft", "tp", "kv_cache", "kv_streaming", "kv_resident",
+DS4_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "parallel", "draft", "tp", "mmap", "prefill_chunk",
             "cpu_threads")
+MM3_KEYS = ("context", "images", "gpus", "env", "parallel", "draft", "tp", "kv_cache", "kv_streaming", "kv_resident",
+            "cpu_threads")
+QWEN_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "draft", "expert_cache", "prefill", "kv", "ram_gb")
 
 
 # ------------------------------------------------------------------ the engine's arguments
@@ -78,7 +85,7 @@ def _int(v, default=None):
 
 
 def family(cfg: dict) -> str:
-    """"minimax", "deepseek" or "glm" (maya_quants.family_of, as maya.py and the server read it)."""
+    """"minimax", "deepseek", "qwen" or "glm" (maya_quants.family_of, as maya.py and the server read it)."""
     return maya_quants.family_of(cfg)
 
 
@@ -134,6 +141,17 @@ def ds4_has_vision(cfg: dict) -> bool:
         return False
 
 
+def qwen_mtp(cfg: dict) -> Path | None:
+    """CYBER-FROST's MTP drafter: the one the config drafts with, else the one its setup built in the pack (<pack>/mtp,
+    tools/mtp_from_gguf.py), or None."""
+    p = flag(cfg.get("args") or [], "--mtp")
+    pack = pack_of(cfg)
+    for d in ([Path(p)] if p else []) + ([pack / "mtp"] if pack else []):
+        if (d / "dense.txt").is_file():
+            return d
+    return None
+
+
 def mm3_pack_has(cfg: dict, key: str) -> bool:
     """MiniMax's pack indexes `key` (mm3.txt: "dspark.num_hidden_layers" its drafter, "vision.hidden_size" its vision
     tower - maya.py's checks)."""
@@ -153,6 +171,8 @@ def choices(cfg: dict) -> dict:
     if family(cfg) == "deepseek":
         return {"draft": ["dspark", "none"] if ds4_has_drafter(cfg) else ["none"],
                 "images": ds4_has_vision(cfg) or "--vision" not in (cfg.get("args") or [])}
+    if family(cfg) == "qwen":                          # (text only: no vision tower)
+        return {"draft": ["mtp", "none"] if qwen_mtp(cfg) is not None else ["none"], "images": False}
     f = dflash_file(cfg)
     return {"draft": ["mtp", "dflash2"] if f is not None else ["mtp"],
             "images": bool(cfg.get("vision") or cfg.get("vision_off"))}
@@ -166,15 +186,24 @@ def settings_of(cfg: dict) -> dict:
     if family(cfg) == "minimax":                       # (maya-mm3's own defaults where the config names none)
         vision, kvs = flag(args, "--vision"), flag(args, "--kv-streaming")
         out.update(images=vision == "on" or (vision is None and mm3_pack_has(cfg, "vision.hidden_size")),
+                   parallel=_int(flag(args, "--parallel"), 1),
                    draft="dspark" if flag(args, "--dspark", "off") not in ("off", "none") else "none",
                    tp=_int(flag(args, "--tp"), 0), kv_cache=flag(args, "--kv-cache", "int8"),
                    kv_streaming=kvs == "on" or (kvs is None and _int(flag(args, "--kv-resident"), 0) > 0),
                    kv_resident=_int(flag(args, "--kv-resident")), cpu_threads=_int(flag(args, "--cpu-threads")))
         return out
+    if family(cfg) == "qwen":
+        ec, pf = flag(args, "--expert-cache", "auto"), flag(args, "--prefill", "auto")
+        ram = env.get("MAYA_EXPERT_RAM_GB")
+        out.update(images=False, reserve_mib=_int(flag(args, "--vram-reserve-mib")),
+                   draft="mtp" if flag(args, "--mtp") and flag(args, "--mtp-max-t") != "1" else "none",
+                   expert_cache=None if ec == "auto" else _int(ec), prefill=None if pf == "auto" else _int(pf),
+                   kv=flag(args, "--kv", "fp16"), ram_gb=_int(ram))
+        return out
     if family(cfg) == "deepseek":
         dspark = flag(args, "--dspark")
         out.update(images=flag(args, "--vision") != "off",
-                   reserve_mib=_int(flag(args, "--reserve-mib")),
+                   reserve_mib=_int(flag(args, "--reserve-mib")), parallel=_int(flag(args, "--parallel"), 1),
                    draft="none" if dspark == "none" or (dspark is None and not ds4_has_drafter(cfg)) else "dspark",
                    tp=_int(flag(args, "--tp"), 2), mmap=flag(args, "--mmap-experts", "auto"),   # (2: the engine's own)
                    prefill_chunk=_int(flag(args, "--prefill-chunk")), cpu_threads=_int(flag(args, "--cpu-threads")))
@@ -221,7 +250,7 @@ def apply(cfg: dict, settings: dict) -> dict:
         raise ValueError("the settings must be a JSON object")
     fam = family(cfg)
     ds4 = fam == "deepseek"
-    known = {"minimax": MM3_KEYS, "deepseek": DS4_KEYS}.get(fam, GLM_KEYS)
+    known = {"minimax": MM3_KEYS, "deepseek": DS4_KEYS, "qwen": QWEN_KEYS}.get(fam, GLM_KEYS)
     unknown = sorted(set(settings) - set(known))
     if unknown:
         raise ValueError(f"not a setting of this model: {', '.join(unknown)}")
@@ -260,7 +289,40 @@ def apply(cfg: dict, settings: dict) -> dict:
         out.pop("env", None)
 
     reserve = _num(s, "reserve_mib", 0, 65536, "VRAM kept free") if fam != "minimax" else None
-    if fam == "minimax":
+    if fam == "qwen":
+        if s.get("draft") not in can["draft"]:
+            raise ValueError("Drafting: this pack has no MTP drafter (the setup builds it)" if s.get("draft") == "mtp"
+                             else "Drafting: MTP or none")
+        if qwen_mtp(cfg) is not None:   # (loaded either way - the server needs it; "none" keeps its drafts off)
+            args = set_flag(args, "--mtp", qwen_mtp(cfg))
+        args = drop_flag(args, "--mtp-max-t") if s["draft"] == "mtp" else set_flag(args, "--mtp-max-t", 1)
+        if s.get("images"):
+            raise ValueError("Images: this model has no vision tower (text only)")
+        args = set_flag(args, "--vram-reserve-mib", reserve) if reserve is not None else \
+            drop_flag(args, "--vram-reserve-mib")
+        ec = _num(s, "expert_cache", 1, 1000000, "Expert cache")
+        args = set_flag(args, "--expert-cache", "auto" if ec is None else ec)
+        pf = _num(s, "prefill", 64, 65536, "Prompt chunk")
+        args = set_flag(args, "--prefill", "auto" if pf is None else pf)
+        kv = str(s.get("kv") or "fp16")
+        if kv not in QWEN_KV:
+            raise ValueError("KV cache: " + ", ".join(f.upper() for f in QWEN_KV))
+        args = set_flag(args, "--kv", kv) if kv != "fp16" or "--kv" in args else args
+        ram = _num(s, "ram_gb", 0, 4096, "Experts in RAM (GB)")
+        env2 = dict(out.get("env") or {})
+        if ram is None:
+            env2.pop("MAYA_EXPERT_RAM_GB", None)
+        else:
+            env2["MAYA_EXPERT_RAM_GB"] = str(ram)
+        if env2:
+            out["env"] = env2
+        else:
+            out.pop("env", None)
+    elif fam == "minimax":
+        # (maya-mm3 --parallel: n conversations at once - each its own KV cache in VRAM, so no KV streaming and no DSpark
+        #  while it is above 1; those two settings stay as chosen for the day it is 1 again; written where it changes)
+        par = _num(s, "parallel", 1, 8, "Answers at once", none_ok=False)
+        args = set_flag(args, "--parallel", par) if par > 1 or "--parallel" in args else args
         if s.get("draft") not in can["draft"]:
             raise ValueError("Drafting: this pack has no DSpark drafter" if s.get("draft") == "dspark"
                              else "Drafting: DSpark or none")
@@ -286,6 +348,9 @@ def apply(cfg: dict, settings: dict) -> dict:
         ct = _num(s, "cpu_threads", 1, 512, "CPU threads")
         args = set_flag(args, "--cpu-threads", ct) if ct is not None else drop_flag(args, "--cpu-threads")
     elif ds4:
+        # (maya-ds4 --parallel: n conversations at once - each its own context's caches in VRAM; written where it changes)
+        par = _num(s, "parallel", 1, 8, "Answers at once", none_ok=False)
+        args = set_flag(args, "--parallel", par) if par > 1 or "--parallel" in args else args
         if s.get("draft") not in can["draft"]:
             raise ValueError("Drafting: this pack has no DSpark drafter" if s.get("draft") == "dspark"
                              else "Drafting: DSpark or none")
@@ -440,7 +505,8 @@ def describe(path: Path, running: str | None) -> dict:
             "port": cfg.get("port"), "script": script, "folder": str(pack.parent) if pack else None,
             "size": folder_size(pack), "ok": why is None, "missing": why,
             "settings": cur, "setup": setup, "choices": choices(cfg), "command": command(cfg),
-            "contexts": {"deepseek": DS4_CONTEXTS, "minimax": MM3_CONTEXTS}.get(family(cfg), CONTEXTS)}
+            "contexts": {"deepseek": DS4_CONTEXTS, "minimax": MM3_CONTEXTS, "qwen": QWEN_CONTEXTS}.get(family(cfg),
+                                                                                                       CONTEXTS)}
 
 
 _gpu_cache: dict = {}
@@ -474,6 +540,24 @@ def listing(root: Path, running: str | None) -> dict:
                 seen.add(i)
                 gpus.append({"index": i, "name": None, "vram_gb": None})
     return {"models": models, "gpus": sorted(gpus, key=lambda g: g["index"]), "contexts": CONTEXTS}
+
+
+def own_defaults(path: Path) -> bool:
+    """A switch to the config at `path` (the Models page): its model's own sampling and thinking level
+    (maya_quants.MODEL_DEFAULTS, as the setup writes them) written into it where they differ - a config from an older
+    setup, or with another model's values - the one before kept beside it (<config>.prev).  True when it changed."""
+    cfg = read(path)
+    if not cfg:
+        return False
+    sampling, effort = maya_quants.model_defaults(cfg)
+    if cfg.get("sampling") == sampling and cfg.get("reasoning_effort") == effort:
+        return False
+    p = Path(path)
+    p.with_name(p.name + ".prev").write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    st = p.stat()
+    write(p, {**cfg, "sampling": sampling, "reasoning_effort": effort})
+    os.utime(p, (st.st_atime, st.st_mtime))
+    return True
 
 
 def save(path: Path, settings: dict) -> dict:

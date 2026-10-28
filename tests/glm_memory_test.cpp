@@ -56,6 +56,24 @@ int main() {
     assert(complete_pool_slots(40 * G, 308 * M, 288, 3, 18) == 0);
     assert(complete_pool_slots(158 * G, 0, 288, 3, 18) == 0);
     assert(complete_pool_slots(158 * G, 308 * M, 288, 3, -5) == 291);
+    // #474: the complete pool is asked for on every GPU (the budget above decides); the setting wins either way
+    {
+        using strata::core::glmfast::complete_pool_on;
+        const auto set = [](const char* v) {
+#if defined(_WIN32)
+            _putenv_s("STRATA_GLM_COMPLETE_POOL", v ? v : "");
+#else
+            if (v) setenv("STRATA_GLM_COMPLETE_POOL", v, 1); else unsetenv("STRATA_GLM_COMPLETE_POOL");
+#endif
+        };
+        set(nullptr);
+        assert(complete_pool_on());
+        set("0");
+        assert(!complete_pool_on());
+        set("1");
+        assert(complete_pool_on());
+        set(nullptr);
+    }
     // The pool's reserve: 700 MiB, except where it leaves the pool short of its floor (here 2 GiB) - an automatic budget
     // then lowers it to leave exactly the floor, never below 300 MiB; one set by hand or a fixed budget keeps it
     using strata::core::glmfast::pool_reserve;

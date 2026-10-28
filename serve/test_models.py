@@ -41,7 +41,7 @@ def glm_cfg(d: Path, name="maya-maya-m.json", **extra) -> Path:
     return p
 
 
-def ds4_cfg(d: Path, name="maya-gguf-q8.json", drafter=True, vision=False) -> Path:
+def ds4_cfg(d: Path, name="maya-gguf-q8.json", drafter=True, vision=False, quant="gguf-q8") -> Path:
     pack = d / "DeepSeek-V4.1-Flash" / "pack"
     pack.mkdir(parents=True, exist_ok=True)
     (pack / "tensors.txt").write_text("t blk.0.x\n" + ("t mtp.0.w\n" if drafter else ""))
@@ -50,7 +50,7 @@ def ds4_cfg(d: Path, name="maya-gguf-q8.json", drafter=True, vision=False) -> Pa
     if drafter:
         args += ["--dspark", "on"]
     cfg = {"exe": "/b/maya-ds4", "args": args, "model_name": "deepseek-v4.1-flash", "gpu": [0, 1],
-           "installer": {"family": "deepseek", "ds4_quant": "gguf-q8", "written": "2026-10-09 10:00"}}
+           "installer": {"family": "deepseek", "ds4_quant": quant, "written": "2026-10-09 10:00"}}
     p = d / name
     p.write_text(json.dumps(cfg, indent=1))
     return p
@@ -163,6 +163,19 @@ class Settings(unittest.TestCase):
             M.apply(cfg, {"images": True})
         self.assertEqual(M.choices(M.read(ds4_cfg(self.d, "maya-x.json", drafter=False)))["draft"], ["none"])
 
+    def test_deepseek_answers_at_once(self):
+        """maya-ds4 --parallel: read (1 where the config names none), written where it changes, 1-8."""
+        cfg = M.read(ds4_cfg(self.d))
+        self.assertEqual(M.settings_of(cfg)["parallel"], 1)
+        self.assertNotIn("--parallel", M.apply(cfg, {"cpu_threads": 8})["args"])   # (an older config: as it was)
+        new = M.apply(cfg, {"parallel": 4})
+        self.assertEqual(M.flag(new["args"], "--parallel"), "4")
+        self.assertEqual(M.settings_of(new)["parallel"], 4)
+        self.assertEqual(M.flag(M.apply(new, {"parallel": 1})["args"], "--parallel"), "1")
+        for bad in (0, 9):
+            with self.assertRaisesRegex(ValueError, "Answers at once"):
+                M.apply(cfg, {"parallel": bad})
+
     def test_deepseek_tensor_parallel_beyond_two(self):
         # a 9-GPU config the calibration left at --tp 8: read as it is, and its other settings still save
         cfg = M.read(ds4_cfg(self.d))
@@ -187,8 +200,8 @@ class Settings(unittest.TestCase):
         self.assertEqual(M.family(cfg), "minimax")
         self.assertEqual(M.family({"exe": "/b/maya-mm3", "args": ["--pack", "/p"]}), "minimax")   # (no installer)
         self.assertEqual(M.settings_of(cfg), {"context": 65536, "gpus": list(range(9)), "env": {}, "images": True,
-                                              "draft": "none", "tp": 4, "kv_cache": "int8", "kv_streaming": True,
-                                              "kv_resident": None, "cpu_threads": None})
+                                              "parallel": 1, "draft": "none", "tp": 4, "kv_cache": "int8",
+                                              "kv_streaming": True, "kv_resident": None, "cpu_threads": None})
         self.assertEqual(M.choices(cfg), {"draft": ["dspark", "none"], "images": True})
         new = M.apply(cfg, {"context": 262144, "draft": "dspark", "images": False, "tp": 2, "kv_cache": "fp8",
                             "kv_resident": 65536, "cpu_threads": 24})
@@ -198,8 +211,9 @@ class Settings(unittest.TestCase):
                      ("--cpu-threads", "24")):
             self.assertEqual(M.flag(a, f), v, f)
         # maya-mm3 stops at a flag it does not know: none of DeepSeek's or GLM's are written
-        for f in ("--mmap-experts", "--prefill-chunk", "--reserve-mib", "--vram-reserve-mib", "--parallel", "--prefill"):
+        for f in ("--mmap-experts", "--prefill-chunk", "--reserve-mib", "--vram-reserve-mib", "--prefill"):
             self.assertNotIn(f, a)
+        self.assertNotIn("--parallel", a)                                       # (1 and not in the config: as it was)
         with self.assertRaisesRegex(ValueError, "not a setting of this model: mmap"):
             M.apply(cfg, {"mmap": "on"})
         # tp 0: the layers split (no --tp); 3 is not a group the engine takes
@@ -218,6 +232,22 @@ class Settings(unittest.TestCase):
             M.apply(bare, {"draft": "dspark"})
         self.assertEqual(M.quant_label(cfg, Path("maya-mm3.json")), "EXL3 3.5 bpw")
 
+    def test_minimax_answers_at_once(self):
+        """maya-mm3 --parallel: read (1 where the config names none), written where it changes, 1-8; the KV streaming and
+        DSpark choices stay as they are for the day it is 1 again (the engine leaves both out while it is above 1)."""
+        cfg = M.read(mm3_cfg(self.d))
+        self.assertEqual(M.settings_of(cfg)["parallel"], 1)
+        self.assertNotIn("--parallel", M.apply(cfg, {"cpu_threads": 8})["args"])   # (an older config: as it was)
+        new = M.apply(cfg, {"parallel": 4, "draft": "dspark"})
+        self.assertEqual(M.flag(new["args"], "--parallel"), "4")
+        self.assertEqual((M.flag(new["args"], "--kv-streaming"), M.flag(new["args"], "--dspark")), ("on", "on"))
+        s = M.settings_of(new)
+        self.assertEqual((s["parallel"], s["kv_streaming"], s["draft"]), (4, True, "dspark"))
+        self.assertEqual(M.flag(M.apply(new, {"parallel": 1})["args"], "--parallel"), "1")
+        for bad in (0, 9):
+            with self.assertRaisesRegex(ValueError, "Answers at once"):
+                M.apply(cfg, {"parallel": bad})
+
     def test_listing(self):
         g, ds = glm_cfg(self.d), ds4_cfg(self.d)
         (self.d / "maya-maya-m.shared-settings.json").write_text("{}")
@@ -231,6 +261,32 @@ class Settings(unittest.TestCase):
         # each model's context choices are its setup's: DeepSeek's reach 1M, GLM's 128K (its own size is offered too)
         self.assertEqual((out["models"][0]["contexts"], mm["contexts"]), (M.DS4_CONTEXTS, M.CONTEXTS))
         self.assertEqual([x["index"] for x in out["gpus"]], [0, 1])               # (GPU 1: named by a config only)
+
+
+    def test_installs_the_setup_no_longer_lists_are_still_listed(self):
+        """v1.1.34: unsloth's UD-Q4_K_XL (gguf-q4) and GLM's EXL3-sc_4.10bpw are out of the setup's pickers; a config of
+        either is listed, shown and settable on the Models page as before."""
+        g = glm_cfg(self.d, name="maya-exl3-sc_4.10bpw.json",
+                    installer={"models_dir": str(self.d), "quant": "EXL3-sc_4.10bpw", "written": "2026-10-20 09:00"})
+        ds = ds4_cfg(self.d, name="maya-gguf-q4.json", quant="gguf-q4")
+        with mock.patch.object(M, "machine_gpus", return_value=[]):
+            out = M.listing(self.d, None)
+        by = {m["file"]: m for m in out["models"]}
+        self.assertEqual(by[ds.name]["quant"], "UD-Q4_K_XL")
+        self.assertEqual(by[g.name]["quant"], "EXL3-sc_4.10bpw")
+        self.assertTrue(by[ds.name]["ok"] and by[g.name]["ok"])
+        cfg = M.read(ds)
+        self.assertEqual(M.settings_of(cfg)["context"], 65536)
+        self.assertEqual(M.apply(cfg, {"context": 131072})["args"][cfg["args"].index("--max-context") + 1], "131072")
+        self.assertEqual(M.maya_quants.config_label(cfg), "DeepSeek V4.1 · UD-Q4_K_XL")
+
+    def test_the_qwen_models_label(self):
+        """The CYBER-FROST config's quant shows as Q5_K_M beside the model's name the page writes from model_name; the
+        label the server reports is "Qwen-3.8-Flash-Next (CYBER-FROST) · Q5_K_M"."""
+        cfg = {"exe": "/b/maya", "args": ["--pack", "/p", "--ple-gguf", "/g.gguf"], "model_name": "cyber-frost-3.8-ps",
+               "installer": {"family": "qwen", "quant": "CYBER-FROST-3.8-PS", "qwen_quant": "q5_k_m"}}
+        self.assertEqual(M.quant_label(cfg, Path("maya-cyber-frost.json")), "Q5_K_M")
+        self.assertEqual(M.maya_quants.config_label(cfg), "Qwen-3.8-Flash-Next (CYBER-FROST) · Q5_K_M")
 
 
 class Page(unittest.TestCase):
@@ -352,6 +408,20 @@ class Page(unittest.TestCase):
         self.assertEqual(json.loads((self.d / M.SWITCH_FILE).read_text())["why"], "switch")
         s, b = self.req("POST", "/api/models/switch", {"file": self.other.name})
         self.assertEqual(s, 400)                                              # (already starting again)
+
+    def test_switch_writes_the_models_own_defaults(self):
+        """A switch to a config without its model's sampling and level (an older setup's), or with another model's,
+        writes the model's own into it (the setup's MODEL_DEFAULTS), the config before kept beside it."""
+        cfg = json.loads(self.other.read_text())                             # (DeepSeek's)
+        cfg.pop("reasoning_effort", None)
+        cfg["sampling"] = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}      # (not DeepSeek's)
+        self.other.write_text(json.dumps(cfg))
+        s, b = self.req("POST", "/api/models/switch", {"file": self.other.name})
+        self.assertEqual(s, 202, b)
+        got = json.loads(self.other.read_text())
+        self.assertEqual((got["sampling"], got["reasoning_effort"]), ({"temperature": 1.0, "top_p": 1.0}, "high"))
+        self.assertTrue((self.d / (self.other.name + ".prev")).exists())
+        self.assertFalse(M.own_defaults(self.other))                         # (its own already: nothing written)
 
     def test_refused(self):
         for f in (self.cfg.name, "../maya-x.json", "maya-none.json", "maya-maya-m.shared-settings.json", None):

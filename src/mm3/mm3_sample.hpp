@@ -28,6 +28,7 @@ struct Req {
     float conf = -1.0f;     // dspark_conf=F: the drafts' confidence floor for this request (-1: the engine's)
     std::string file;       // GENI: the pictures
     std::vector<int> ids;
+    int rid = -1;           // rid=N: the request's id (--parallel: every line it causes carries it)
 };
 
 inline bool penalised(const Req& r) {

@@ -48,6 +48,36 @@ def args(**kw):
     return SimpleNamespace(**base)
 
 
+class ModelDefaults(unittest.TestCase):
+    """Each model's own sampling and thinking level, from its developer (MODEL_DEFAULTS): what the setup writes for
+    every quant of it, the dashboard's switch writes, and a config without them runs with."""
+
+    def test_the_published_values(self):
+        self.assertEqual(Q.MODEL_DEFAULTS["glm"], ({"temperature": 1.0, "top_p": 0.95}, "max"))
+        self.assertEqual(Q.MODEL_DEFAULTS["deepseek"], ({"temperature": 1.0, "top_p": 1.0}, "high"))
+        self.assertEqual(Q.MODEL_DEFAULTS["minimax"], ({"temperature": 1.0, "top_p": 0.95}, "auto"))
+        self.assertEqual(Q.MODEL_DEFAULTS["qwen"], ({"temperature": 1.0, "top_p": 0.95, "top_k": 20}, "xhigh"))
+        self.assertEqual((maya.QWEN_SAMPLING, maya.QWEN_EFFORT), Q.MODEL_DEFAULTS["qwen"])
+        self.assertEqual(Q.model_defaults({"exe": "/b/maya", "args": ["--pack", "/p", "--ple-gguf", "/g"]}),
+                         ({"temperature": 1.0, "top_p": 0.95, "top_k": 20}, "xhigh"))
+
+    def test_the_setup_writes_them(self):
+        self.assertEqual((maya.SAMPLING, maya.EFFORT), Q.MODEL_DEFAULTS["glm"])
+        self.assertEqual((maya.DS4_SAMPLING, maya.DS4_EFFORT), Q.MODEL_DEFAULTS["deepseek"])
+        self.assertEqual((maya.MM3_SAMPLING, maya.MM3_EFFORT), Q.MODEL_DEFAULTS["minimax"])
+
+    def test_by_the_configs_model(self):
+        for cfg, fam in (({"exe": "/b/maya", "args": ["--glm-pack", "/p"]}, "glm"),
+                         ({"exe": "/b/maya-ds4", "args": ["--pack", "/p"]}, "deepseek"),
+                         ({"exe": "/b/maya-ds4", "args": ["--pack", "/p"], "installer": {"ds4_quant": "abliterated-128g"}},
+                          "deepseek"),
+                         ({"exe": "/b/maya-mm3", "args": ["--pack", "/p"]}, "minimax")):
+            s, e = Q.model_defaults(cfg)
+            self.assertEqual((s, e), Q.MODEL_DEFAULTS[fam], fam)
+            s["temperature"] = 0                                           # (a copy: the table stays)
+            self.assertNotEqual(Q.MODEL_DEFAULTS[fam][0]["temperature"], 0)
+
+
 class Aliases(unittest.TestCase):
     def test_setup_ids(self):
         for i, (family, key, shown) in IDS.items():

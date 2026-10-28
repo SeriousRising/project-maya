@@ -34,6 +34,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <fstream>
 #include <mutex>
 #include <random>
@@ -46,13 +47,16 @@
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 
+#include "mm3_cands.hpp"
 #include "mm3_cpu.hpp"
 #include "mm3_env.hpp"
 #include "mm3_kernels.cuh"
+#include "mm3_lane_plan.hpp"
 #include "mm3_model.hpp"
 #include "mm3_os.hpp"
 #include "mm3_pack.hpp"
 #include "mm3_sample.hpp"
+#include "mm3_slots.hpp"
 #include "mm3_vision.hpp"
 #if defined(_WIN32)
 #include <timeapi.h>
@@ -195,6 +199,29 @@ struct Lines {
     bool eof = false;
     std::atomic<bool> stop{false};
     std::atomic<bool> wrap{false};   // (WRAP: the server is stopping - a request still thinking closes it and answers)
+    std::vector<int> stops;          // (--parallel: STOP <rid> - that request alone; under mu)
+    bool stopped(int rid) {          // (the request's STOP <rid> taken, if one came)
+        std::lock_guard<std::mutex> lk(mu);
+        const auto it = std::find(stops.begin(), stops.end(), rid);
+        if (it == stops.end()) return false;
+        stops.erase(it);
+        return true;
+    }
+    void forget(int rid) {
+        std::lock_guard<std::mutex> lk(mu);
+        stops.erase(std::remove(stops.begin(), stops.end(), rid), stops.end());
+    }
+    bool try_next(std::string& out) {   // (a line if one is waiting, without waiting)
+        std::lock_guard<std::mutex> lk(mu);
+        if (q.empty()) return false;
+        out = std::move(q.front());
+        q.pop_front();
+        return true;
+    }
+    bool ended() {
+        std::lock_guard<std::mutex> lk(mu);
+        return eof && q.empty();
+    }
     void start() {
         std::thread([this] {
             std::string buf;
@@ -213,6 +240,13 @@ struct Lines {
                     }
                     if (l == "WRAP") {
                         wrap.store(true);
+                        continue;
+                    }
+                    if (l.rfind("STOP ", 0) == 0) {   // (--parallel: one request's)
+                        const int rid = std::atoi(l.c_str() + 5);
+                        std::lock_guard<std::mutex> lk(mu);
+                        if (stops.size() >= 256) stops.erase(stops.begin());   // (stale ones: requests already ended)
+                        if (rid >= 0) stops.push_back(rid);
                         continue;
                     }
                     std::lock_guard<std::mutex> lk(mu);
@@ -263,13 +297,14 @@ bool parse_gen(const std::string& line, Req& r) {
         else if (k == "think_end") r.think_end = std::atoi(v.c_str());
         else if (k == "spec") r.spec = std::atoi(v.c_str()) != 0;
         else if (k == "dspark_conf" || k == "spec_min_p") r.conf = std::strtof(v.c_str(), nullptr);
+        else if (k == "rid") r.rid = std::atoi(v.c_str());
         // (keys this engine does not use are taken and ignored)
     }
     return !r.ids.empty();
 }
 
-int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, float conf_floor, float draft_cost,
-          const std::string& kv_fmt, const std::string& profile_out) {
+// --serve's first lines: the load's notes, the Monitor's GPU map, the INFO facts (READY follows)
+void serve_header(mm3::Model& m, bool spec_on, const std::string& kv_fmt) {
     for (const std::string& l : m.info_lines()) std::printf("NOTE %s\n", l.c_str());
     for (const std::string& l : m.vram_lines()) std::printf("%s\n", l.c_str());   // (the Monitor's GPU map)
     const auto& st0 = m.stats();
@@ -284,6 +319,11 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
         std::printf("INFO vision=mm3 image_token=%d image_start=%d image_end=%d vision_patch=%d vision_merge=%d "
                     "vision_max_pixels=%d vision_min_pixels=%d\n", vg->image_token, vg->image_start, vg->image_end,
                     vg->patch, vg->merge, vg->max_pixels, vg->min_pixels);
+}
+
+int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, float conf_floor, float draft_cost,
+          const std::string& kv_fmt, const std::string& profile_out) {
+    serve_header(m, spec_on, kv_fmt);
     std::printf("READY %d stop\n", m.max_ctx());
     std::fflush(stdout);
     std::fprintf(stderr, "maya mm3 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <file> <ids>; STOP, QUIT\n");
@@ -413,7 +453,10 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
             std::fflush(stdout);
             continue;
         }
-        std::mt19937_64 rng(r.seed ^ (0x9E3779B97F4A7C15ull * ++counter));
+        // (a request's own seed alone: the same seed, the same answer - mixed with the request count it was not
+        //  reproducible; without one each request still gets a stream of its own)
+        ++counter;
+        std::mt19937_64 rng(r.seed != 0 ? r.seed : 0x9E3779B97F4A7C15ull * counter);
         const auto s_dec = m.stats();
         long long produced = 0;
         const char* finish = "length";
@@ -608,6 +651,547 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
     return 0;
 }
 
+// --serve with --parallel N (N > 1): several conversations at once, as the GLM engine runs them (serve/server.py's
+// multi protocol).  READY ... multi=<n>; GEN / GENI lines carry rid=<id> and every line a request causes carries it
+// after its keyword (T <rid> <id>, PP <rid> ..., DONE <rid> ..., ERR <rid> ...); STOP <rid> ends one request, STOP
+// alone all of them.  A request takes one of the n sequences (a KV cache each): the idle one whose tokens its prompt
+// extends the most (only the rest is read), else the least recently used.  A prompt is read in chunks with a decode
+// step of the running requests between two (not a prompt with pictures: the chunks' rows are its pictures'); the
+// running requests decode together, a token each a step (Model::forward_rows; a request alone: the token path) -
+// greedy, each request's tokens are its tokens alone (the CPU lane's experts aside: their last bits differ from the
+// GPU's, and which experts the CPU lane takes depends on what runs beside).  No DSpark drafting.
+int serve_multi(mm3::Model& m, const std::vector<int>& eos, int chunk, const std::string& kv_fmt,
+                const std::string& profile_out) {
+    const int N = m.seqs();
+    serve_header(m, false, kv_fmt);
+    std::printf("READY %d stop multi=%d\n", m.max_ctx(), N);
+    std::fflush(stdout);
+    std::fprintf(stderr, "maya mm3 serve: %d conversations at once (--parallel); GEN <max_new> [keys] rid=<id> <ids>; "
+                         "STOP <rid>, STOP, QUIT\n", N);
+#if defined(SIGPIPE)
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
+    Lines in;
+    in.start();
+    struct Held {
+        long long start;
+        uint64_t hash;
+    };
+    struct Seq {
+        std::vector<int> state;   // the tokens in its cache, positions 0 ..
+        std::vector<Held> held;   // the pictures in its cache
+        bool busy = false;
+        unsigned long long used = 0;
+    };
+    std::vector<Seq> seqs((size_t) N);
+    unsigned long long clock = 0, counter = 0;
+    struct Gen {
+        int rid = -1, seq = 0;
+        Req r;
+        std::mt19937_64 rng;
+        long long produced = 0;
+        const char* finish = "length";
+        bool in_think = false, done = false, use_c = false;
+        bool shown = false;        // (tok written, not read yet)
+        bool flight = false;       // (tok in the pipeline)
+        int tok = -1;              // the next token: written at the next step, then read
+        size_t from = 0;
+        double t0 = 0, t1 = 0;
+        long prof0 = 0, cpu0 = 0;  // (the engine's routings / CPU lane experts when its decode began)
+        mm3::Cands cd;
+    };
+    std::vector<std::unique_ptr<Gen>> run;
+    std::deque<std::string> waiting;   // GEN lines no idle sequence could take yet
+    const bool full_env = std::getenv("MM3_FULL_LOGITS") != nullptr;
+    const int V = m.vocab();
+    std::vector<float> lg, lg1((size_t) V);
+    std::vector<std::pair<int, float>> top;
+    std::vector<float> ex;
+    // (the Monitor's STAT line: everything decoded since the engine was last idle)
+    unsigned long long multi_n = 0;
+    double busy_t0 = 0;
+    mm3::Stats busy_s0;
+    auto stat_line = [&]() {
+        const auto& s = m.stats();
+        const double ms = now() * 1e3 - busy_t0, n = (double) std::max(1ULL, multi_n);
+        const double xp = (double) (s.profiled - busy_s0.profiled), cx = (double) (s.cpu_experts - busy_s0.cpu_experts);
+        std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f cpu=%.3f vram_used=%ld ram_used=%ld vram_gb=%.2f "
+                    "ram_gb=%.2f %s=%.3f %s=0 promo=%.3f active=%zu\n",
+                    ms > 0 ? 1000.0 * (double) multi_n / ms : 0.0, ms / n, xp > 0 ? 1.0 - cx / xp : 1.0, cx / n,
+                    s.resident, s.pooled, s.vram_gb, s.pinned_gb, s.pooled ? "ram_fetch" : "disk", cx / n,
+                    s.pooled ? "disk" : "ram_fetch", (double) (s.promoted - busy_s0.promoted) / n, run.size());
+    };
+    auto release = [&](int s) {
+        seqs[(size_t) s].busy = false;
+        seqs[(size_t) s].used = ++clock;
+    };
+    // a request's end: its DONE line (the engine's counters over its decode are shared with the others meanwhile)
+    auto finish = [&](Gen& g) {
+        const double t2 = now() * 1e3;
+        const auto& se = m.stats();
+        const long long look = se.profiled - g.prof0, cpu = se.cpu_experts - g.cpu0;
+        std::printf("DONE %d %lld %zu %.1f %.1f %s 0 0 %zu %lld %lld\n", g.rid, g.produced, g.r.ids.size(), g.t1 - g.t0,
+                    t2 - g.t1, g.finish, g.from, look - cpu, look);
+        std::fprintf(stderr,
+                     "maya mm3 serve: request %d (sequence %d): prompt %zu tokens = %zu reused + %zu read in %.0f ms, "
+                     "%lld generated in %.0f ms (%.2f tok/s, %zu running) - %s\n",
+                     g.rid, g.seq, g.r.ids.size(), g.from, g.r.ids.size() - g.from, g.t1 - g.t0, g.produced, t2 - g.t1,
+                     t2 > g.t1 ? 1000.0 * (double) g.produced / (t2 - g.t1) : 0.0, run.size(), g.finish);
+        release(g.seq);
+        in.forget(g.rid);
+        g.done = true;
+    };
+    auto emit = [&](Gen& g, int t) -> bool {
+        std::printf("T %d %d\n", g.rid, t);
+        ++g.produced;
+        ++multi_n;
+        if (g.in_think && t == g.r.think_end) g.in_think = false;
+        if (multi_n % 8 == 0) stat_line();
+        for (int e : eos)
+            if (t == e) {
+                g.finish = "stop";
+                return false;
+            }
+        return g.produced < g.r.max_new && (int) seqs[(size_t) g.seq].state.size() < m.max_ctx();
+    };
+    auto sweep = [&]() {
+        run.erase(std::remove_if(run.begin(), run.end(), [](const std::unique_ptr<Gen>& p) { return p->done; }),
+                  run.end());
+        if (!run.empty()) return;
+        in.stop.store(false);   // (a STOP for all: every request it found has ended)
+        if (!profile_out.empty()) {   // (this PC's routing learned: the next start places its experts by it)
+            std::string perr;
+            const std::string tmp = profile_out + ".tmp";
+            if (!m.save_profile(tmp, perr) || !strata::ds4::os::replace_file(tmp, profile_out))
+                std::fprintf(stderr, "mm3: the expert profile %s not saved %s\n", profile_out.c_str(), perr.c_str());
+        }
+    };
+    // the tokens drawn and not written yet: written (T lines); a request that ends there finishes
+    auto show = [&]() {
+        for (auto& gp : run) {
+            Gen& g = *gp;
+            if (g.done || g.flight || g.shown) continue;
+            if (in.stop.load() || in.stopped(g.rid)) {
+                g.finish = "cancel";
+                finish(g);
+                continue;
+            }
+            if (g.in_think && (g.produced >= g.r.think_budget || in.wrap.load()) && g.tok != g.r.think_end)
+                g.tok = g.r.think_end;   // (the budget, or WRAP)
+            if (!emit(g, g.tok)) {
+                finish(g);
+                continue;
+            }
+            g.shown = true;
+        }
+        std::fflush(stdout);
+    };
+    // the requests whose written token is to be read
+    auto ready = [&]() {
+        std::vector<Gen*> v;
+        for (auto& gp : run)
+            if (!gp->done && !gp->flight && gp->shown) v.push_back(gp.get());
+        return v;
+    };
+    // rows' tokens, sequences, positions, and each one's candidates (the penalised ids of the history with its token)
+    auto rows_of = [&](const std::vector<Gen*>& rows, std::vector<int>& ids, std::vector<int>& sq, std::vector<int>& ps) {
+        ids.clear();
+        sq.clear();
+        ps.clear();
+        for (Gen* gp : rows) {
+            Gen& g = *gp;
+            const std::vector<int>& st = seqs[(size_t) g.seq].state;
+            ids.push_back(g.tok);
+            sq.push_back(g.seq);
+            ps.push_back((int) st.size());
+            g.use_c = !full_env && cands_for(g.r, st, std::vector<int>(1, g.tok), g.cd);
+        }
+    };
+    // a request's token read, its logits back: the next token drawn
+    auto took = [&](Gen& g, const float* row) {
+        std::vector<int>& st = seqs[(size_t) g.seq].state;
+        st.push_back(g.tok);
+        if (g.use_c) {   // (as Model::forward_cands on the layer split: the row's candidates on the host)
+            mm3::host_cands(row, V, g.cd.kc, g.cd.extra, top, ex);
+            g.tok = draw(dist_c(top, g.cd.extra, ex, g.r, st), g.rng);
+        } else {
+            g.tok = draw(dist(row, V, g.r, st), g.rng);
+        }
+        g.shown = false;
+        g.flight = false;
+    };
+    auto failed = [&](Gen& g, const std::string& err) {   // (its cache may hold part of the step: read again)
+        std::printf("ERR %d %s\n", g.rid, err.c_str());
+        seqs[(size_t) g.seq].state.clear();
+        seqs[(size_t) g.seq].held.clear();
+        g.flight = false;
+        g.finish = "cancel";
+        finish(g);
+    };
+    // a decode step: the written tokens of every request going on read together (Model::forward_rows)
+    std::vector<int> ids_, sq_, ps_;
+    auto feed = [&](const std::vector<Gen*>& rows) {
+        if (rows.empty()) return;
+        rows_of(rows, ids_, sq_, ps_);
+        lg.resize(rows.size() * (size_t) V);
+        std::string err;
+        if (!m.forward_rows(ids_.data(), sq_.data(), ps_.data(), (int) rows.size(), lg.data(), err)) {
+            std::fprintf(stderr, "mm3: %s\n", err.c_str());
+            for (Gen* gp : rows) failed(*gp, err);
+        } else {
+            for (size_t i = 0; i < rows.size(); ++i) took(*rows[i], lg.data() + i * (size_t) V);
+        }
+        std::fflush(stdout);
+    };
+    auto step = [&]() {
+        show();
+        feed(ready());
+        sweep();
+    };
+    // a layer split's pipeline (Model::pipe_tick; MAYA_MM3_PIPE=0: off - the requests read together instead): each
+    // tick a group of the ready requests enters the first GPU - about 1 / stages of all the requests, so the GPUs each
+    // hold one - and the groups past the last GPU draw their next tokens
+    const int stages = mm3::env("MM3_PIPE") && std::atoi(mm3::env("MM3_PIPE")) == 0 ? 1 : m.pipe_stages();
+    std::map<int, std::vector<Gen*>> groups;
+    int ptag = 0;
+    auto pipe_fail = [&](const std::string& err, std::vector<Gen*> also) {
+        std::fprintf(stderr, "mm3: %s\n", err.c_str());
+        for (auto& kv : groups) also.insert(also.end(), kv.second.begin(), kv.second.end());
+        groups.clear();
+        m.pipe_drop();
+        for (Gen* gp : also)
+            if (!gp->done) failed(*gp, err);
+    };
+    auto tick = [&](const std::vector<Gen*>& group) {
+        std::string err;
+        int tag = -1;
+        if (!group.empty()) {
+            rows_of(group, ids_, sq_, ps_);
+            tag = ++ptag;
+            groups[tag] = group;
+            for (Gen* gp : group) gp->flight = true;
+        }
+        if (!m.pipe_tick(ids_.data(), sq_.data(), ps_.data(), (int) group.size(), tag, err)) {
+            pipe_fail(err, {});
+            return;
+        }
+        std::vector<float> lgp;
+        while (m.pipe_take(tag, lgp)) {
+            auto it = groups.find(tag);
+            if (it == groups.end()) continue;
+            for (size_t i = 0; i < it->second.size(); ++i) took(*it->second[i], lgp.data() + i * (size_t) V);
+            groups.erase(it);
+        }
+    };
+    auto pipe_step = [&]() {
+        show();
+        std::vector<Gen*> rows = ready();
+        if (m.pipe_busy() == 0 && rows.size() <= 1) {   // (a request alone: the token path)
+            feed(rows);
+            sweep();
+            return;
+        }
+        const int free_ = std::max(1, stages - std::min(stages - 1, m.pipe_busy()));
+        size_t n = std::min<size_t>(rows.size(), (rows.size() + (size_t) free_ - 1) / (size_t) free_);
+        n = std::min<size_t>(n, 16);
+        rows.resize(n);
+        tick(rows);
+        std::fflush(stdout);
+        sweep();
+    };
+    auto drain = [&]() {   // (before a prompt's read: every group out of the pipeline)
+        while (m.pipe_busy() > 0) tick({});
+    };
+    auto idle_seq = [&]() {
+        for (const Seq& s : seqs)
+            if (!s.busy) return true;
+        return false;
+    };
+    // a GEN / GENI line: its sequence, its prompt read, its first token drawn - then it runs with the others
+    auto admit = [&](const std::string& line) {
+        Req r;
+        std::string err;
+        const bool geni = line.rfind("GENI ", 0) == 0;
+        const bool parsed = parse_gen(line, r) && !(geni && r.file.empty());
+        if (r.rid < 0) {
+            std::printf("ERR expected rid=<id> in each GEN line (this engine runs %d conversations at once)\n", N);
+            std::fflush(stdout);
+            return;
+        }
+        auto refuse = [&](const std::string& why) {
+            std::printf("ERR %d %s\n", r.rid, why.c_str());
+            std::printf("DONE %d 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.rid, r.ids.size());
+            std::fflush(stdout);
+            in.forget(r.rid);
+        };
+        if (!parsed) return refuse("expected: GEN <max_new> [keys] <id,id,...> (GENI: the pictures' file before the ids)");
+        if (in.stopped(r.rid)) {   // (stopped while it waited)
+            std::printf("DONE %d 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.rid, r.ids.size());
+            std::fflush(stdout);
+            return;
+        }
+        std::vector<Pic> pics;
+        if (!r.file.empty() && !read_pics(r.file, pics, err)) return refuse(err);
+        if ((long long) r.ids.size() + std::max(0LL, r.max_new) > m.max_ctx())
+            return refuse("the prompt (" + std::to_string(r.ids.size()) + " tokens) and max_new " +
+                          std::to_string(r.max_new) + " are more than the context " + std::to_string(m.max_ctx()));
+        // the sequence: idle, the longest shared start (the last token always read again: its logits are this
+        // request's first; a picture before it in either must be in both, at the same place), else least recently
+        // used - a short shared start never takes a longer conversation's cache while one drops nothing (pick_slot)
+        std::vector<mm3::SlotView> views((size_t) N);
+        for (int s = 0; s < N; ++s) {
+            const Seq& S = seqs[(size_t) s];
+            views[(size_t) s].busy = S.busy;
+            views[(size_t) s].size = S.state.size();
+            views[(size_t) s].used = S.used;
+            if (S.busy) continue;
+            size_t from = 0;
+            while (from < S.state.size() && from + 1 < r.ids.size() && S.state[from] == r.ids[from]) ++from;
+            for (const Held& q : S.held)
+                if (q.start < (long long) from && std::none_of(pics.begin(), pics.end(), [&](const Pic& x) {
+                        return x.start == q.start && x.hash == q.hash;
+                    }))
+                    from = (size_t) q.start;
+            for (const Pic& x : pics)
+                if (x.start < (long long) from && std::none_of(S.held.begin(), S.held.end(), [&](const Held& q) {
+                        return x.start == q.start && x.hash == q.hash;
+                    }))
+                    from = (size_t) x.start;
+            views[(size_t) s].from = from;
+        }
+        const int best = mm3::pick_slot(views);
+        const size_t bfrom = best >= 0 ? views[(size_t) best].from : 0;
+        if (best < 0) {   // (every sequence busy - the server sends at most n at once: after one ends)
+            waiting.push_back(line);
+            return;
+        }
+        if (stages > 1) drain();   // (the pipeline empty: the prompt's forwards and its pictures use every GPU)
+        if (run.empty()) in.stop.store(false);   // (a STOP for all before this request: nothing it could stop)
+        Seq& S = seqs[(size_t) best];
+        S.busy = true;
+        auto gp = std::make_unique<Gen>();
+        Gen& g = *gp;
+        g.rid = r.rid;
+        g.seq = best;
+        g.r = std::move(r);
+        g.t0 = now() * 1e3;
+        g.from = bfrom;
+        const std::vector<int>& ids = g.r.ids;
+        S.state.resize(bfrom);
+        S.held.clear();
+        std::vector<mm3::Model::Image> rows;
+        if (!(pics.empty() && std::find(ids.begin(), ids.end(), m.vision() ? m.vision()->image_token : -1) ==
+                                  ids.end()) &&
+            !picture_rows(m, pics, ids, bfrom, rows, err)) {
+            release(best);
+            return refuse(err);
+        }
+        for (const Pic& x : pics) S.held.push_back({x.start, x.hash});
+        const bool between = rows.empty();   // (decode steps of the others between its chunks)
+        m.bind(best);
+        m.set_images(std::move(rows));
+        const int C = std::max(1, m.chunk() > 0 ? m.chunk() : chunk);
+        bool ok = true, cancel = false;
+        for (size_t a = bfrom; a < ids.size();) {
+            const int T = (int) std::min<size_t>((size_t) C, ids.size() - a);
+            const bool last = a + (size_t) T == ids.size();
+            if (last) g.use_c = !full_env && cands_for(g.r, ids, {}, g.cd);   // (the first token's history: the prompt)
+            m.bind(best);
+            if (!m.forward(ids.data() + a, T, (int) a, last ? 1 : 0, last ? lg1.data() : nullptr, err)) {
+                ok = false;
+                break;
+            }
+            S.state.insert(S.state.end(), ids.begin() + (long) a, ids.begin() + (long) a + T);
+            a += (size_t) T;
+            const double ms = now() * 1e3 - g.t0;
+            std::printf("PP %d %zu %zu %.1f %.1f %zu\n", g.rid, a, ids.size(), ms,
+                        ms > 0 ? 1000.0 * (double) (a - bfrom) / ms : 0.0, bfrom);
+            std::fflush(stdout);
+            if (last) break;
+            if (in.stop.load() || in.stopped(g.rid)) {
+                cancel = true;
+                break;
+            }
+            if (between && !run.empty()) step();   // (the running requests' next token)
+        }
+        m.set_images({});
+        g.t1 = now() * 1e3;
+        if (!ok) {
+            std::printf("ERR %d %s\n", g.rid, err.c_str());
+            std::printf("DONE %d 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", g.rid, ids.size());
+            std::fflush(stdout);
+            S.state.clear();
+            S.held.clear();
+            release(best);
+            in.forget(g.rid);
+            return;
+        }
+        if (cancel) {
+            std::printf("DONE %d 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0\n", g.rid, ids.size(), g.t1 - g.t0, bfrom);
+            std::fflush(stdout);
+            release(best);
+            in.forget(g.rid);
+            return;
+        }
+        // (a request's own seed alone, as with one conversation: the same seed, the same answer)
+        ++counter;
+        g.rng.seed(g.r.seed != 0 ? g.r.seed : 0x9E3779B97F4A7C15ull * counter);
+        g.in_think = g.r.think_budget > 0 && g.r.think_end >= 0;
+        if (g.use_c) {
+            mm3::host_cands(lg1.data(), V, g.cd.kc, g.cd.extra, top, ex);
+            g.tok = draw(dist_c(top, g.cd.extra, ex, g.r, S.state), g.rng);
+        } else {
+            g.tok = draw(dist(lg1.data(), V, g.r, S.state), g.rng);
+        }
+        if (run.empty()) {   // (the STAT lines' window: from the engine's first busy moment)
+            busy_t0 = now() * 1e3;
+            busy_s0 = m.stats();
+            multi_n = 0;
+        }
+        const auto& s = m.stats();
+        g.prof0 = s.profiled;
+        g.cpu0 = s.cpu_experts;
+        run.push_back(std::move(gp));
+    };
+    bool quit = false;
+    auto handle = [&](const std::string& l) {
+        if (l == "QUIT") {
+            quit = true;
+        } else if (l.rfind("GEN ", 0) == 0 || l.rfind("GENI ", 0) == 0) {
+            admit(l);
+        } else {
+            std::printf("ERR unsupported command '%s' (GEN, GENI, STOP and QUIT)\n", l.substr(0, l.find(' ')).c_str());
+            std::fflush(stdout);
+        }
+    };
+    std::string line;
+    while (!quit) {
+        if (run.empty() && waiting.empty()) {   // (idle: wait for a line)
+            if (!in.next(line)) break;
+            handle(line);
+        }
+        while (!quit && in.try_next(line)) handle(line);
+        if (quit) break;
+        while (!waiting.empty() && idle_seq()) {
+            line = std::move(waiting.front());
+            waiting.pop_front();
+            admit(line);
+        }
+        if (!run.empty()) stages > 1 ? pipe_step() : step();
+        else if (waiting.empty() && in.ended()) break;
+    }
+    return 0;
+}
+
+// --rows-check G with --parallel N (2 or more) and --ids: forward_rows against each token alone.  Sequence s reads part
+// s of the ids (N equal parts); then G steps, each first every sequence's token alone (bind + forward, the token path)
+// and then the same tokens together (forward_rows: 2 sequences on the even steps, all N on the odd ones) - the
+// logits compared bit for bit - and each sequence's greedy token next.  Run it with the CPU lane off (--cpu-threads -1):
+// the lane's experts may come out with other last bits.
+int rows_check(mm3::Model& m, const std::vector<int>& ids, int steps) {
+    const int N = m.seqs(), V = m.vocab();
+    if (N < 2 || (int) ids.size() < 2 * N) {
+        std::fprintf(stderr, "--rows-check: --parallel 2 or more, and --ids with at least 2 tokens a sequence\n");
+        return 2;
+    }
+    const size_t part = ids.size() / (size_t) N;
+    std::vector<int> tok((size_t) N), pos((size_t) N);
+    std::vector<float> one((size_t) N * V), rows((size_t) N * V);
+    std::string err;
+    auto argmax = [&](const float* r) { return (int) (std::max_element(r, r + V) - r); };
+    for (int s = 0; s < N; ++s) {
+        m.bind(s);
+        if (!m.forward(ids.data() + (size_t) s * part, (int) part, 0, 1, one.data(), err)) {
+            std::fprintf(stderr, "maya-mm3: %s\n", err.c_str());
+            return 1;
+        }
+        tok[(size_t) s] = argmax(one.data());
+        pos[(size_t) s] = (int) part;
+    }
+    long bad = 0;
+    for (int k = 0; k < steps; ++k) {
+        const int R = k % 2 == 0 ? 2 : N;
+        std::vector<int> sq((size_t) R);
+        for (int r = 0; r < R; ++r) {
+            sq[(size_t) r] = R == N ? r : (k / 2 + r) % N;   // (the pairs move through the sequences)
+            m.bind(sq[(size_t) r]);
+            if (!m.forward(&tok[(size_t) sq[(size_t) r]], 1, pos[(size_t) sq[(size_t) r]], 1,
+                           one.data() + (size_t) r * V, err)) {
+                std::fprintf(stderr, "maya-mm3: %s\n", err.c_str());
+                return 1;
+            }
+        }
+        std::vector<int> t((size_t) R), p((size_t) R);
+        for (int r = 0; r < R; ++r) {
+            t[(size_t) r] = tok[(size_t) sq[(size_t) r]];
+            p[(size_t) r] = pos[(size_t) sq[(size_t) r]];
+        }
+        if (!m.forward_rows(t.data(), sq.data(), p.data(), R, rows.data(), err)) {
+            std::fprintf(stderr, "maya-mm3: %s\n", err.c_str());
+            return 1;
+        }
+        int same = 0;
+        float worst = 0.0f;
+        for (int r = 0; r < R; ++r) {
+            const float* a = one.data() + (size_t) r * V;
+            const float* b = rows.data() + (size_t) r * V;
+            same += std::memcmp(a, b, (size_t) V * 4) == 0;
+            for (int i = 0; i < V; ++i) worst = std::max(worst, std::fabs(a[i] - b[i]));
+            tok[(size_t) sq[(size_t) r]] = argmax(a);
+            ++pos[(size_t) sq[(size_t) r]];
+        }
+        bad += R - same;
+        std::printf("rows check: step %d, %d rows: %d bit for bit, max |diff| %g\n", k, R, same, worst);
+        std::fflush(stdout);
+    }
+    // a layer split's pipeline (Model::pipe_tick): each step every sequence's token alone first, then the same tokens
+    // as groups through the pipeline - the even steps one sequence a group, the odd ones two - entering a tick apart
+    for (int k = 0; k < steps && m.pipe_stages() > 1; ++k) {
+        for (int s = 0; s < N; ++s) {
+            m.bind(s);
+            if (!m.forward(&tok[(size_t) s], 1, pos[(size_t) s], 1, one.data() + (size_t) s * V, err)) {
+                std::fprintf(stderr, "maya-mm3: %s\n", err.c_str());
+                return 1;
+            }
+        }
+        const int gs = k % 2 == 0 ? 1 : 2;
+        for (int s0 = 0, tag = 0; s0 < N || m.pipe_busy() > 0; s0 += gs, ++tag) {
+            const int n = s0 < N ? std::min(gs, N - s0) : 0;
+            std::vector<int> sq((size_t) n), t((size_t) n), p((size_t) n);
+            for (int i = 0; i < n; ++i) {
+                sq[(size_t) i] = s0 + i;
+                t[(size_t) i] = tok[(size_t) (s0 + i)];
+                p[(size_t) i] = pos[(size_t) (s0 + i)];
+            }
+            if (!m.pipe_tick(t.data(), sq.data(), p.data(), n, n ? s0 : -1, err)) {
+                std::fprintf(stderr, "maya-mm3: %s\n", err.c_str());
+                return 1;
+            }
+            int first;
+            std::vector<float> lgp;
+            while (m.pipe_take(first, lgp))
+                for (size_t i = 0; i < lgp.size() / (size_t) V; ++i)
+                    std::memcpy(rows.data() + (size_t) (first + (int) i) * V, lgp.data() + i * V, (size_t) V * 4);
+        }
+        int same = 0;
+        float worst = 0.0f;
+        for (int s = 0; s < N; ++s) {
+            const float* a = one.data() + (size_t) s * V;
+            const float* b = rows.data() + (size_t) s * V;
+            same += std::memcmp(a, b, (size_t) V * 4) == 0;
+            for (int i = 0; i < V; ++i) worst = std::max(worst, std::fabs(a[i] - b[i]));
+            tok[(size_t) s] = argmax(a);
+            ++pos[(size_t) s];
+        }
+        bad += N - same;
+        std::printf("rows check: pipeline step %d (%d GPUs, groups of %d): %d of %d bit for bit, max |diff| %g\n", k,
+                    m.pipe_stages(), gs, same, N, worst);
+        std::fflush(stdout);
+    }
+    std::printf("rows check: %s (%ld rows differ)\n", bad == 0 ? "PASS" : "FAIL", bad);
+    return bad == 0 ? 0 : 1;
+}
+
 // --score FILE [--write-ref OUT]: the quality check against a reference's top-K log-probs (tools/mm3/kv_gate.py writes
 // FILE from ref_topk.npz, or from another run's --write-ref).  FILE: "MM3R", int32 rows, int32 T, int32 K, then per row
 // int32 ids[T], int32 ref_ids[T][K], float ref_lp[T][K] (K 0: none), uint8 mask[T - 1] (position t predicts ids[t + 1];
@@ -751,15 +1335,40 @@ int score_main(mm3::Model& m, const std::string& path, const std::string& out_pa
 // chunk above the default only where every routed expert is in VRAM at the largest one (else a larger chunk's
 // buffers would take room from the experts).  The fastest setting is kept for this PC in the pack's
 // prefill-tune.txt (the next starts take it) unless it beats the defaults by less than kKeepGain; OUT gets the
-// measurements (JSON) for the setup.
-int calibrate_prefill(mm3::Model& m, std::vector<int> ids, const std::string& out_path) {
-    constexpr double kKeepGain = 0.02;
-    constexpr int kDefChunk = 1024;
-    const double t_start = now();
-    const auto& st = m.stats();
-    const int cmax = m.chunk_max();
-    const bool all_res = st.resident >= st.experts;
-    const int N = std::max(1, std::min(m.max_ctx() - 1, std::max(4096, cmax)));
+// measurements (JSON) for the setup.  Where not every expert is in VRAM the larger chunks are measured too (after the
+// rest: what is kept does not change) with the decode of this load's placement - each chunk stages the experts VRAM
+// does not hold, so there a larger one reads prompts much faster (#552: 4096 2.2x 1024's on one 48 GB GPU) - and
+// the setup (tools/calibrate_mm3_prefill.py) keeps one when a start with the default chunk does not decode faster.
+// decode_rate: tokens decoded one by one after the prompt's (whose logits are in lg), the faster of two runs
+// (-1: an error, 0: no room in the context)
+constexpr int kDecodeTokens = 32;
+double decode_rate(mm3::Model& m, int N, std::vector<float>& lg) {
+    if (N + kDecodeTokens >= m.max_ctx()) return 0.0;
+    const auto argmax = [&] { return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin()); };
+    const int tok0 = argmax();
+    std::string err;
+    double best = 0;
+    for (int r = 0; r < 2; ++r) {
+        int tok = tok0;
+        const double t0 = now();
+        for (int i = 0; i < kDecodeTokens; ++i) {
+            if (!m.forward(&tok, 1, N + i, 1, lg.data(), err)) {
+                std::fprintf(stderr, "maya-mm3: calibration: %s\n", err.c_str());
+                return -1.0;
+            }
+            tok = argmax();
+        }
+        best = std::max(best, (double) kDecodeTokens / (now() - t0));
+    }
+    std::fprintf(stderr, "calibration: decode %.2f tok/s (%ld of %ld experts in VRAM)\n", best,
+                 (long) m.stats().resident, (long) m.stats().experts);
+    return best;
+}
+
+// the calibration's prompt: `ids` (a real text's tokens) repeated to N - the calibration's 4096 or its largest chunk -
+// or, without them, a fixed pseudo-random text
+int calib_prompt(const mm3::Model& m, std::vector<int>& ids) {
+    const int N = std::max(1, std::min(m.max_ctx() - 1, std::max(4096, m.chunk_max())));
     if (ids.empty() || (ids.size() == 1 && ids[0] == 0)) {   // (no text: a fixed pseudo-random one)
         ids.clear();
         unsigned x = 12345u;
@@ -770,6 +1379,41 @@ int calibrate_prefill(mm3::Model& m, std::vector<int> ids, const std::string& ou
     }
     for (size_t i = 0; ids.size() < (size_t) N; ++i) ids.push_back(ids[i]);
     ids.resize((size_t) N);
+    return N;
+}
+
+// --calibrate-decode OUT (the setup's decode check, tools/calibrate_mm3_prefill.py): this load's decode - its placement
+// beside the buffers of its --chunk - after the calibration's prompt: {"decode_tok_s", "resident", "experts"}
+int calibrate_decode(mm3::Model& m, std::vector<int> ids, const std::string& out_path) {
+    const int N = calib_prompt(m, ids);
+    std::vector<float> lg((size_t) m.vocab());
+    std::string err;
+    if (!m.forward(ids.data(), N, 0, 1, lg.data(), err)) {
+        std::fprintf(stderr, "maya-mm3: calibration: %s\n", err.c_str());
+        return 1;
+    }
+    const double dec = decode_rate(m, N, lg);
+    if (dec < 0) return 1;
+    char buf[256];
+    std::snprintf(buf, sizeof buf, "{\"decode_tok_s\": %.2f, \"chunk\": %d, \"resident\": %ld, \"experts\": %ld}\n", dec,
+                  m.chunk_max(), (long) m.stats().resident, (long) m.stats().experts);
+    std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+    f << buf;
+    if (!f) {
+        std::fprintf(stderr, "%s: cannot write\n", out_path.c_str());
+        return 1;
+    }
+    return 0;
+}
+
+int calibrate_prefill(mm3::Model& m, std::vector<int> ids, const std::string& out_path) {
+    constexpr double kKeepGain = 0.02;
+    constexpr int kDefChunk = 1024;
+    const double t_start = now();
+    const auto& st = m.stats();
+    const int cmax = m.chunk_max();
+    const bool all_res = st.resident >= st.experts;
+    const int N = calib_prompt(m, ids);
     std::vector<float> lg((size_t) m.vocab());
     std::string err;
     struct Trial {
@@ -795,9 +1439,9 @@ int calibrate_prefill(mm3::Model& m, std::vector<int> ids, const std::string& ou
         std::fprintf(stderr, "calibration: chunk %d, %s GEMMs: %.1f tok/s\n", c, gm == 1 ? "hipBLASLt" : "BLAS", best);
         return best;
     };
-    std::vector<int> chunks;
+    std::vector<int> chunks, wide;   // (wide: the larger ones where not every expert is in VRAM - measured last)
     for (int c : {1024, 2048, 4096})
-        if (c <= cmax && (all_res || c <= kDefChunk)) chunks.push_back(c);
+        if (c <= cmax) (all_res || c <= kDefChunk ? chunks : wide).push_back(c);
     if (chunks.empty()) chunks.push_back(cmax);
     const int top = chunks.back();
     std::vector<int> gemms{0};
@@ -819,6 +1463,17 @@ int calibrate_prefill(mm3::Model& m, std::vector<int> ids, const std::string& ou
     const double def = measure(dc, 0);
     if (def < 0) return 1;
     if (bt < def * (1.0 + kKeepGain)) bc = dc, bg = 0, bt = def;   // (the defaults, unless the best is clearly faster)
+    int wc = 0;
+    double wt = 0, dec = 0;
+    for (int c : wide) {   // (with the kept GEMMs; the prompt's logits of the last one stay in lg for the decode)
+        const double r = measure(c, bg);
+        if (r < 0) return 1;
+        if (r > wt) wt = r, wc = c;
+    }
+    if (!wide.empty()) {
+        dec = decode_rate(m, N, lg);
+        if (dec < 0) return 1;
+    }
     char set[256];
     std::snprintf(set, sizeof set, "chunk=%d gemm=%d tok_s=%.1f default_tok_s=%.1f tokens=%d", bc, bg, bt, def, N);
     if (!m.write_tune(set, err)) {
@@ -827,11 +1482,14 @@ int calibrate_prefill(mm3::Model& m, std::vector<int> ids, const std::string& ou
     }
     std::string js = "{\"key\": \"" + m.tune_key() + "\", \"file\": \"";
     for (char ch : m.tune_file()) js += ch == '\\' ? std::string("\\\\") : std::string(1, ch);
-    char buf[512];
+    char buf[512], wbuf[256] = "";
+    if (wc > 0)   // (the setup's decode check: this load's decode - its buffers the largest chunk's)
+        std::snprintf(wbuf, sizeof wbuf, "\"wide_chunk\": %d, \"wide_tok_s\": %.1f, \"decode_tok_s\": %.2f, "
+                      "\"resident\": %ld, \"experts\": %ld, ", wc, wt, dec, (long) st.resident, (long) st.experts);
     std::snprintf(buf, sizeof buf, "\", \"chunk\": %d, \"gemm\": \"%s\", \"tok_s\": %.1f, \"default_tok_s\": %.1f, "
-                  "\"tokens\": %d, \"all_resident\": %s, \"lt_available\": %s, \"seconds\": %.0f, \"trials\": [",
+                  "\"tokens\": %d, \"all_resident\": %s, \"lt_available\": %s, \"seconds\": %.0f, %s\"trials\": [",
                   bc, bg == 1 ? "hipblaslt" : "blas", bt, def, N, all_res ? "true" : "false",
-                  m.lt_available() ? "true" : "false", now() - t_start);
+                  m.lt_available() ? "true" : "false", now() - t_start, wbuf);
     js += buf;
     for (size_t i = 0; i < trials.size(); ++i) {
         std::snprintf(buf, sizeof buf, "%s{\"chunk\": %d, \"gemm\": \"%s\", \"tok_s\": %.1f}", i ? ", " : "",
@@ -864,7 +1522,8 @@ int usage() {
                  "                [--score REF [--write-ref OUT]] [--cpu-threads N] [--dspark on|off]\n"
                  "                [--kv-resident N] [--tp-chunk N] [--tp-ffn-rows N] [--dspark-cost X]\n"
                  "                [--prefill-gemm blas|hipblaslt|auto] [--prefill-tune FILE] [--no-prefill-tune]\n"
-                 "                [--calibrate-prefill OUT.json [--ids @prompt]] [--verbose]\n"
+                 "                [--calibrate-prefill OUT.json [--ids @prompt]] [--calibrate-decode OUT.json] [--verbose]\n"
+                 "                [--serve [--parallel N (1-8: conversations at once)]] [--parallel N --rows-check G]\n"
                  "       maya-mm3 --pack DIR --encode-image FILE.rgb --size WxH --dump-image OUT [--gpus N]\n");
     return 2;
 }
@@ -892,10 +1551,10 @@ int main(int argc, char** argv) {
 #endif
     mm3::Options o;
     std::string ids_arg, dump, profile_out, batch, eos_arg, images, enc_rgb, enc_size, enc_out, score_path, ref_out, learned;
-    std::string calib_out;
+    std::string calib_out, calib_dec;
     bool serve_mode = false;
     int kv_stream = -1;   // (--kv-streaming: -1 not given)
-    int gen = 0, last = 1, ppl = 0;
+    int gen = 0, last = 1, ppl = 0, rows_steps = 0;
     float dspark_conf = 0.7f;   // the drafts' confidence floor: a round verifies the drafts before the first below it
     float dspark_cost = 0.0f;   // (> 0) ... and those before the first whose confidences' product is below it
     for (int i = 1; i < argc; ++i) {
@@ -926,6 +1585,7 @@ int main(int argc, char** argv) {
         else if (a == "--prefill-tune") o.prefill_tune = val();
         else if (a == "--no-prefill-tune") o.tune = false;
         else if (a == "--calibrate-prefill") calib_out = val();
+        else if (a == "--calibrate-decode") calib_dec = val();
         else if (a == "--staging") o.staging = std::atoi(val().c_str());
         else if (a == "--resident-cap") o.resident_cap = std::atoi(val().c_str());
         else if (a == "--reserve-gb") o.reserve_gb = std::atof(val().c_str());
@@ -937,7 +1597,8 @@ int main(int argc, char** argv) {
         else if (a == "--promote-lag") o.promote_lag = std::max(1, std::atoi(val().c_str()));
         else if (a == "--ppl") ppl = std::atoi(val().c_str());
         else if (a == "--batch") batch = val();
-        else if (a == "--cpu-threads") o.cpu_threads = std::atoi(val().c_str());
+        else if (a == "--cpu-threads")   // (the lane's threads, the caller included: its workers one fewer - #552)
+            o.cpu_threads = mm3::lane_workers_of_threads(std::atoi(val().c_str()));
         else if (a == "--dspark") {
             const std::string v = val();
             o.dspark = v != "off" && v != "none";
@@ -988,6 +1649,8 @@ int main(int argc, char** argv) {
         else if (a == "--score") score_path = val();
         else if (a == "--write-ref") ref_out = val();
         else if (a == "--serve") serve_mode = true;
+        else if (a == "--parallel") o.seqs = std::atoi(val().c_str());   // (--serve: conversations at once, 1-8)
+        else if (a == "--rows-check") rows_steps = std::atoi(val().c_str());
         else if (a == "--eos") eos_arg = val();
         else if (a == "--verbose") o.verbose = true;
         else return usage();
@@ -1045,11 +1708,15 @@ int main(int argc, char** argv) {
         std::fclose(fo);
         return 0;
     }
-    if (o.pack.empty() || (ids_arg.empty() && batch.empty() && !serve_mode && score_path.empty() && calib_out.empty()))
+    if (o.pack.empty() || (ids_arg.empty() && batch.empty() && !serve_mode && score_path.empty() && calib_out.empty() &&
+                           calib_dec.empty()))
         return usage();
     if (!calib_out.empty()) {   // (the calibration: buffers for its largest chunk, measured from scratch - no cache)
         if (!o.chunk_given) o.chunk = 4096;
         o.chunk_given = true;
+        o.tune = false;
+        if (o.prefill_gemm < 0) o.prefill_gemm = 0;
+    } else if (!calib_dec.empty()) {   // (its decode check: the --chunk given, not a calibration's)
         o.tune = false;
         if (o.prefill_gemm < 0) o.prefill_gemm = 0;
     }
@@ -1083,6 +1750,11 @@ int main(int argc, char** argv) {
         for (const auto& l : m.info_lines()) std::fprintf(stderr, "  %s\n", l.c_str());
         return calibrate_prefill(m, ids_arg.empty() ? std::vector<int>{} : ids, calib_out);
     }
+    if (!calib_dec.empty()) {
+        for (const auto& l : m.info_lines()) std::fprintf(stderr, "  %s\n", l.c_str());
+        return calibrate_decode(m, ids_arg.empty() ? std::vector<int>{} : ids, calib_dec);
+    }
+    if (rows_steps > 0) return rows_check(m, ids, rows_steps);
     if (!score_path.empty()) {
         for (const auto& l : m.info_lines()) std::fprintf(stderr, "  %s\n", l.c_str());
         return score_main(m, score_path, ref_out);
@@ -1091,6 +1763,7 @@ int main(int argc, char** argv) {
         std::vector<int> eos = eos_arg.empty() ? std::vector<int>{m.eos()} : parse_list(eos_arg);
         const std::string kvf = o.kv_k == o.kv_v ? std::string(mm3::k::kv_name(o.kv_k))
                                                  : std::string(mm3::k::kv_name(o.kv_k)) + "," + mm3::k::kv_name(o.kv_v);
+        if (m.seqs() > 1) return serve_multi(m, eos, o.chunk, kvf, profile_out);
         return serve(m, eos, o.chunk, o.dspark, dspark_conf, dspark_cost, kvf, profile_out);
     }
     const auto& st = m.stats();

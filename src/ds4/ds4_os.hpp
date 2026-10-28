@@ -401,7 +401,9 @@ inline void drop_cached(const std::vector<std::pair<uint8_t*, size_t>>& maps, co
 }
 
 /// Anonymous memory on NUMA node `node` of `nodes` (node < 0 or nodes < 2: wherever the first touch puts it), on huge
-/// pages where the OS gives them; nullptr if it cannot be had.
+/// pages where the OS gives them; nullptr if it cannot be had.  Linux: the node is preferred, not required
+/// (MPOL_PREFERRED) - a node that fills up (locked Engram tables, another program's memory) lends the rest from the
+/// other nodes, where MPOL_BIND had the kernel end the process with RAM free on the other node (#507)
 inline void* anon_alloc(size_t bytes, int node, int nodes) {
 #if defined(_WIN32)
     if (node >= 0 && nodes > 1)
@@ -415,7 +417,7 @@ inline void* anon_alloc(size_t bytes, int node, int nodes) {
     if (node >= 0 && nodes > 1) {
         unsigned long mask[4] = {0, 0, 0, 0};
         mask[node / 64] = 1ul << (node % 64);
-        syscall(SYS_mbind, m, bytes, 2 /* MPOL_BIND */, mask, 256, 0);
+        syscall(SYS_mbind, m, bytes, 1 /* MPOL_PREFERRED */, mask, 256, 0);
     }
     return m;
 #endif

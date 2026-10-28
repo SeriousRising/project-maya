@@ -57,6 +57,10 @@ class ChatTemplate:
         # MiniMax-M3.1 (tools/mm3/chat_template.jinja: MiniMax's own plus thinking_mode "disabled"): reasoning_effort
         # low .. max; <mm:think> reasoning and ]<]minimax[>[-tagged tool calls (OutputParser(minimax=True) reads them)
         self.minimax = MINIMAX_NS in self.source
+        # CYBER-FROST-3.8-PS (a Qwen3.8 template that sets enable_thinking = true itself): it opens <think> whatever it
+        # is told.  Thinking off (a client's, or a forced tool call's) closes the block the way its Qwen base's template
+        # writes thinking off - <think>\n\n</think>\n\n - so the prompt and the server's parser agree
+        self.forced_thinking = bool(re.search(r"set\s+enable_thinking\s*=\s*true", self.source))
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -124,6 +128,9 @@ class ChatTemplate:
                                    **kwargs)
         if off and add_generation_prompt and out.endswith("<think>"):
             out += "</think>"
+        if self.forced_thinking and add_generation_prompt and kwargs.get("enable_thinking") is False and \
+                out.endswith("<think>\n"):
+            out += "\n</think>\n\n"
         return out
 
 

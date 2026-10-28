@@ -15,10 +15,38 @@ from __future__ import annotations
 
 from pathlib import Path
 
-FAMILIES = ("glm", "deepseek", "minimax")
-MODEL = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek-V4.1-Flash-1017", "minimax": "MiniMax-M3.1-Flash"}
-SHOWN = {"glm": "GLM-5.3", "deepseek": "DeepSeek V4.1", "minimax": "MiniMax M3.1"}   # the model's name on screen
+FAMILIES = ("glm", "deepseek", "minimax", "qwen")
+# ("qwen": CYBER-FROST-3.8-PS, the Qwen3.8-Flash-Next fine-tune - qwen4exp, on the `maya` engine's own Qwen path)
+MODEL = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek-V4.1-Flash-1017", "minimax": "MiniMax-M3.1-Flash",
+         "qwen": "CYBER-FROST-3.8-PS"}
+SHOWN = {"glm": "GLM-5.3", "deepseek": "DeepSeek V4.1", "minimax": "MiniMax M3.1",
+         "qwen": "Qwen-3.8-Flash-Next (CYBER-FROST)"}   # the model's name on screen (the chat header: serve/web/lib.js's
+                                                         # modelName(id, true), "Qwen-3.8-Flash-Next"); its ids stay
 SEP = " · "
+
+# Each model's own defaults - what its config gets (the setup, the dashboard's switch to it) and what a config without
+# them runs with: its sampling as its developer publishes it (no top-k, min-p or penalties unless they name one) and the
+# thinking level a request without one gets.  Every quant of a model the same (Maya's, unsloth's, orcarouter's, EXL3).
+#   GLM-5.3-Flash: zai-org/GLM-5.3-Flash generation_config.json - temperature 1.0, top_p 0.95; the level its card's
+#     default, Max (the owner, 2026-10-27; it was Maya's High)
+#   DeepSeek-V4.1-Flash-1017: deepseek-ai's card ("Recommended sampling parameters") - temperature 1.0, top_p 1.0;
+#     the level its encoder's default, high (a reasoning effort of 75); orcarouter's card names none (its base's)
+#   MiniMax-M3.1-Flash: MiniMaxAI's card and generation_config.json (54e4e69) - temperature 1.0, top_p 0.95; no
+#     default effort named, so "auto" (the template's own: the model decides whether to think)
+MODEL_DEFAULTS = {
+    "glm": ({"temperature": 1.0, "top_p": 0.95}, "max"),
+    "deepseek": ({"temperature": 1.0, "top_p": 1.0}, "high"),
+    "minimax": ({"temperature": 1.0, "top_p": 0.95}, "auto"),
+    # CYBER-FROST-3.8-PS: Blackfrost-AI/CYBER-FROST-3.8-BF16 generation_config.json and card - temperature 1.0, top_p
+    # 0.95, top_k 20; thinking on, its template's default effort xhigh
+    "qwen": ({"temperature": 1.0, "top_p": 0.95, "top_k": 20}, "xhigh"),
+}
+
+
+def model_defaults(cfg: dict) -> tuple:
+    """(sampling, reasoning_effort): a config's model's own defaults (MODEL_DEFAULTS by its family), copies."""
+    sampling, effort = MODEL_DEFAULTS.get(family_of(cfg), MODEL_DEFAULTS["glm"])
+    return dict(sampling), effort
 
 # Maya's own quants: (family, the setup's key for it, its tier, its setup id).  The key is what the setup and the
 # configs' installer records use: a GLM download's MODELS key, a --ds4-quant / --mm3-quant value
@@ -34,12 +62,15 @@ QUANTS = (
     ("minimax", "gguf-xs", "Maya-XS", "minimax-maya-xs"),
     ("minimax", "gguf-s", "Maya-S", "minimax-maya-s"),
 )
-# the other files the setup offers, as shown after the model's name (a GLM download not listed: its own name)
+# the other files the setup offers, as shown after the model's name (a GLM download not listed: its own name); also
+# the ones an install can still have though the list no longer offers them (DeepSeek's UD-Q4_K_XL: maya.DS4_BY_HAND)
 OTHERS = {("deepseek", "gguf-q8"): "UD-Q8_K_XL", ("deepseek", "gguf-q4"): "UD-Q4_K_XL",
           ("deepseek", "exl3"): "EXL3 2.9 bpw", ("deepseek", "exl3-3.5"): "EXL3 3.5 bpw",
           ("deepseek", "abliterated-128g"): "orcarouter Abliterated Mix-128G",
           ("deepseek", "abliterated-256g"): "orcarouter Abliterated Mix-256G",
-          ("minimax", "exl3"): "EXL3 3.5 bpw"}
+          ("minimax", "exl3"): "EXL3 3.5 bpw", ("qwen", "q5_k_m"): "Q5_K_M"}
+# CYBER-FROST-3.8-PS: its one GGUF (peasantsmith/CYBER-FROST-3.8-PS-GUFF) - the setup ids it is asked for by
+QWEN_IDS = ("cyber-frost", "cyber-frost-3.8", "cyber-frost-3.8-ps", "cyber-frost-3.8-ps-q5_k_m", "cyber-frost-q5_k_m")
 # --mm3-quant also takes the tier as DeepSeek's --ds4-quant does (maya-xs), beside its first names (gguf-xs)
 MM3_QUANT_ALIASES = {"maya-xs": "gguf-xs", "maya-s": "gguf-s"}
 
@@ -72,6 +103,8 @@ def config_stem(family: str, key: str | None) -> str | None:
     """A Maya quant's config name under the scheme (maya-minimax-maya-xs), or None where the config keeps the name it
     always had (GLM's maya-<download>.json, DeepSeek's maya-ds4.json, MiniMax's EXL3 maya-mm3.json - installs and
     their run scripts point at them).  MiniMax's GGUFs, new with the scheme, are the first named by it."""
+    if family == "qwen":
+        return "maya-cyber-frost"
     return f"maya-{setup_id(family, key)}" if family == "minimax" and setup_id(family, key) else None
 
 
@@ -88,20 +121,25 @@ def resolve(name: str, glm_downloads=()) -> tuple | None:
     for k in glm_downloads:
         if low == k.lower():
             return "glm", k
-    for f in ("deepseek", "minimax"):
+    if low in QWEN_IDS:
+        return "qwen", "q5_k_m"
+    for f in ("deepseek", "minimax", "qwen"):
         if low == MODEL[f].lower():
             return f, None
     return None
 
 
 def family_of(cfg: dict) -> str:
-    """"minimax" for a MiniMax-M3.1-Flash config (maya-mm3), "deepseek" for a DeepSeek-V4.1-Flash config (maya-ds4's
-    --pack: also the configs from before the programs' names of v1.1.16), else "glm"."""
+    """"minimax" for a MiniMax-M3.1-Flash config (maya-mm3), "qwen" for CYBER-FROST-3.8-PS (the `maya` engine with its
+    n-gram table, --ple-gguf), "deepseek" for a DeepSeek-V4.1-Flash config (maya-ds4's --pack: also the configs from
+    before the programs' names of v1.1.16), else "glm"."""
     inst = cfg.get("installer") or {}
     exe = Path(str(cfg.get("exe", ""))).name
     if inst.get("family") == "minimax" or exe.startswith("maya-mm3"):
         return "minimax"
     args = cfg.get("args") or []
+    if inst.get("family") == "qwen" or "--ple-gguf" in args[:-1]:
+        return "qwen"
     return "deepseek" if inst.get("family") == "deepseek" or "--pack" in args[:-1] or \
         exe.startswith(("maya-ds4", "strata-ds4")) else "glm"   # (the engine's name before v1.1.16)
 
@@ -117,6 +155,8 @@ def config_key(cfg: dict) -> str | None:
         return inst.get("ds4_quant") or "exl3"
     if fam == "minimax":
         return inst.get("mm3_quant") or "exl3"
+    if fam == "qwen":
+        return inst.get("qwen_quant") or "q5_k_m"
     return inst.get("quant")
 
 

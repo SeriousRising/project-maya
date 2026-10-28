@@ -1,7 +1,7 @@
 // serve/web/server.js - what the page asks the server: its health (the model, its defaults), the live metrics every
 // second, the MCP servers, the context size and port (each a restart), the update, the shared settings and the report.
 import {api, ctxfmt, esc, fmt, headers} from "./lib.js";
-import {DEFAULTS, P, S, THINKING, confirmDialog, emit, loadPrefs, setFamily, toast} from "./state.js";
+import {DEFAULTS, P, PENALTIES, S, THINKING, confirmDialog, emit, loadPrefs, modelId, newModelCheck, setFamily, toast} from "./state.js";
 
 // ------------------------------------------------------------------ health: the model and its recommended settings
 let onHealth = () => {};
@@ -18,10 +18,17 @@ export async function loadHealth() {
     if (d.temperature !== undefined) DEFAULTS.temperature = d.temperature;
     if (d.top_p !== undefined) DEFAULTS.top_p = d.top_p;
     if (d.temperature !== undefined || d.top_k !== undefined) DEFAULTS.top_k = d.top_k !== undefined ? d.top_k : 0;
+    if (d.temperature !== undefined || d.min_p !== undefined) DEFAULTS.min_p = d.min_p !== undefined ? d.min_p : 0;
     const was = P.thinking;                        // (the level the empty chat on screen took from the defaults)
+    const switched = newModelCheck();              // another model than last time: its own standard parameters
     loadPrefs();                                   // each model keeps its own (DeepSeek's, MiniMax's are not GLM's)
     // ... made before the model was known: it starts at this model's default, as a change in Settings moves it
-    if (S.current && !S.current.messages.length && S.current.thinking === was) S.current.thinking = P.thinking;
+    if (S.current && !S.current.messages.length && (S.current.thinking === was || switched)) {
+      S.current.thinking = P.thinking;
+      S.current.thinkingFor = modelId();
+    }
+    if (switched) toast("info", `${h.model_label || h.model}: its own settings`, "A new model starts at its standard " +
+                        "parameters and thinking level; change them in Settings › Chat defaults.", 6000);
     emit();
     onHealth();
     if (h.status === "reloading") watchReload();
@@ -213,9 +220,9 @@ export async function loadShared() {
 }
 export function sharedDefaults(s) {
   const d = {reasoning_effort: s.thinking, temperature: +s.temperature};
-  if (+s.temperature > 0) Object.assign(d, {top_p: +s.top_p});
-  if (+s.temperature > 0 && +s.top_k > 0) d.top_k = +s.top_k;
-  if (+s.temperature > 0 && +s.min_p > 0) d.min_p = +s.min_p;
+  // (top-k and min-p even when off: 0 - an app's request then gets no cut, not the run config's)
+  if (+s.temperature > 0) Object.assign(d, {top_p: +s.top_p, top_k: Math.max(0, +s.top_k || 0), min_p: Math.max(0, +s.min_p || 0)});
+  for (const k of PENALTIES) if (s[k] !== "" && s[k] != null && Number.isFinite(+s[k])) d[k] = +s[k];   // (only those set)
   if (s.seed) d.seed = +s.seed;
   if (s.max) d.max_tokens = +s.max;
   return d;

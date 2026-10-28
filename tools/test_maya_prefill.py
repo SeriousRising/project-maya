@@ -82,6 +82,46 @@ class PrefillConfigTests(unittest.TestCase):
         self.assertIsNone(maya.saved_calibration(dict(c, installer=dict(c["installer"], quant="other")),
                                                  any_context=True))
 
+    def test_tuning_measured_again_after_a_driver_or_p2p_change(self):
+        # #419: STRATA_GLM_PCIE_SHARE tuned before a P2P driver was installed halved the decode, nothing said why
+        topo = (" \t\x1b[4mGPU0\tGPU1\t\x1b[0m\n GPU0\tX\t{s}\t\n GPU1\t{s}\tX\t\n\nLegend:\n  X    = Self\n  OK   = Status Ok\n")
+        state = {"drv": "595.58", "p2p": "NS"}
+
+        def gpus():
+            return [{"index": i, "name": "RTX 3090", "vram_gb": 24, "driver": state["drv"], "pci": f"0000:0{i}:00.0"}
+                    for i in (0, 1)]
+
+        def out(cmd):
+            return topo.format(s=state["p2p"]) if cmd[1:3] == ["topo", "-p2p"] else ""
+        with patch.object(maya.S, "gpus", side_effect=gpus), patch.object(maya.S, "out", side_effect=out):
+            cfg = {"gpu": [0, 1], "args": ["--max-context", "32768"], "installer": {"quant": "Maya-S"},
+                   "env": {"STRATA_GLM_PCIE_SHARE": "0.25", "STRATA_GLM_CPU_LANE": "12", "STRATA_GLM_FOO": "1"}}
+            self.assertEqual(maya.gpu_env(cfg)["p2p"], {"0-1": "NS"})
+            # an older config: this PC's state is recorded, nothing changes
+            self.assertEqual(maya.stale_tuning(cfg), "")
+            self.assertEqual(cfg["installer"]["tuned_on"]["driver"], "595.58")
+            self.assertIsNone(maya.stale_tuning(cfg))
+            # the store's record: valid while nothing changed
+            store = {maya.hardware_key(cfg): {"settings": {"STRATA_GLM_PCIE_SHARE": "0.25"},
+                                              "gpu_env": maya.gpu_env(cfg)}}
+            maya.CAL_STORE.write_text(json.dumps(store))
+            self.assertIsNotNone(maya.saved_calibration(cfg))
+            # the P2P driver: P2P on, a new version - the tuned settings go, the others stay; a setup offers it again
+            state.update(drv="615.71", p2p="OK")
+            msg = maya.stale_tuning(cfg)
+            self.assertIn("driver 595.58 -> 615.71", msg)
+            self.assertIn("P2P 0-1:NS -> 0-1:OK", msg)
+            self.assertEqual(cfg["env"], {"STRATA_GLM_FOO": "1"})
+            self.assertNotIn("tuned_on", cfg["installer"])
+            self.assertIsNone(maya.saved_calibration(cfg))
+            self.assertIsNone(maya.saved_calibration(cfg, any_context=True))
+            # nvidia-smi silent once (no P2P answer): no change seen
+            cfg["env"] = {"STRATA_GLM_PCIE_SHARE": "0.3"}
+            cfg["installer"]["tuned_on"] = maya.gpu_env(cfg)
+            state["p2p"] = ""
+            self.assertIsNone(maya.stale_tuning(cfg))
+            self.assertEqual(cfg["env"], {"STRATA_GLM_PCIE_SHARE": "0.3"})
+
     def test_prefill_auto_is_written_and_an_edit_kept(self):
         for gpus in ([0], [0, 1]):
             p, args = self.write(gpus)

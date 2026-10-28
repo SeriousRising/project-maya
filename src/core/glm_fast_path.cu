@@ -1205,12 +1205,12 @@ bool Glm5Model::fast_setup(std::string& err) {
         // only the tail, the decode never misses, the RAM tier is staging only and the CPU lane has nothing to take.
         // Any device whose budget holds it (a discrete card too: the slots past the experts cost only budget nothing
         // else used); Linux's unified-memory budget is the experts' bytes exactly, so it keeps its own policy there.
-        // STRATA_GLM_COMPLETE_POOL=0: the capped pool (A/B); on by default on AMD only (on_by_default_on_amd).
+        // STRATA_GLM_COMPLETE_POOL=0: the capped pool (A/B); on by default on every GPU (complete_pool_on, #474).
         {
             int k_full = pf_ != nullptr ? tail_slots(prefill_borrow_bytes()) : 0;
             if (const char* v = getenv("STRATA_GLM_VISION_LEND_MB"); v != nullptr && dev_ == 0)
                 k_full = std::max(k_full, tail_slots((size_t) std::max(0LL, std::atoll(v)) << 20));
-            const int full = glmfast::on_by_default_on_amd("STRATA_GLM_COMPLETE_POOL") && !F->unified_memory
+            const int full = glmfast::complete_pool_on() && !F->unified_memory
                                  ? glmfast::complete_pool_slots(avail, stride_sum, g.n_expert, gf::kSpares, k_full)
                                  : 0;
             if (full > 0) {
@@ -3105,7 +3105,17 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     if (shared) {
         F->cpu_pool = shared_cpu_pool(threads);
     } else {
-        F->cpu_pool.reset(new glmfast::Workers(threads - 1, 20000, pin_cpus));
+        // STRATA_GLM_CPU_LANE_MAX=N, more than the lane's count: the pool holds N threads and starts with the lane's
+        // count active (the rest sleep), so a request's cpu_threads can try up to N without a restart - the setup's
+        // calibration (tools/calibrate_glm.py) measures counts above the engine's own with it.  A KVM guest's 16
+        // vCPUs, no SMT siblings: two thirds of them (10) 14.9 tok/s, 14 18.4 (Maya-L, one 3090 Ti, #177)
+        const char* mx = getenv("STRATA_GLM_CPU_LANE_MAX");
+        const int pool_n = mx != nullptr ? std::max(threads, std::min(64, std::atoi(mx))) : threads;
+        F->cpu_pool.reset(new glmfast::Workers(pool_n - 1, 20000, pin_cpus));
+        if (pool_n > threads) {
+            F->cpu_pool->set_active(threads);
+            F->cpu_threads0 = threads;
+        }
         F->cpu_node = pin_node;
         F->cpu_pin = pin_cpus;
     }
@@ -3144,6 +3154,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
             const bool lane_pin = win_lanes != 2;
             if (lane_pin) {
                 F->cpu_pool.reset(new glmfast::Workers(ta - 1, 20000, ca));
+                F->cpu_threads0 = 0;
                 F->cpu_node = groups[a].first;
                 F->cpu_pin = ca;
             }
@@ -3155,7 +3166,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
                                      "%d, %d on node %d\n", dev_, ta, groups[a].first, tb, groups[b].first);
             else
                 std::fprintf(stderr, "glm fast: CUDA%d a verify window's tokens on two CPU lanes of %d and %d threads, "
-                                     "unpinned\n", dev_, F->cpu_pool->size(), tb);
+                                     "unpinned\n", dev_, F->cpu_pool->active(), tb);
         }
     }
     // STRATA_GLM_CPU_CAL=<file>: reuse the timed values across starts, keyed by build, model, layer, card and pool
@@ -4081,12 +4092,16 @@ int Glm5Model::cpu_lane_threads() const {
     return fast_ != nullptr && fast_->cpu_pool != nullptr ? fast_->cpu_pool->active() : 0;
 }
 
+int Glm5Model::cpu_lane_threads_max() const {
+    return fast_ != nullptr && fast_->cpu_pool != nullptr ? fast_->cpu_pool->size() : 0;
+}
+
 bool Glm5Model::set_cpu_lane_threads(int n) {
     bool any = false;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         FastState* F = m->fast_;
         if (F == nullptr || F->cpu_pool == nullptr) continue;
-        F->cpu_pool->set_active(n > 0 ? n : F->cpu_pool->size());
+        F->cpu_pool->set_active(n > 0 ? n : F->cpu_threads0 > 0 ? F->cpu_threads0 : F->cpu_pool->size());
         any = true;
     }
     return any;

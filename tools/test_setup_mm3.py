@@ -135,6 +135,35 @@ class Contexts(unittest.TestCase):
         self.assertEqual(maya.mm3_kv_format(["--kv-cache", "int8"]), "int8")
         self.assertEqual(maya.mm3_kv_format([]), maya.MM3_KV_FORMAT)
 
+    def test_parallel_caches_are_in_vram(self):
+        """--parallel N: no KV streaming, a whole cache a conversation in VRAM (~61 KB a position with INT8) - the
+        recommended context is the largest at which the N caches take at most a third of the GPUs' memory, the RAM
+        no longer matters."""
+        gib = lambda ctx, n: n * ctx * maya.MM3_KV_BYTES["int8"] / 2**30
+        self.assertEqual(maya.mm3_recommended_context(96, 183, "int8", 93), 262144)                # (one: streamed in RAM)
+        self.assertEqual(maya.mm3_recommended_context(96, 183, "int8", 93, parallel=1), 262144)
+        self.assertEqual(maya.mm3_recommended_context(96, 183, "int8", 93, parallel=4), 131072)    # (30.9 of 32 GB)
+        self.assertEqual(maya.mm3_recommended_context(96, 183, "int8", 93, parallel=8), 65536)     # (30.9 of 32 GB)
+        self.assertEqual(maya.mm3_recommended_context(32, 64, "int8", 93, parallel=4), 32768)      # (one V100)
+        self.assertEqual(maya.mm3_recommended_context(24, 0, "int8", 93, parallel=8), 32768)       # (the smallest)
+        self.assertEqual(maya.mm3_recommended_context(160, 0, "int8", 93, parallel=2), 262144)     # (RAM unknown: VRAM decides)
+        for vram, n in ((96, 4), (96, 8), (160, 2), (32, 2)):
+            c = maya.mm3_recommended_context(vram, 128, "int8", 93, n)
+            self.assertTrue(c == maya.MM3_CONTEXTS[0] or gib(c, n) <= vram * maya.MM3_PARALLEL_VRAM_SHARE)
+            self.assertTrue(c == maya.MM3_CONTEXTS[-1] or gib(c * 2, n) > vram * maya.MM3_PARALLEL_VRAM_SHARE or
+                            c >= maya.MM3_TESTED_CONTEXT)
+
+    def test_parallel_notes(self):
+        said, warned = [], []
+        with patch.object(maya, "warn", warned.append), patch.object(maya, "ok", said.append):
+            maya.mm3_context_notes(65536, 96, 183, "int8", 93, 4)               # (15.5 GB of 96: fine)
+            self.assertEqual(warned, [])
+            self.assertIn("4 conversations at once", said[0])
+            self.assertIn("VRAM", said[0])
+            maya.mm3_context_notes(262144, 96, 183, "int8", 93, 4)              # (62 GB of 96: the experts give way)
+        self.assertEqual(len(warned), 1)
+        self.assertIn("128K fits this PC for 4", warned[0])
+
     def test_warnings(self):
         said = []
         with patch.object(maya, "warn", said.append), patch.object(maya, "ok", lambda *a: None):
@@ -184,6 +213,27 @@ class Config(unittest.TestCase):
         a = self.write(args(no_vision=True))["args"]
         self.assertEqual(a[a.index("--vision") + 1], "off")
 
+    def test_parallel_written_kept_and_given_back(self):
+        """--parallel N is written and kept by a setup again; with N above 1 a new config does not ask for KV streaming
+        (the engine runs each conversation's cache in VRAM), and --parallel 1 brings it back."""
+        a = self.write(args(parallel=4))["args"]
+        self.assertEqual(a[a.index("--parallel") + 1], "4")
+        self.assertNotIn("--kv-streaming", a)
+        a = self.write(args())["args"]                                         # (a setup again: kept)
+        self.assertEqual((a.count("--parallel"), a[a.index("--parallel") + 1]), (1, "4"))
+        self.assertNotIn("--kv-streaming", a)
+        a = self.write(args(parallel=2))["args"]
+        self.assertEqual((a.count("--parallel"), a[a.index("--parallel") + 1]), (1, "2"))
+        a = self.write(args(parallel=1))["args"]
+        self.assertEqual(a[a.index("--parallel") + 1], "1")
+        self.assertEqual(a[a.index("--kv-streaming") + 1], "on")
+        old = {"args": ["--pack", "/old", "--kv-streaming", "on", "--kv-resident", "16384"]}
+        a = self.write(args(parallel=4), old)["args"]                         # (a streaming config kept as chosen)
+        self.assertEqual((a[a.index("--kv-streaming") + 1], a[a.index("--parallel") + 1]), ("on", "4"))
+
+    def test_fresh_has_no_parallel(self):
+        self.assertNotIn("--parallel", self.write(args())["args"])
+
     def test_again_keeps_what_it_does_not_ask(self):
         old = {"args": ["--pack", "/old", "--max-context", "262144", "--kv-cache", "int8", "--vision", "off"],
                "reasoning_effort": "high", "sampling": {"temperature": 0.7}, "host": "0.0.0.0"}
@@ -191,7 +241,9 @@ class Config(unittest.TestCase):
         a = c["args"]
         self.assertEqual(a[a.index("--kv-cache") + 1], "int8")
         self.assertEqual(a[a.index("--vision") + 1], "off")
-        self.assertEqual((c["reasoning_effort"], c["sampling"], c["host"]), ("high", {"temperature": 0.7}, "0.0.0.0"))
+        # (the model's own sampling and level every setup - the owner, 2026-10-27: no exceptions)
+        self.assertEqual((c["reasoning_effort"], c["sampling"], c["host"]), ("auto", {"temperature": 1.0, "top_p": 0.95},
+                                                                              "0.0.0.0"))
 
     def test_tp_follows_the_gpus_chosen_now(self):
         """#436 (DeepSeek's, the same rule here): the config before's --tp only for the same GPUs"""

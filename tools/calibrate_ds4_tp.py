@@ -46,7 +46,10 @@ KEYS = ("--tp", "--cpu-threads")         # the engine arguments a calibration ow
 def tp_candidates(vram: list[float]) -> list[int]:
     """The --tp values that group these GPUs (their memory, in the engine's order) differently: 2, 4, 8, 16 up to the
     longest run of equal GPUs, that run's length, and every GPU in one group when there are more than that run; with no
-    two GPUs alike, 1 (each alone) and all of them together.  [] for one GPU."""
+    two GPUs alike, 1 (each alone) and all of them together.  On up to four GPUs the layer split (1) is measured as well,
+    last (#502: on 2x RTX 3090 it kept ~22% more experts in VRAM and read prompts 1.55x faster than --tp 2, its decode
+    5-8% lower - the measured decode decides); past four, its stages leave too much of each GPU idle in decode to be
+    worth a start.  [] for one GPU."""
     n = len(vram)
     if n < 2:
         return []
@@ -64,6 +67,8 @@ def tp_candidates(vram: list[float]) -> list[int]:
     for t in (longest, n):
         if t not in out:
             out.append(t)
+    if n <= 4:
+        out.append(1)
     return out
 
 

@@ -789,5 +789,17 @@ class WindowsHipSetupTests(unittest.TestCase):
         self.assertNotIn("STRATA_GLM_POOL_GB", env)
 
 
+class Vs2026Hint(unittest.TestCase):
+    """#544: a HIP build with VS 2026's Build Tools alone - its folder is named 18, 2019 / 2022 by their year."""
+
+    def test_vs_2026(self):
+        vs = r"C:\Program Files (x86)\Microsoft Visual Studio\{}\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+        self.assertTrue(maya.vs_2026(vs.format("18")))
+        self.assertFalse(maya.vs_2026(vs.format("2022")))
+        self.assertFalse(maya.vs_2026(vs.format("2019")))
+        self.assertFalse(maya.vs_2026(None))
+        self.assertIn("2022", maya.VS2026_HIP_HINT)
+
+
 if __name__ == "__main__":
     unittest.main()

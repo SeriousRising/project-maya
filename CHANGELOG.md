@@ -4,6 +4,93 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.35 - 2026-10-28
+
+GLM keeps every expert in VRAM on NVIDIA where they fit, tuned speed settings are measured again after a driver
+change, GLM conversations with pictures keep their slots, faster long prompts for Qwen-3.8-Flash-Next (CYBER-FROST) on
+three or more GPUs, and a MiniMax `--parallel` fix.
+
+- **GLM: every expert stays in VRAM on NVIDIA where it fits** (#474, @walker2kk): where the GPUs' memory holds every
+  expert, NVIDIA now gets the same complete expert pool as AMD, so a long prompt no longer pushes experts out of VRAM
+  and the decode after it stays at full speed (the reporter's 4x A100 split: 2.5x decode). Where the experts do not all
+  fit, nothing changes. `MAYA_GLM_COMPLETE_POOL=0` keeps the old pool.
+- **A tuned speed setting is measured again after a driver or P2P change** (#419, @catonooka): the CPU-lane tuning
+  (`MAYA_GLM_PCIE_SHARE`, `MAYA_GLM_CPU_LANE`, `MAYA_GLM_READ_CHUNKS`) now remembers the NVIDIA driver, the GPUs' slots
+  and which GPUs reach each other directly (P2P). When one of them changes, Maya says what changed, drops the old values
+  and the engine measures again at its start (the reporter's 2x RTX 3090 after a P2P driver: 1.6x decode back);
+  `./maya.sh --calibrate` tunes it again. A setup no longer re-applies a stale stored tuning.
+- **GLM: a conversation with pictures keeps its slot** (#331, @Cass67; also reported in #418 by @CoolJohn-lab): a chat
+  with pictures is set aside in a conversation slot like a text chat, so a chat with one screenshot no longer reads its
+  whole history again each time another chat pushed it out. Kept slots from an older version are removed once at start
+  (the slot format changed).
+- **GLM: an edited last message after switching chats** (#400, @Zcg2021): A -> B -> back to A with the last message
+  edited no longer reads the whole conversation again (that step's prompt read about 10x faster on a 2K-token chat).
+- **GLM calibration with more CPU-lane threads** (#178, @Jw88888): on one GPU whose CPUs show no SMT siblings (a VM's
+  vCPUs) `--calibrate` also measures more CPU-lane threads than the engine's own count, and lower counts are no longer
+  measured slower than they run; new setting `MAYA_GLM_CPU_LANE_MAX`.
+- **MiniMax `--parallel`: a short question no longer evicts a long picture conversation:** the picture was read again
+  at that conversation's next turn. A new request now takes an empty conversation (or the least recently used one);
+  continued conversations are reused as before (that next turn 2.9x faster on 3x V100, its answer the same).
+- **Qwen-3.8-Flash-Next (CYBER-FROST) on three or more GPUs reads long prompts with every GPU at once:** with the model
+  split across GPUs, the second and third GPU used to take turns on each piece of the prompt; each now works on a
+  different piece at the same time. On three V100s with most experts in VRAM, prompts of 4K, 8K and 16K tokens read
+  about 1.14x, 1.35x and 1.5x faster (a 2K prompt is one piece: no change); with experts streamed from RAM the gain is
+  small. Answers are the same; one GPU and two GPUs are unchanged.
+- **Chat:** the attach menu's item reads "Select file".
+
+## v1.1.34 - 2026-10-27
+
+DeepSeek and MiniMax answer several requests at once, fixes for one-GPU and tensor-parallel speed, Qwen-3.8-Flash-Next
+(CYBER-FROST) in the setup, each model's own defaults in the chat, your own EXL3 folders in the setup, and a new README.
+
+- **DeepSeek-V4.1-Flash and MiniMax-M3.1-Flash answer several requests at once** (#332): `./maya.sh --parallel 4`
+  (Windows: `START-MAYA.bat --parallel 4`; up to 8), or the Models page's Answers at once, as for GLM-5.3-Flash - for
+  agents that run several sessions, or several people on one PC. Each conversation keeps its own state; two at once
+  write about 1.6x the tokens per second of one after another on a V100 with most of DeepSeek Maya-XS's experts in
+  RAM. MiniMax keeps every conversation's cache in VRAM, so KV streaming and its drafter
+  are off while more than one runs, and the setup recommends a context that leaves them room.
+- **DeepSeek on one GPU with every expert in RAM** (#551, @talisp): the one-GPU decode path now turns itself off where
+  nothing would ever stream from the disk (`--mmap-experts off`, or auto with all of them copied); it cost 4-9% of
+  decode on the reporter's L40S, and decode was 2.2x faster without it on a V100 test PC. Nothing to set.
+- **MiniMax CPU lane** (#552, @talisp): `--cpu-threads N` now means N threads in all, as for DeepSeek (it started
+  N + 1: about 1.3x faster decode with N = the cores); by default 2 cores stay free for the engine's other work on a
+  CPU without SMT (a VM's vCPUs), and decode times the CPU lane again when the start-up timing was off.
+- **MiniMax prompts on one GPU** (#552): the prompt calibration also tries larger chunks where most experts stay in
+  RAM and keeps one only when it reads prompts clearly faster without slowing decode: 1.9x faster prompts on a V100
+  with a quarter of the experts in VRAM.
+- **MiniMax tensor parallel with DSpark** (#556, @bandito1): the VRAM the drafter's GPU uses alone was left empty on
+  the other GPU of its group; that GPU now fills it with more experts (about 1.2x decode on a two-GPU test with half
+  of the experts outside VRAM).
+- **Qwen-3.8-Flash-Next (CYBER-FROST) in the setup:** its Q5_K_M GGUF, pinned and checked, with its MTP drafter built
+  from the GGUF's own block (no second download), its experts read straight from the GGUF where RAM cannot hold them
+  all, INT8 KV cache, and the model card's settings (temperature 1.0, top-p 0.95, top-k 20; reasoning efforts low,
+  medium and xhigh). Text only.
+- **Each model's own defaults:** the setup writes each model's card sampling and thinking level into its config every
+  time, the chat uses them until you choose something, and switching models starts at the new model's own. GLM gets
+  its Max level and penalty fields; Top-k and Min-p "off" take effect; a chat continued on another model takes its
+  nearest thinking level; the same seed gives the same answer on DeepSeek and MiniMax. The chat follows a streaming
+  answer until you scroll, and notifications get a close button.
+- **Your own quants in the setup** (#545 @sebastian-burlacu, #547 @misty-soverin, #528 @woodsonl): `--model-dir`
+  takes an EXL3 folder of GLM-5.3-Flash or MiniMax-M3.1-Flash at any bit rate, checked file by file, with the
+  folder's own sampling and chat template; a GLM GGUF with another expert count (a pruned model) no longer gets the
+  shipped 288-expert profile. The model list is shorter: unsloth's DeepSeek UD-Q4_K_XL and turboderp's GLM
+  EXL3 sc_4.10bpw are no longer offered (named by hand, or set up before, they work as before).
+- **DeepSeek expert tables** (#550, @handmade0octopus): two races closed - a streamed expert no longer lands in a
+  recent slot while its swap is pending, and a table update waits for the device's earlier one.
+- **DeepSeek tensor parallel: a stopped prompt no longer wedges the pair** (#539, @zhangxiaoxing): one GPU spinning
+  and the other idle until a restart. A request that stops moving for 10 minutes now ends the engine with a report and
+  the server starts it again; an engine stopped by a signal is no longer reported as out of RAM (#494).
+- **More fixes:** DeepSeek on a 2-socket PC no longer gets killed for memory at load with RAM free (#507,
+  @zhangxiaoxing); `--calibrate` measures the layer split too on two to four equal GPUs (#502, @noonghunna); one busy
+  moment at MiniMax's start no longer moves every expert to the GPU for the session (#548, @noonghunna); `--bench`
+  uses MiniMax's own chat format and engine on AMD and works with a `--parallel` config (#549 @noonghunna, #420
+  @oscarlius, #509 @knoodrake); Linux setups warn when systemd-oomd could end the session during a large load (#497,
+  @HansStrupat); the CPU expert kernel builds with an assembler without AVX512-VNNI (#535, @biochem-fan); a Windows
+  AMD build with only Visual Studio 2026's Build Tools says what to install (#544, @wonder-sound).
+- **README:** a shorter front page - quick start, one "pick your model" table with each quant under its own model
+  (#554, @AutisticPancake), quality, and every user speed report back in a closed section per model; each model's
+  files and options in [docs/MODELS.md](docs/MODELS.md).
+
 ## v1.1.33 - 2026-10-27
 
 A quick fix for setting up MiniMax-M3.1-Flash from our GGUFs.

@@ -1,6 +1,7 @@
 # Setting up Maya
 
-The setup in detail: what its first run does, starting again and updating, and its options. Back to the
+The setup in detail: what its first run does, starting again and updating, its options, and what to do if the build
+fails. Back to the
 [README](../README.md).
 
 ## What the first run does
@@ -30,7 +31,8 @@ It first asks which model to set up:
 
   Or from [unsloth's GGUFs](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (`--ds4-quant`; the setup asks):
   **UD-Q8_K_XL** (508 GB, the default: dense weights BF16, routed experts MXFP4, the Engram tables FP8 - DeepSeek's own
-  formats) or **UD-Q4_K_XL** (501 GB: dense weights Q8_0, less VRAM). The same engine reads them in place (the pack is
+  formats); its **UD-Q4_K_XL** (501 GB: dense weights Q8_0, less VRAM) is no longer in the setup's list - `--ds4-quant
+  gguf-q4` and an install of it work as before. The same engine reads them in place (the pack is
   `tools/ds4/pack_gguf.py`'s), from NVIDIA Volta (V100) on: the most-used experts in VRAM, the others read from the
   GGUF through the OS page cache - from RAM where they fit, from the SSD otherwise - so it runs whatever the memory
   (more VRAM and RAM is faster; keep the files on an NVMe SSD; `--mmap-experts off` copies as many of them into RAM as
@@ -93,6 +95,19 @@ GLM-5.3-Flash's first run takes 20-40 minutes plus the download:
 > **The start takes a few minutes**: the engine pins most of the free RAM (all but about 6 GB) for its expert tier
 > and warms its caches. Other programs get little RAM while Maya runs.
 
+**Linux: systemd-oomd.** Stock Ubuntu 22.04 and newer run `systemd-oomd`, which ends a desktop session's whole
+terminal (Maya, and the setup's own tuning with it) when the session's memory pressure stays over 50% for 20 seconds.
+Loading a large RAM tier - about 200 GB of DeepSeek experts - reclaims the page cache for minutes and can cross that,
+with RAM still free and nothing in `dmesg`; only the journal says `systemd-oomd killed ... process(es)` (issue #497).
+`--check` and the setup warn when it runs. Stop it for the run with `sudo systemctl stop systemd-oomd` (it starts again
+at the next boot), or exempt your user sessions for good with a drop-in, then log out and in:
+
+```bash
+sudo mkdir -p /etc/systemd/system/user@.service.d
+printf '[Service]\nManagedOOMMemoryPressure=auto\n' | sudo tee /etc/systemd/system/user@.service.d/90-maya-oomd.conf
+sudo systemctl daemon-reload
+```
+
 ## Next time, and updating
 
 **Next time**, just run `./setup.sh` again (or the model's `./run-maya-<model>.sh`): it starts right away, nothing is
@@ -112,12 +127,12 @@ is not downloaded again, and your settings stay. By hand: `git pull`, then `./se
 | --- | --- |
 | `--setup` | set up again (other GPUs, context, model folder) |
 | `--check` | only check the PC |
-| `--gguf-dir DIR` | use GLM-5.3-Flash GGUF files you already have: their folder, or the `.gguf` file (the first one of a split model) when the folder holds several models. The folder must be writable: the pack goes inside it |
+| `--gguf-dir DIR` | use GLM-5.3-Flash GGUF files you already have: their folder, or the `.gguf` file (the first one of a split model) when the folder holds several models. The folder must be writable: the pack goes inside it. A GGUF Maya does not list (a pruned model such as RCO-152E included: the shipped expert profile is for 288 experts a layer and is left out of any other count) gets its own sampling (`general.sampling.*`) and chat template from the file, else GLM's |
 | `--models-dir DIR` | where downloaded models go, each in a folder named after it - `DIR/Maya-L/` holds that model's GGUF files (default `../Maya-data/models`); put it on the NVMe |
 | `--download-model` | download the model without asking (the commands and size are still printed) |
-| `--model NAME` | which model and files, without asking. Maya's quants by their setup id - the model first, then the tier (XS, S, M, L by the experts' bits): `glm-maya-s`, `glm-maya-s24`, `glm-maya-m`, `glm-maya-m-derisked`, `glm-maya-l`, `deepseek-maya-xs`, `deepseek-maya-s`, `deepseek-maya-m`, `minimax-maya-xs`, `minimax-maya-s` (or the full name, e.g. `MiniMax-M3.1-Flash-Maya-XS`). Or a model, its files asked: `DeepSeek-V4.1-Flash-1017`, `MiniMax-M3.1-Flash`. The names used before still work: `Maya-S-v2-IQ2_XXS` (GLM-5.3 · Maya-S), `Maya-S24`, `Maya-M`, `Maya-M-Derisked`, `Maya-L`, and `EXL3-3.05bpw` / `EXL3-4.05bpw` / `EXL3-sc_4.10bpw` - an experimental EXL3 quant of GLM-5.3-Flash at 3.05 or 4.05 bits per weight, or the self-calibrated one at 4.10 with 8-bit attention and shared experts ([3.05bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/3.05bpw), 125.3 GB; [4.05bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/4.05bpw), 165.2 GB; [sc_4.10bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/sc_4.10bpw), 167.8 GB; all with the MTP block) that the engine reads in place from its safetensors: NVIDIA, and AMD (experimental); 3.05bpw tested on Linux, none measured against the FP8 model |
-| `--model-dir DIR` | use DeepSeek-V4.1-Flash-1017's files you already have: the folder with a GGUF's shards, or with the EXL3 quant's files and the Engram shards `model-00047-of-00048.safetensors` / `model-00048-of-00048.safetensors` of DeepSeek's repo (it must be writable: the pack goes inside it) |
-| `--ds4-quant Q` | DeepSeek-V4.1-Flash-1017's files: `maya-s`, `maya-xs` (Maya's quants, the same as `--model deepseek-maya-s` / `deepseek-maya-xs`; Maya-S the default), `gguf-q8` (unsloth's UD-Q8_K_XL GGUF), `gguf-q4` (its UD-Q4_K_XL: dense weights Q8_0), `exl3` (LibertAIDAI's EXL3 quant at 2.9 bits), `exl3-3.5` (its 3.5-bit quant: closer to the original, about 280 GB of VRAM and RAM), `abliterated-128g` / `abliterated-256g` (orcarouter's abliterated model as its Mix-128G / Mix-256G GGUF, with Maya's Q6_K n-gram tables; `abliterated`: the one this PC holds; a gated repo: `HF_TOKEN` or `hf auth login`); the EXL3 quants need NVIDIA V100 or newer (pictures: RTX 30 / A100 or newer) and are offered only there, and on AMD as experimental (as GLM's EXL3 quants there; [docs/EXL3_HIP.md](EXL3_HIP.md)) |
+| `--model NAME` | which model and files, without asking. Maya's quants by their setup id - the model first, then the tier (XS, S, M, L by the experts' bits): `glm-maya-s`, `glm-maya-s24`, `glm-maya-m`, `glm-maya-m-derisked`, `glm-maya-l`, `deepseek-maya-xs`, `deepseek-maya-s`, `deepseek-maya-m`, `minimax-maya-xs`, `minimax-maya-s` (or the full name, e.g. `MiniMax-M3.1-Flash-Maya-XS`). Or a model, its files asked: `DeepSeek-V4.1-Flash-1017`, `MiniMax-M3.1-Flash`. The names used before still work: `Maya-S-v2-IQ2_XXS` (GLM-5.3 · Maya-S), `Maya-S24`, `Maya-M`, `Maya-M-Derisked`, `Maya-L`, and `EXL3-3.05bpw` / `EXL3-4.05bpw` / `EXL3-sc_4.10bpw` - an experimental EXL3 quant of GLM-5.3-Flash at 3.05 or 4.05 bits per weight, or the self-calibrated one at 4.10 with 8-bit attention and shared experts ([3.05bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/3.05bpw), 125.3 GB; [4.05bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/4.05bpw), 165.2 GB; [sc_4.10bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/sc_4.10bpw), 167.8 GB; all with the MTP block) that the engine reads in place from its safetensors: NVIDIA, and AMD (experimental); 3.05bpw tested on Linux, none measured against the FP8 model (`EXL3-sc_4.10bpw` is not in the setup's list: named by hand, or set up before, it works as before) |
+| `--model-dir DIR` | use DeepSeek-V4.1-Flash-1017's files you already have: the folder with a GGUF's shards, or with the EXL3 quant's files and the Engram shards `model-00047-of-00048.safetensors` / `model-00048-of-00048.safetensors` of DeepSeek's repo (it must be writable: the pack goes inside it). Or an EXL3 folder of GLM-5.3-Flash or MiniMax-M3.1-Flash at any bit rate that is not one of the listed downloads (turboderp's other branches, Mia-AiLab's other bit rates): the setup reads the folder's own `config.json` and `model.safetensors.index.json`, checks each file whole by its header, never offers the listed downloads for it, writes a config named after the folder (`maya-<folder>.json`) and uses the folder's own sampling (`generation_config.json`) and chat template (`chat_template.jinja`) - GLM's / MiniMax's where the folder has none. MiniMax: `--model MiniMax-M3.1-Flash --model-dir DIR` is the same |
+| `--ds4-quant Q` | DeepSeek-V4.1-Flash-1017's files: `maya-s`, `maya-xs` (Maya's quants, the same as `--model deepseek-maya-s` / `deepseek-maya-xs`; Maya-S the default), `gguf-q8` (unsloth's UD-Q8_K_XL GGUF), `gguf-q4` (its UD-Q4_K_XL: dense weights Q8_0; not in the setup's list, named by hand), `exl3` (LibertAIDAI's EXL3 quant at 2.9 bits), `exl3-3.5` (its 3.5-bit quant: closer to the original, about 280 GB of VRAM and RAM), `abliterated-128g` / `abliterated-256g` (orcarouter's abliterated model as its Mix-128G / Mix-256G GGUF, with Maya's Q6_K n-gram tables; `abliterated`: the one this PC holds; a gated repo: `HF_TOKEN` or `hf auth login`); the EXL3 quants need NVIDIA V100 or newer (pictures: RTX 30 / A100 or newer) and are offered only there, and on AMD as experimental (as GLM's EXL3 quants there; [docs/EXL3_HIP.md](EXL3_HIP.md)) |
 | `--mm3-quant Q` | MiniMax-M3.1-Flash's files: `exl3` (Mia-AiLab's EXL3 quant at 3.5 bits, NVIDIA), `maya-xs` or `maya-s` (Maya's GGUF quants, the same as `--model minimax-maya-xs` / `minimax-maya-s`; `gguf-xs` / `gguf-s` before) |
 | `--no-vision` | text only: no image encoder (DeepSeek, MiniMax: their vision tower off) |
 | `--draft mtp` / `--draft dflash2` | how the model drafts tokens ahead: its MTP block (the default), or a DFlash2 drafter - downloaded (0.7 GB) into `DIR/GLM-5.3-Flash-DFlash2/` and passed as `--dflash` (Maya-L: +44% on nine GPUs, +12% on two, +19% on one GPU; NVIDIA RTX 30 / A100 and newer - older cards keep the MTP block unless you pass this; the drafter's license is CC BY-NC-ND 4.0, non-commercial use only). The [speed calibration](SETTINGS.md#the-speed-calibration) then keeps it only if it is faster on your PC |
@@ -166,3 +181,22 @@ in VRAM warm up again over the next answers. With `STRATA_GLM_SLOT_KEEP=1` the c
 the disk on the way out and read back, so the next turn of the same chat reads only its new tokens (1,630 of 1,690
 prompt tokens reused after an unload). `0` (the default): never. A new `--setup` writes the config again: add the
 lines back after it.
+
+## If the build fails
+
+- **"nvcc ... cannot build for these GPUs":** Volta needs CUDA 12.x, Blackwell 12.8 or newer. The setup takes the
+  newest installed toolkit that fits.
+- **"unsupported GNU version":** `./maya.sh --setup --host-compiler g++-12` (install `g++-12` first).
+- **`cuda_profiler_api.h` or `nvtx3/nvToolsExt.h` is missing:** Maya's CUDA build needs the profiler API and NVTX
+  headers as well as `nvcc` and the runtime. Install those development components for your toolkit. With a split
+  CUDA 13 toolkit, NVIDIA's official header wheels can also stay in a project-local folder:
+
+  ```sh
+  python3 -m pip install --target .cuda-headers \
+    nvidia-cuda-profiler-api==13.3.27 nvidia-nvtx==13.3.29
+  CPATH="$PWD/.cuda-headers/nvidia/cu13/include${CPATH:+:$CPATH}" ./maya.sh --setup
+  ```
+
+  Select wheel versions that match your toolkit. This include layout was checked with CUDA 13.3,
+  `nvidia-cuda-profiler-api==13.3.27` and `nvidia-nvtx==13.3.29`; other CUDA major versions can use a different
+  layout. Use the same `CPATH` when rebuilding after an update. No shared toolkit files need changing.

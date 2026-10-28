@@ -72,6 +72,58 @@ class Command(unittest.TestCase):
         with patch.object(CPF, "prompt_ids", return_value=[]):
             self.assertEqual(CPF.run(mm3_cfg(), say=lambda *a: None, runner=runner)["chunk"], 1024)
 
+    def wide_run(self, wide_tok_s, kept_decode, rc_b=0):
+        """Calibration where not every expert is in VRAM (#552): the engine's first run reports a larger chunk and
+        its decode; a decode check's start (if made) reports kept_decode.  -> (res, the commands, the tune file)"""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        tune = Path(tmp.name) / "prefill-tune.txt"
+        tune.write_text("other-pc\tchunk=2048 gemm=0\nthis-pc\tchunk=1024 gemm=0 tok_s=150.0\n", encoding="utf-8")
+        cmds = []
+
+        def runner(cmd, env, cwd, timeout, say):
+            cmds.append(cmd)
+            if "--calibrate-decode" in cmd:
+                if rc_b:
+                    return rc_b, ["maya-mm3: out of memory\n"]
+                Path(cmd[cmd.index("--calibrate-decode") + 1]).write_text(json.dumps({"decode_tok_s": kept_decode}))
+                return 0, []
+            Path(cmd[cmd.index("--calibrate-prefill") + 1]).write_text(json.dumps(
+                {"key": "this-pc", "file": str(tune), "chunk": 1024, "gemm": "blas", "tok_s": 150.0,
+                 "default_tok_s": 150.0, "tokens": 4096, "all_resident": False, "wide_chunk": 4096,
+                 "wide_tok_s": wide_tok_s, "decode_tok_s": 14.2, "trials": []}))
+            return 0, []
+        with patch.object(CPF, "prompt_ids", return_value=[1, 2, 3]):
+            res = CPF.run(mm3_cfg(), say=lambda *a: None, runner=runner)
+        return res, cmds, tune
+
+    def test_wide_chunk_kept_when_decode_holds(self):
+        res, cmds, tune = self.wide_run(340.0, 14.3)   # (decode 14.2 against 14.3: within DECODE_LOSS)
+        self.assertEqual(len(cmds), 2)
+        b = cmds[1]
+        self.assertEqual(b[b.index("--chunk") + 1], "1024")   # (the decode check: the kept chunk's buffers)
+        self.assertNotIn("--calibrate-prefill", b)
+        self.assertEqual((res["chunk"], res["tok_s"], res["wide_check"]["taken"]), (4096, 340.0, True))
+        lines = tune.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[0], "other-pc\tchunk=2048 gemm=0")   # (another PC's line kept)
+        self.assertEqual(lines[1], "this-pc\tchunk=4096 gemm=0 tok_s=340.0 default_tok_s=150.0 tokens=4096")
+
+    def test_wide_chunk_not_kept_when_decode_drops(self):
+        res, cmds, tune = self.wide_run(340.0, 15.5)   # (8% faster decode with the default chunk)
+        self.assertEqual((len(cmds), res["chunk"], res["wide_check"]["taken"]), (2, 1024, False))
+        self.assertIn("this-pc\tchunk=1024 gemm=0 tok_s=150.0", tune.read_text(encoding="utf-8"))
+
+    def test_no_second_start_for_a_small_gain(self):
+        res, cmds, _ = self.wide_run(170.0, 14.3)   # (+13%: below WIDE_GAIN)
+        self.assertEqual((len(cmds), res["chunk"]), (1, 1024))
+        self.assertNotIn("wide_check", res)
+
+    def test_failed_decode_check_keeps_the_default(self):
+        res, cmds, tune = self.wide_run(340.0, 0, rc_b=1)
+        self.assertEqual((len(cmds), res["chunk"]), (2, 1024))
+        self.assertIn("failed", res["wide_check"])
+        self.assertIn("this-pc\tchunk=1024", tune.read_text(encoding="utf-8"))
+
     def test_failed_run_raises(self):
         with patch.object(CPF, "prompt_ids", return_value=[]):
             with self.assertRaisesRegex(RuntimeError, "exit 1.*out of memory"):

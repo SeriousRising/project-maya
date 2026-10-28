@@ -55,7 +55,8 @@ from serve import ds4_vision, gpu_map, loop_guard, mm3_vision, models, savings  
 
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
 from serve.frontend import (CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
-                            EFFORT_WORDS, anthropic_to_messages, deepseek_effort_kwargs, deepseek_images, effort_kwargs,
+                            EFFORT_WORDS, QWEN_EFFORT, anthropic_to_messages, deepseek_effort_kwargs, deepseek_images,
+                            effort_kwargs,
                             effort_level, effort_name, literal_tags, mark_literals, media_of, openai_to_messages,
                             unmark_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -724,6 +725,9 @@ class StrataEngine:
             if "issue #29" in line:
                 return ("The engine stopped itself because it had stopped making progress - a hang it caught. Its log "
                         "line: " + line.strip() + " - please report it at github.com/mw00/project-maya/issues.")
+        if getattr(getattr(self, "proc", None), "returncode", None) in (-2, -15):   # (#539: read as a lack of RAM)
+            return ("A signal from outside ended it (SIGINT or SIGTERM: Ctrl+C, kill, a service manager), not a lack "
+                    "of RAM.")
         return ("The usual cause is running out of RAM: Linux then ends the biggest program (check: sudo dmesg | "
                 "grep -i -E 'killed process|out of memory'); Windows slows down instead. Close other programs or use a "
                 "smaller model (Q2_0 / IQ2_XS).")
@@ -876,7 +880,7 @@ class StrataEngine:
             sd = tune.get("suffix_draft")   # the DeepSeek engine's prompt lookup beside DSpark: off (0) / on (1)
             if isinstance(sd, int) and not isinstance(sd, bool) and sd in (0, 1):
                 tune_keys += f" suffix_draft={sd}"
-            ct = tune.get("cpu_threads")   # the GLM engine's CPU lane threads (fewer than it started with)
+            ct = tune.get("cpu_threads")   # the GLM engine's CPU lane threads (more: STRATA_GLM_CPU_LANE_MAX)
             if isinstance(ct, int) and not isinstance(ct, bool) and ct > 0:
                 tune_keys += f" cpu_threads={ct}"
             rc = tune.get("read_chunks")   # ... and the pieces it reads an expert from the SSD in (x3)
@@ -2161,6 +2165,8 @@ class Service:
         if why:
             raise ValueError(f"{p.name} cannot start: {why} - run the setup again to repair it")
         self._restart_busy()
+        if models.own_defaults(p):                       # (its model's own sampling and level, as the setup writes)
+            print(f"[maya] {p.name}: its model's own sampling and thinking level written into it", flush=True)
         os.utime(p)
         restarts = bool(os.environ.get("MAYA_RESTART_ON_UPDATE"))
         if restarts:
@@ -3986,10 +3992,12 @@ def make_handler(svc: Service):
                 self.wfile.write(body)
             elif path == "/health":
                 # the run config's recommended settings: the web app's Chat defaults until its user picks their own
-                rec = {k: v for k, v in svc.sampling_defaults.items() if k in ("temperature", "top_p", "top_k")}
-                if svc.default_effort:   # (MiniMax's by its own five names)
+                rec = {k: v for k, v in svc.sampling_defaults.items() if k in ("temperature", "top_p", "top_k", "min_p")}
+                if svc.default_effort:   # (MiniMax's by its own five names, CYBER-FROST's by Qwen's three)
                     rec["reasoning_effort"] = (effort_name if getattr(svc.template, "minimax", False) else effort_level)(
                         svc.default_effort) or svc.default_effort
+                    if getattr(svc.template, "forced_thinking", False):
+                        rec["reasoning_effort"] = QWEN_EFFORT.get(rec["reasoning_effort"], rec["reasoning_effort"])
                 self._json(200, {"status": "updating" if svc.updater.busy() else
                                            "reloading" if svc.reloading() else "ok",
                                  "max_context": svc.engine.max_context, "model": svc.model,
@@ -4607,7 +4615,8 @@ def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     return httpd
 
 
-SHARED_KEYS = ("reasoning_effort", "temperature", "top_p", "top_k", "seed", "max_tokens", "experimental_speed_projection")
+SHARED_KEYS = ("reasoning_effort", "temperature", "top_p", "top_k", "seed", "max_tokens", "experimental_speed_projection",
+               "repetition_penalty", "frequency_penalty", "presence_penalty")
 
 
 def clean_shared_defaults(d) -> dict:
@@ -4635,20 +4644,41 @@ def clean_shared_defaults(d) -> dict:
             if not number or not 0 <= value < 1:
                 raise ValueError("min_p: 0 <= min_p < 1")
         elif key == "top_k":
-            if not number or value != int(value) or not 1 <= value <= 64:
-                raise ValueError("top_k: an integer 1..64")
+            if not number or value != int(value) or not 0 <= value <= 64:   # (0: no top-k cut - the page's "off")
+                raise ValueError("top_k: an integer 0..64")
             value = int(value)
         elif key in ("seed", "max_tokens"):
             if not number or value != int(value) or value <= 0:
                 raise ValueError(f"{key}: a positive integer")
             value = int(value)
+        elif key == "repetition_penalty":               # (the Chat's penalties: only those its user set)
+            if not number or not 0 < value <= 10:
+                raise ValueError("repetition_penalty: above 0, at most 10 (1 = off)")
+        elif key in ("frequency_penalty", "presence_penalty"):
+            if not number or not -2 <= value <= 2:
+                raise ValueError(f"{key}: -2..2 (0 = off)")
         elif key == "experimental_speed_projection":
             if not isinstance(value, bool):
                 raise ValueError("experimental_speed_projection: true or false")
         else:
             raise ValueError(f"unknown setting {key!r}")
-        out[key] = float(value) if key in ("temperature", "top_p", "min_p") else value
+        out[key] = float(value) if key in ("temperature", "top_p", "min_p") or key.endswith("_penalty") else value
     return out
+
+
+def chat_template_path(tpath) -> Path:
+    """The template a model renders with (main): its tokenizer's chat_template.jinja (the pack's copy: MiniMax's and
+    DeepSeek's are tools/mm3's and tools/ds4's - DeepSeek's rendered by its pinned encoder, serve/ds41_encoding.py -
+    CYBER-FROST's its own, verbatim), a GLM-5 pack's swapped for serve/glm5_chat_template.jinja (MAYA_PACK_TEMPLATE=1
+    keeps the pack's), and serve/chat_template.jinja when the tokenizer has none."""
+    tpl = Path(tpath) / "chat_template.jinja"
+    tpl = tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"
+    glm5 = ROOT / "serve/glm5_chat_template.jinja"
+    if glm5.exists() and os.environ.get("MAYA_PACK_TEMPLATE") != "1" and tpl != glm5:
+        head = tpl.read_text(encoding="utf-8", errors="replace")
+        if head.startswith("[gMASK]<sop>") and "reasoning_effort in ['low', 'high']" in head:
+            tpl = glm5
+    return tpl
 
 
 def sampling_defaults_from_config(cfg: dict) -> dict:
@@ -4899,9 +4929,12 @@ def main() -> int:
         vision = None
         env = child_env(cfg)
         sampling_defaults = sampling_defaults_from_config(cfg)
+        if "sampling" not in cfg:                       # (a config without them: the model's own, not none)
+            sampling_defaults = maya_quants.model_defaults(cfg)[0]
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
-            print(f"[maya] sampling defaults from the config: {pretty}", flush=True)
+            print(f"[maya] sampling defaults from the {'config' if 'sampling' in cfg else 'model'}: {pretty}",
+                  flush=True)
         vcfg = cfg.get("vision") or None
         vlog = (open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None) if vcfg else None
         venv = dict(env)
@@ -4973,13 +5006,7 @@ def main() -> int:
     # matches tool results to their calls without nested loops (zai-org/GLM-5.3-Flash PR #63: 100 parallel calls
     # 137 -> 6 ms a render), so the server uses the copy shipped here (serve/glm5_chat_template.jinja) for a GLM-5
     # pack.  MAYA_PACK_TEMPLATE=1 keeps the pack's own.
-    tpl = tpath / "chat_template.jinja"
-    tpl = tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"
-    glm5 = ROOT / "serve/glm5_chat_template.jinja"
-    if glm5.exists() and os.environ.get("MAYA_PACK_TEMPLATE") != "1" and tpl != glm5:
-        head = tpl.read_text(encoding="utf-8", errors="replace")
-        if head.startswith("[gMASK]<sop>") and "reasoning_effort in ['low', 'high']" in head:
-            tpl = glm5
+    tpl = chat_template_path(tpath)
     svc = Service(engine, tok, ChatTemplate(tpl),
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
@@ -4987,6 +5014,8 @@ def main() -> int:
     if getattr(engine, "multi", 0) > 1:                 # n conversations at once: n places in the FIFO
         svc.fifo.set_capacity(engine.multi)
         print(f"[maya] {engine.multi} conversations at once (--parallel)", flush=True)
+    if "reasoning_effort" not in cfg and a.engine == "strata":   # (a config without one: the model's own level)
+        cfg = dict(cfg, reasoning_effort=maya_quants.model_defaults(cfg)[1])
     if cfg.get("reasoning_effort") or (svc.template.deepseek and cfg.get("reasoning_effort") is not None):
         try:
             (deepseek_effort_kwargs if svc.template.deepseek else effort_kwargs)(cfg["reasoning_effort"])
@@ -4997,6 +5026,8 @@ def main() -> int:
         level = (effort_name if svc.template.minimax else effort_level)(svc.default_effort) or \
             (f"{svc.default_effort} of 100" if type(svc.default_effort) is int
                                                      else "none")
+        if getattr(svc.template, "forced_thinking", False):   # (CYBER-FROST: Qwen's words, low / medium / xhigh)
+            level = QWEN_EFFORT.get(level, level)
         print(f"[maya] thinking level when a request names none: {level}"
               f"{'' if level in (svc.default_effort, f'{svc.default_effort} of 100') else f' (the config says {svc.default_effort})'}",
               flush=True)

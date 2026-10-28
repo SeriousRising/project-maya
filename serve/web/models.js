@@ -70,7 +70,8 @@ async function switchTo(m) {
     (restarts
       ? `<p>Maya stops <b>${esc(run ? titleOf(run) : "the model running now")}</b> and loads <b>${esc(titleOf(m))}</b> from ` +
         `<code>${esc(m.file)}</code>. That takes a few minutes.</p><ul>` +
-        "<li>Your chats stay here. Each model keeps its own chat settings.</li>" +
+        `<li>Your chats stay here. The chat settings start at ${esc(titleOf(m))}'s own standard parameters and thinking ` +
+        "level: a model's are not another's.</li>" +
         `<li>Apps using the API get a “try again” until it is back, then the model name <code>${esc(m.model)}</code>.</li>` +
         (S.busy ? "<li>The answer being written finishes first.</li>" : "") + "</ul>"
       : `<p><b>${esc(titleOf(m))}</b> becomes the model Maya starts next. This server was not started by maya.sh or ` +
@@ -143,6 +144,15 @@ function setDraft(patch) {
 
 async function saveSettings(m) {
   if (MS.saving) return;
+  // the running model's, where Maya starts again by itself: the reload is said and confirmed first, as a switch is
+  if (m.running && MS.data.restarts) {
+    const ok = await confirmDialog(`Restart ${titleOf(m)} with these engine settings?`,
+      `<p>Maya saves them into <code>${esc(m.file)}</code> and loads the model again with them. That takes a few minutes.</p>` +
+      "<ul><li>Your chats stay here; the next answer reads the chat again.</li>" +
+      "<li>Apps using the API get a “try again” until it is back.</li>" +
+      (S.busy ? "<li>The answer being written finishes first.</li>" : "") + "</ul>", "Save and restart");
+    if (!ok) return;
+  }
   MS.saving = true;
   emit();
   try {
@@ -221,6 +231,7 @@ function fieldsOf(m, d) {
     warn=${whole(d.reserve_mib) ? null : "A whole number of MiB, or empty for the default."}>
     <${Num} label="VRAM kept free" value=${d.reserve_mib} ph=${glm ? "700" : "default"} unit="MiB / GPU" on=${(v) => setDraft({reserve_mib: v})}/><//>`;
   if (m.family === "minimax") return mm3Fields(m, d, s, ch, ctxs, images, gpus);
+  if (m.family === "qwen") return qwenFields(m, d, s, ch, ctxs, gpus);
   if (glm) {
     const ec = AutoOr({label: "Expert cache", k: "expert_cache", d, dflt: 1200, unit: "experts", subLabel: "Experts in the first GPU's pool"});
     const pf = AutoOr({label: "Prompt chunk", k: "prefill", d, dflt: 8192, unit: "tokens", subLabel: "Tokens a prompt is read in at a time"});
@@ -256,6 +267,10 @@ function fieldsOf(m, d) {
   const dspark = m.choices.draft.includes("dspark");
   return [
     {label: "Model", rows: [context,
+      html`<${Row} label="Answers at once" flag="--parallel" changed=${ch("parallel")}
+        hint="Up to 8. Each extra conversation keeps its own context's caches in VRAM, which the experts give up. An answer written alone still drafts; several at once are decoded together."
+        warn=${d.parallel > 1 && d.context * d.parallel > 1048576 ? `${d.parallel} conversations of ${ctxfmt(d.context)} each: a smaller context leaves the experts more VRAM.` : null}>
+        <${Stepper} label="Answers at once" value=${d.parallel} min=${1} max=${8} on=${(v) => setDraft({parallel: v})}/><//>`,
       html`<${Row} label="Drafting" flag="--dspark" changed=${ch("draft")}
         hint=${dspark ? "DSpark drafts a few tokens at a time for the model to check. The speed calibration picks the faster on this PC."
           : "This pack has no DSpark drafter."}>
@@ -296,13 +311,19 @@ function mm3Fields(m, d, s, ch, ctxs, images, gpus) {
   return [
     {label: "Model", rows: [
       html`<${Row} label="Context size" flag="--max-context" changed=${ch("context")}
-        hint=${d.kv_streaming ? `Every position's cache sits in RAM: ${ram}, its newest ${ctxfmt(win)} in VRAM too.${d.context > 262144 ? " Past 256K it has not been run end to end." : ""}`
+        hint=${d.parallel > 1 ? `${d.parallel} answers at once: each keeps a whole cache of this size in VRAM (${fmt((d.parallel * d.context * (kv ? kv.bytes : 63360)) / 2 ** 30, 1)} GB in all at ${ctxfmt(d.context)}), which the experts give up. The engine shortens a context that does not fit.`
+          : d.kv_streaming ? `Every position's cache sits in RAM: ${ram}, its newest ${ctxfmt(win)} in VRAM too.${d.context > 262144 ? " Past 256K it has not been run end to end." : ""}`
           : "The whole cache in VRAM: more context takes GPU memory from the experts."}>
         <${Seg} label="Context size" value=${Number(d.context)} options=${ctxs.map((n) => ({id: n, label: ctxfmt(n)}))}
           onChange=${(v) => setDraft({context: v})}/><//>`,
+      html`<${Row} label="Answers at once" flag="--parallel" changed=${ch("parallel")}
+        hint="Up to 8. Each extra conversation keeps its own context's cache in VRAM, which the experts give up. With more than one the answers are decoded together: no KV streaming and no DSpark."
+        warn=${d.parallel > 1 && d.context * d.parallel > 1048576 ? `${d.parallel} conversations of ${ctxfmt(d.context)} each: a smaller context leaves the experts more VRAM.` : null}>
+        <${Stepper} label="Answers at once" value=${d.parallel} min=${1} max=${8} on=${(v) => setDraft({parallel: v})}/><//>`,
       html`<${Row} label="Drafting" flag="--dspark" changed=${ch("draft")}
         hint=${dspark ? "DSpark drafts a few tokens at a time for the model to check: the same answer. The speed calibration picks the faster on this PC."
-          : "This pack has no DSpark drafter."}>
+          : "This pack has no DSpark drafter."}
+        warn=${d.draft === "dspark" && d.parallel > 1 ? `DSpark drafts for one answer at a time: with ${d.parallel} at once the engine decodes without it.` : null}>
         <${Seg} label="Drafting" value=${d.draft} options=${[...(dspark ? [{id: "dspark", label: "DSpark"}] : []), {id: "none", label: "Off"}]}
           onChange=${(v) => setDraft({draft: v})}/><//>`,
       images]},
@@ -318,7 +339,8 @@ function mm3Fields(m, d, s, ch, ctxs, images, gpus) {
         <${Seg} label="KV cache" value=${d.kv_cache} options=${(kv ? MM3_KV : [...MM3_KV, {id: d.kv_cache, label: d.kv_cache}]).map((f) => ({id: f.id, label: f.label}))}
           onChange=${(v) => setDraft({kv_cache: v})}/><//>`,
       html`<${Row} label="KV streaming" flag="--kv-streaming" changed=${ch("kv_streaming", "kv_resident")}
-        hint="The attention cache lives in pinned RAM, with each layer's newest positions in VRAM. Off: all of it in VRAM."
+        hint=${d.parallel > 1 ? "Off while several answers are written at once (each conversation's whole cache is in VRAM); the choice below returns with one."
+          : "The attention cache lives in pinned RAM, with each layer's newest positions in VRAM. Off: all of it in VRAM."}
         below=${d.kv_streaming ? html`<div class="mdl-sub"><span>Positions each layer keeps in VRAM (--kv-resident)</span>
           <${Num} label="Positions each layer keeps in VRAM" value=${d.kv_resident} ph="32768" unit="tokens" on=${(v) => setDraft({kv_resident: v})}/></div>` : null}
         warn=${whole(d.kv_resident) ? null : "A whole number, or empty for 32,768."}>
@@ -327,6 +349,49 @@ function mm3Fields(m, d, s, ch, ctxs, images, gpus) {
       html`<${Row} label="CPU threads" flag="--cpu-threads" changed=${ch("cpu_threads")} hint="The CPU lane's threads, which compute the experts VRAM does not hold. Empty: the engine picks."
         warn=${whole(d.cpu_threads) ? null : "A whole number, or empty."}>
         <${Num} label="CPU threads" value=${d.cpu_threads} ph="auto" unit="threads" on=${(v) => setDraft({cpu_threads: v})}/><//>`]},
+  ];
+}
+
+// CYBER-FROST's (the `maya` engine's Qwen path; text only).  Its KV cache's VRAM a context token, by format: 12 attention
+// layers' K and V plus the sparse attention's pooled keys (maya.py's QWEN_KV_BYTES for FP16)
+const QWEN_KV = [{id: "fp16", label: "FP16", bytes: 26112}, {id: "int8", label: "INT8", bytes: 14208},
+                 {id: "k8v4", label: "K8 V4", bytes: 11328}, {id: "q4_0", label: "Q4_0", bytes: 8448}];
+function qwenFields(m, d, s, ch, ctxs, gpus) {
+  const mtp = m.choices.draft.includes("mtp");
+  const kv = QWEN_KV.find((f) => f.id === d.kv) || QWEN_KV[0];
+  const ec = AutoOr({label: "Expert cache", k: "expert_cache", d, dflt: 8000, unit: "experts", subLabel: "Experts in the GPU's pool"});
+  const pf = AutoOr({label: "Prompt chunk", k: "prefill", d, dflt: 4096, unit: "tokens", subLabel: "Tokens a prompt is read in at a time"});
+  return [
+    {label: "Model", rows: [
+      html`<${Row} label="Context size" flag="--max-context" changed=${ch("context")}
+        hint=${`The attention cache sits in VRAM: about ${fmt((d.context * kv.bytes) / 2 ** 30, 1)} GB at ${ctxfmt(d.context)} (${kv.label}), taken from the experts.`}>
+        <${Seg} label="Context size" value=${Number(d.context)} options=${ctxs.map((n) => ({id: n, label: ctxfmt(n)}))}
+          onChange=${(v) => setDraft({context: v})}/><//>`,
+      html`<${Row} label="Drafting" flag="--mtp-max-t" changed=${ch("draft")}
+        hint=${mtp ? "The model's own MTP block drafts a few tokens for the model to check: the same answer. Off keeps it loaded with its drafts off. The setup measures which is faster on this PC."
+          : "This pack has no MTP drafter: the setup builds it from the model file."}>
+        <${Seg} label="Drafting" value=${d.draft} options=${[...(mtp ? [{id: "mtp", label: "MTP"}] : []), {id: "none", label: "Off"}]}
+          onChange=${(v) => setDraft({draft: v})}/><//>`]},
+    {label: "GPUs and memory", rows: [gpus,
+      html`<${Row} label="VRAM kept free" flag="--vram-reserve-mib" changed=${ch("reserve_mib")}
+        hint="For the driver, the desktop and other programs. Empty: 700 MiB."
+        warn=${whole(d.reserve_mib) ? null : "A whole number of MiB, or empty for the default."}>
+        <${Num} label="VRAM kept free" value=${d.reserve_mib} ph="700" unit="MiB" on=${(v) => setDraft({reserve_mib: v})}/><//>`,
+      html`<${Row} label="Expert cache" flag="--expert-cache" changed=${ch("expert_cache")}
+        hint="Auto takes the VRAM left free, less the reserve. A number caps the GPU's pool at that many experts."
+        below=${ec.below} warn=${whole(d.expert_cache) ? null : "A whole number, or Auto."}>${ec.ctl}<//>`,
+      html`<${Row} label="Experts in RAM" flag="MAYA_EXPERT_RAM_GB" changed=${ch("ram_gb")}
+        hint="The experts the GPU does not hold stay in RAM, the most-used first, as far as the free RAM goes; the rest are read from the SSD. A number caps that RAM."
+        warn=${whole(d.ram_gb) ? null : "A whole number of GB, or empty for all the engine can take."}>
+        <${Num} label="Experts in RAM" value=${d.ram_gb} ph="auto" unit="GB" on=${(v) => setDraft({ram_gb: v})}/><//>`]},
+    {label: "Prompts and cache", rows: [
+      html`<${Row} label="Prompt chunk" flag="--prefill" changed=${ch("prefill")}
+        hint="Auto takes the largest chunk the expert pool can lend."
+        below=${pf.below} warn=${whole(d.prefill) ? null : "A whole number, or Auto."}>${pf.ctl}<//>`,
+      html`<${Row} label="KV cache" flag="--kv" changed=${ch("kv")}
+        hint="The attention cache's format: INT8 the setup's (the model card's own), FP16 exact, K8 V4 and Q4_0 smaller - more VRAM for experts at long contexts.">
+        <${Seg} label="KV cache" value=${kv.id} options=${QWEN_KV.map((f) => ({id: f.id, label: f.label}))}
+          onChange=${(v) => setDraft({kv: v})}/><//>`]},
   ];
 }
 

@@ -1172,9 +1172,9 @@ bool Glm5Model::prefill_setup(std::string& err) {
     // nothing to land from the disk (the smallest landing ring: ~0.4 GB of the 8065S's 32 GB of OS RAM less pinned).
     // Priced with the largest chunk's buffers and a margin; fast_setup decides from what is free then (short of it
     // there, the pool is the capped one - without a prestage buffer).  STRATA_GLM_COMPLETE_POOL=0: never (on by
-    // default on AMD only: on_by_default_on_amd).
+    // default on every GPU: complete_pool_on).
     bool complete = false;
-    if (glmfast::on_by_default_on_amd("STRATA_GLM_COMPLETE_POOL") && !F->unified_memory && has_moe && stride_sum > 0 &&
+    if (glmfast::complete_pool_on() && !F->unified_memory && has_moe && stride_sum > 0 &&
         ceiling > 0) {
         const auto pu = prefill_bytes_for((size_t) ceiling);
         size_t bufs = pu.first + pu.second + (size_t) w16_elems * 2 + (size_t) w32_elems * 4 + ws_bytes + gbuf + 4096;

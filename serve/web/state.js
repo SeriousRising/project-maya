@@ -135,11 +135,15 @@ export function setScheme(c) {
 // (no effort named: its template's default, the default here) and its card's five efforts, each in its template's
 // adaptive mode (the model decides whether to think).  The page before v1.0.18 saved Qwen-era names, where its
 // "Medium" was GLM's High and its "High" GLM's Max: they are translated once (thinking_v 2)
+// (the penalties: blank, none sent - no model has any as a standard; its user may set them)
 export const DEFAULTS = {thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0, max: "", seed: "", show: true,
-                         mcp: true, system: "", sys_default: false, thinking_v: 2};
+                         mcp: true, system: "", sys_default: false, thinking_v: 2,
+                         repetition_penalty: "", frequency_penalty: "", presence_penalty: ""};
+export const PENALTIES = ["repetition_penalty", "frequency_penalty", "presence_penalty"];
+// CYBER-FROST-3.8-PS (Qwen3.8's template, thinking always on): its three reasoning efforts, low / medium / xhigh
 const THINK_LEVELS = {glm: ["none", "low", "high", "max"], deepseek: ["none", "low", "high", "max"],
-                      minimax: ["none", "auto", "low", "medium", "high", "xhigh", "max"]};
-const THINK_DEFAULT = {glm: "high", deepseek: "high", minimax: "auto"};   // (the run config's level wins: loadHealth)
+                      minimax: ["none", "auto", "low", "medium", "high", "xhigh", "max"], qwen: ["low", "medium", "xhigh"]};
+const THINK_DEFAULT = {glm: "max", deepseek: "high", minimax: "auto", qwen: "xhigh"};   // (the run config's level wins: loadHealth)
 const LEVEL = {none: ["Off", "Answers right away"], auto: ["Auto", "It decides whether to think"], low: ["Low", "A short think"],
                medium: ["Medium", "A moderate think"], high: ["High", "Thinks it through"], xhigh: ["XHigh", "Thinks hard"],
                max: ["Max", "The most thorough, and the longest"]};
@@ -155,10 +159,13 @@ export const THINK_TITLES = {
             high: "Effort high: it decides whether to think, and thinks it through",
             xhigh: "Effort extra-high: it decides whether to think, and thinks hard",
             max: "Effort max: it decides whether to think - the most thorough, and the longest"},
+  qwen: {low: "Reasoning effort low: a short think", medium: "Reasoning effort medium: thinks it through",
+         xhigh: "Reasoning effort xhigh (its default): checks its assumptions and alternatives - the most thorough"},
 };
 // the running model's family, its thinking levels (THINKING, LEVELS: live bindings) and their titles
 export const familyOf = (model = S.health.model) =>
-  (/deepseek/i.test(model || "") ? "deepseek" : /minimax/i.test(model || "") ? "minimax" : "glm");
+  (/deepseek/i.test(model || "") ? "deepseek" : /minimax/i.test(model || "") ? "minimax"
+    : /cyber-frost|qwen/i.test(model || "") ? "qwen" : "glm");
 export let THINKING = THINK_LEVELS.glm;
 export let LEVELS = [];
 export function setFamily(model) {
@@ -182,18 +189,66 @@ export function presetOf(p) {
 }
 const glmLevel = (v) => ({medium: "high", high: "max", xhigh: "max"}[v] || v);
 
-export const prefsKey = () => ({deepseek: "sampling_deepseek", minimax: "sampling_minimax"}[familyOf()] || "sampling");
-export let P = null;                     // the running model's chat settings
+// a level this model does not offer (a chat started on another model): the nearest it has - MiniMax's XHigh is Max
+// elsewhere, its Medium High (as the server maps them), Auto the model's own default - not the default whatever it was
+const NEAREST = {xhigh: ["max", "high"], medium: ["high", "low"], max: ["xhigh", "high"], high: ["medium", "max"],
+                 low: ["low"], none: ["none"]};
+export function levelFor(level) {
+  if (THINKING.includes(level)) return level;
+  return (NEAREST[level] || []).find((l) => THINKING.includes(l)) || null;
+}
+
+export const prefsKey = () => ({deepseek: "sampling_deepseek", minimax: "sampling_minimax", qwen: "sampling_qwen"}[familyOf()] ||
+  "sampling");
+export let P = null;                     // the running model's chat settings: its defaults, then its user's own choices
+// stored: only what the user chose (a preset, a slider, a level) - the model's own defaults fill the rest, so they apply
+// until its user picks something.  Before (prefs_v 3) a change saved every value as it was then, the defaults too:
+// those that equal this model's defaults are not a choice and follow the model from now on
+const CHOSEN = ["thinking", "temperature", "top_p", "top_k", "min_p", ...PENALTIES];
 export function loadPrefs(key = prefsKey()) {
-  const p = {...DEFAULTS, ...store.get(key, {})};
+  let own = store.get(key, {}) || {};
+  if (own.prefs_v !== 3 && S.health && S.health.model) {   // (once, against this model's defaults - not the built-in)
+    own = {...own, prefs_v: 3};
+    for (const k of CHOSEN) if (k in own && String(own[k]) === String(DEFAULTS[k])) delete own[k];
+    store.set(key, own);
+  }
+  const p = {...DEFAULTS, ...own};
   if (p.thinking_v !== 2) { p.thinking = glmLevel(p.thinking); p.thinking_v = 2; }
-  if (!THINKING.includes(p.thinking)) p.thinking = DEFAULTS.thinking;
+  if (!THINKING.includes(p.thinking)) p.thinking = levelFor(p.thinking) || DEFAULTS.thinking;
   P = p;
   return p;
 }
 export function savePrefs(patch) {
   P = {...P, ...patch};
-  store.set(prefsKey(), P);
+  const key = prefsKey();
+  store.set(key, {...(store.get(key, {}) || {}), ...patch, prefs_v: 3});
+  emit();
+}
+// the model running: its id and its files (the label: "GLM-5.3 · Maya-L") - another one is a model switch
+export const modelId = () => `${S.health.model || ""}|${S.health.model_label || ""}`;
+// a model switch (the Models page's, or another model found when the page loads - a setup that changed it): the
+// user's sampling choices and level do not carry over - each model starts at its own standard parameters (the owner,
+// 2026-10-27); within one model they stay, across reloads.  True when it was a switch.
+export function newModelCheck() {
+  const id = modelId(), was = store.get("model", null);
+  store.set("model", id);
+  if (!S.health.model || was === null || was === id) return false;
+  let keys = [];                                  // (every model's stored settings: "maya.sampling", "maya.sampling_<family>")
+  try { keys = Object.keys(localStorage).filter((k) => k.startsWith("maya.sampling")).map((k) => k.slice(5)); } catch (e) { /* none */ }
+  for (const key of new Set([prefsKey(), ...keys])) {
+    const own = {...(store.get(key, {}) || {})};
+    for (const k of CHOSEN) delete own[k];
+    store.set(key, own);
+  }
+  return true;
+}
+
+// back to the model's own for these settings (Settings' Reset): no longer the user's
+export function resetPrefs(keys) {
+  const key = prefsKey(), own = {...(store.get(key, {}) || {})};
+  for (const k of keys) delete own[k];
+  store.set(key, {...own, prefs_v: 3});
+  P = {...P, ...Object.fromEntries(keys.map((k) => [k, DEFAULTS[k]]))};
   emit();
 }
 loadPrefs("sampling");
