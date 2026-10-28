@@ -684,6 +684,7 @@ measured choice as before. The log says `ds4: CPU lane IQ1_S rows: ours without 
 | Setting | Default | |
 | --- | --- | --- |
 | `DS4_IQ1_PDEP` | `0` on AMD family 17h / Hygon, else `1` | `0`: the rows without `pdep` on any CPU (tests: `ds4_iq1_rows_test` checks them against ggml-cpu); `1`: the measured choice (ggml-cpu's dot for a single token) |
+| `DS4_IQ1M_PDEP` | with BMI2: `0` on AMD before family 19h (Zen 3) / Hygon, else `1` | IQ1_M experts' own rows (one token and several): `1` builds the grid indices with `pdep`, `0` with plain table lookups; both bit for bit ggml-cpu's dot (`native_rows_exact_test` checks both; the start check tests the one in use). Only for checking the other form; without BMI2 always `0` |
 
 ## DeepSeek: a GEMV call's int8 inputs rounded in one launch
 

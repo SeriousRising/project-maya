@@ -146,8 +146,8 @@ RowsFn exact_rows(int type) {
 // lookups: IQ3_XXS's four keven_signs loads per 32 values, IQ3_S's 9-bit indices built in vectors and read back from
 // memory.  iq256_rows1 is ggml's dot with two changes - IQ3_XXS's signs built in registers, IQ3_S's
 // indices in scalar registers - so it is bit-identical to ggml's dot (checked here once, 306 results).  On every AVX-2
-// CPU, like ggml-cpu's own dot (it has no AVX-512 form for these). IQ1_M uses the same exact AVX2 row backend in
-// both modes, sharing decode across tokens and avoiding PDEP. IQ2_XXS (Maya-S's gate/up) first tries the
+// CPU, like ggml-cpu's own dot (it has no AVX-512 form for these). IQ1_M and IQ2_XS use the same exact AVX2 row backend
+// in both modes, their grid / scale / delta decode kept off the shuffle port (ggml's is bound by it on Broadwell). IQ2_XXS (Maya-S's gate/up) first tries the
 // AVX-512 rows of iq_avx512_one.cpp (VBMI + BMI2: the grid as 2-bit codes in registers, the signs by pdep), checked
 // the same way.  STRATA_GLM_CPU_1T=0 keeps ggml's dot, STRATA_NO_IQ512 the AVX-2 rows.
 RowsFn pick_rows1(int type) {
@@ -188,6 +188,8 @@ RowsFn exact_rows_nt(int type, int nt) { return nt >= 2 ? exact_rows(type) : exa
 bool native_experts_available() noexcept { return true; }
 
 bool native_multi_rows_exact(int type) { return exact_rows(type) != nullptr; }
+
+bool native_rows1_exact(int type) { return exact_rows1(type) != nullptr; }
 
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
     if (gu_type < 0 || gu_type >= GGML_TYPE_COUNT || d_type < 0 || d_type >= GGML_TYPE_COUNT) {
