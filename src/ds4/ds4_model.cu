@@ -2552,7 +2552,30 @@ struct Model::Impl {
                   gg::type_name(l.lay.gg_type[1]) + " / " + gg::type_name(l.lay.gg_type[2]) + " (gate and up must match)";
             return false;
         }
+        std::string why;   // (a layer the CPU lane cannot compute used to answer zeros for every pick it got there)
+        if (!lane_fmt_ok(l, why)) {
+            err = P + ": the CPU lane cannot compute experts of types " + gg::type_name(l.lay.gg_type[0]) + " / " +
+                  gg::type_name(l.lay.gg_type[2]) + ": " + why;
+            return false;
+        }
         l.blob = off;
+        return true;
+    }
+    // cpu_experts_iq / cpu_experts_both take this layer's experts (the checks they make before computing); `why` if not
+    bool lane_fmt_ok(const Layer& l, std::string& why) const {
+        const int E = g.dim, FF = g.ff;
+        const bool mx_gu = gg::expert_type(l.lay, 0) == gg::kTypeMXFP4, mx_d = gg::expert_type(l.lay, 2) == gg::kTypeMXFP4;
+        if (mx_gu && mx_d) return true;   // (cpu_experts_mx's own kernels)
+        const int tg = mx_gu ? gg::expert_type(l.lay, 2) : gg::expert_type(l.lay, 0);
+        const int td = mx_d ? tg : gg::expert_type(l.lay, 2);   // (one MXFP4 role: the low-bit role's type for both)
+        gg::IqCpu fm;
+        if (!gg::iq_cpu_fmt(tg, td, E, FF, fm, why)) return false;
+        const size_t row = (size_t) E * 4;
+        if (fm.act_bytes > row || fm.h_bytes > row ||
+            ((mx_gu || mx_d) && (gg::mx_act_bytes(E) > row || gg::mx_act_bytes(FF) > row))) {
+            why = "activation rows too large";
+            return false;
+        }
         return true;
     }
     const uint8_t* mx_mat(const Layer& l, int e, int r) const {   // expert e's matrix r: its RAM-tier slot, else the file's
@@ -8693,10 +8716,11 @@ struct Model::Impl {
         std::string ferr;
         if (!gg::iq_cpu_fmt(gg::expert_type(l.lay, 0), gg::expert_type(l.lay, 2), E, FF, fm, ferr) ||
             fm.act_bytes > (size_t) E * 4 || fm.h_bytes > (size_t) E * 4) {
-            static std::atomic<bool> said{false};
-            if (!said.exchange(true)) std::fprintf(stderr, "ds4: layer %d's CPU-lane experts: %s\n", l.il, ferr.c_str());
-            for (const Ent& en : ents) std::memset(c_yd.data() + (size_t) en.slot0 * E, 0, (size_t) en.n * E * 4);
-            return;
+            // (expert_layout_mx refuses such a layer at load: if one gets here anyway, stop rather than answer zeros)
+            std::fprintf(stderr, "ds4: layer %d's CPU-lane experts: %s (cannot compute them; aborting)\n", l.il,
+                         ferr.empty() ? "activation rows too large" : ferr.c_str());
+            std::fflush(stderr);
+            std::abort();
         }
         const float lim = g.lim;
         {   // (os::prefetch_cold, as above: the resident ones are left alone - on Windows the hint walks every page of a
@@ -8778,10 +8802,11 @@ struct Model::Impl {
         std::string ferr;
         if (!gg::iq_cpu_fmt(tq, tq, E, FF, fm, ferr) || fm.act_bytes > (size_t) E * 4 || fm.h_bytes > (size_t) E * 4 ||
             gg::mx_act_bytes(E) > (size_t) E * 4 || gg::mx_act_bytes(FF) > (size_t) E * 4) {
-            static std::atomic<bool> said{false};
-            if (!said.exchange(true)) std::fprintf(stderr, "ds4: layer %d's CPU-lane experts: %s\n", l.il, ferr.c_str());
-            for (const Ent& en : ents) std::memset(c_yd.data() + (size_t) en.slot0 * E, 0, (size_t) en.n * E * 4);
-            return;
+            // (expert_layout_mx refuses such a layer at load: if one gets here anyway, stop rather than answer zeros)
+            std::fprintf(stderr, "ds4: layer %d's CPU-lane experts: %s (cannot compute them; aborting)\n", l.il,
+                         ferr.empty() ? "activation rows too large" : ferr.c_str());
+            std::fflush(stderr);
+            std::abort();
         }
         const float lim = g.lim;
         {   // (os::prefetch_cold, as above)
