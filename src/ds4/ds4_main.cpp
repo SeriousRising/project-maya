@@ -1855,6 +1855,7 @@ int serve_pipe(strata::ds4::Model& m, const std::string& eos_list, bool spec, fl
         long long n_pipe = 0;                                          // wait, enqueue-end to taken; the steps
         long long lk_w = 0, lk_o = 0, lk_a = 0;   // (prompt lookup: its rounds and drafts in this request's lone rounds)
         std::string finish = "length";
+        std::FILE* dump = nullptr;   // (DS4_SERVE_DUMP)
     };
     std::vector<std::unique_ptr<PGen>> gens;   // active, admission order
     std::deque<PGen*> flight;                  // issued, oldest first
@@ -1867,6 +1868,14 @@ int serve_pipe(strata::ds4::Model& m, const std::string& eos_list, bool spec, fl
     std::vector<strata::spec::SuffixDrafter> seq_sfx;
     if (lk != nullptr) seq_sfx.assign((size_t) nseq, lk->sfx);
     uint64_t seq_clock = 0;
+    // (DS4_SERVE_DUMP=<prefix>, tests: as serve() - request i's logits, the prompt's last row then every lone round's
+    //  rows, into <prefix>.<i>.f32; a pipelined step's rows are not written)
+    const char* dump_prefix = std::getenv("DS4_SERVE_DUMP");
+    int n_dump = 0;
+    std::vector<float> dump_lg;
+    const auto dump_rows = [&](PGen& g) {
+        if (g.dump != nullptr && m.logits(dump_lg)) std::fwrite(dump_lg.data(), 4, dump_lg.size(), g.dump);
+    };
     bool quit = false;
 
     const auto stopped = [&](const PGen& g) { return g.stop_req || in.stopped_rid(g.r.rid); };
@@ -2011,6 +2020,10 @@ int serve_pipe(strata::ds4::Model& m, const std::string& eos_list, bool spec, fl
         m.checkpoint(0);
         if (!continued) m.pin();
         g.t1 = now_ms();
+        if (dump_prefix != nullptr) {
+            g.dump = std::fopen((std::string(dump_prefix) + "." + std::to_string(++n_dump) + ".f32").c_str(), "wb");
+            dump_rows(g);
+        }
         g.sd = m.stats();
         g.limit = r.max_new > 0 ? r.max_new : m.max_context() - (long long) r.ids.size();
         m.set_penalties(r.pen_n < 0 ? INT_MAX : r.pen_n,
@@ -2114,6 +2127,8 @@ int serve_pipe(strata::ds4::Model& m, const std::string& eos_list, bool spec, fl
         seq_busy[(size_t) g.seq] = 0;
         seq_used[(size_t) g.seq] = ++seq_clock;
         if (!any_inflight()) m.save_profile();
+        if (g.dump != nullptr) std::fclose(g.dump);
+        g.dump = nullptr;
     };
 
     // the next token of a request alone: serve()'s speculative round on its (bound) sequence.  Its tokens
@@ -2142,6 +2157,7 @@ int serve_pipe(strata::ds4::Model& m, const std::string& eos_list, bool spec, fl
             g.lk_a += glk->accepted - a0;
         }
         if (!rok) fatal(err);   // (S2)
+        dump_rows(g);
         g.d_off += off;
         g.d_acc += acc;
         g.cool = drafted && off == 0;
